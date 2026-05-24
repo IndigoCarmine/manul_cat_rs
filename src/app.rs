@@ -1196,6 +1196,8 @@ impl eframe::App for KuromameApp {
         app_ui::render_top_info_panel(self, &ctx);
         app_ui::render_edit_dialog(self, &ctx);
 
+        app_ui::render_bottom_status_bar(self, &ctx);
+
         egui::CentralPanel::default().show(&ctx, |ui| {
             let Some(render_state) = &self.render_state else {
                 ui.heading("WGPU backend is unavailable");
@@ -1209,11 +1211,6 @@ impl eframe::App for KuromameApp {
         });
 
         self.ui.hovered_atom_info = "Hover an atom for details".to_string();
-
-        app_ui::render_bottom_status_bar(self, &ctx);
-
-        // Request continuous repaint
-        ctx.request_repaint();
     }
 
     fn on_exit(&mut self) {
