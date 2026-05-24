@@ -1,5 +1,5 @@
 use moleucle_3dview_rs::{
-    AdditionalRender, Molecule, RenderFrameState, Scene, SharedRenderStates,
+    AdditionalRender, GpuPipeline, Molecule, RenderFrameState, Scene, SharedRenderStates,
     render_state::get_state_clone_by_type, vdw_radius,
 };
 
@@ -36,46 +36,12 @@ impl NdxSelectionRender {
         self.radius = radius;
     }
 }
-impl NdxSelectionRender {
-    fn init_mesh(&self, scene: &mut Scene) -> usize {
-        let sphere_mesh = Mesh::new_sphere_uv(1.0, 5, 5);
-        scene.meshes.push(sphere_mesh);
-        scene.meshes.len() - 1
-    }
-
-    fn add_sphere(
-        &self,
-        scene: &mut Scene,
-        idx: usize,
-        position: Vec3,
-        radius: f32,
-        color: (f32, f32, f32),
-    ) {
-        let entity = Entity::new(
-            idx,
-            position,
-            Quaternion::new_identity(),
-            radius,
-            color,
-            0.2,
-        );
-        scene.entities.push(entity);
-    }
-
-    fn add_sphere_sameas_carbon(
-        &self,
-        scene: &mut Scene,
-        idx: usize,
-        position: Vec3,
-        relative_radius: f32,
-        color: (f32, f32, f32),
-    ) {
-        let radius = vdw_radius("C") * relative_radius; // Carbon van der Waals radius for demo
-        self.add_sphere(scene, idx, position, radius, color);
-    }
-}
 
 impl AdditionalRender for NdxSelectionRender {
+    fn gpu_pipeline(&self) -> GpuPipeline {
+        GpuPipeline::SphereImpostor
+    }
+
     fn update_scene(&self, scene: &mut Scene, frame_state: &RenderFrameState<'_>) {
         let molecule: &Molecule = if let Some(molecule) = frame_state.molecule {
             molecule
@@ -96,19 +62,12 @@ impl AdditionalRender for NdxSelectionRender {
             return;
         }
 
-        let sphere_mesh_idx = self.init_mesh(scene);
-
         for &atom_index in &state.atom_indices {
             let Some(atom) = molecule.atoms.get(atom_index) else {
                 continue;
             };
-            self.add_sphere(
-                scene,
-                sphere_mesh_idx,
-                atom.position,
-                self.radius,
-                self.color,
-            );
+
+            self.add_sphere(scene, frame_state, atom.position, self.radius, self.color);
         }
     }
 }

@@ -312,7 +312,9 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                         app.set_ndx_selected_group_index(selected_index);
                     }
 
-                    let file_name = app.ndx_file_name().unwrap_or_else(|| "(unknown)".to_string());
+                    let file_name = app
+                        .ndx_file_name()
+                        .unwrap_or_else(|| "(unknown)".to_string());
                     let group_name = app.ndx_selected_group_name().unwrap_or("-");
                     ui.label(format!("File: {}", file_name));
                     ui.label(format!("Group: {}", group_name));
@@ -324,7 +326,9 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 ui.label("Render Style:");
                 let mut style = app.viewport.render_style();
                 ui.selectable_value(&mut style, RenderStyle::BallStick, "BallStick");
+                ui.selectable_value(&mut style, RenderStyle::BallOnly, "BallOnly");
                 ui.selectable_value(&mut style, RenderStyle::Wireframe, "Wireframe");
+                ui.selectable_value(&mut style, RenderStyle::Circles, "Circles");
                 app.viewport.set_render_style(style);
             });
         });

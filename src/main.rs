@@ -20,7 +20,7 @@ fn load_icon() -> Option<eframe::egui::IconData> {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Manul")
+            .with_title("Manul - A Molecular Viewer for GROMACS")
             .with_icon(load_icon().unwrap_or_else(|| eframe::egui::IconData {
                 rgba: vec![0, 0, 0, 0],
                 width: 1,
@@ -30,7 +30,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Manul",
+        "Manul - A Molecular Viewer for GROMACS",
         options,
         Box::new(|cc| Ok(Box::new(KuromameApp::new(cc)))),
     )
