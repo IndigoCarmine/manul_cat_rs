@@ -162,6 +162,26 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 {
                     app.export_structure();
                 }
+
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::Button::new(
+                            egui::RichText::new(format!(
+                                "{} Update All",
+                                mi(MaterialIcon::Refresh)
+                            ))
+                            .color(egui::Color32::WHITE)
+                            .size(font_size - 2.0)
+                            .family(font_family.clone()),
+                        )
+                        .fill(egui::Color32::from_rgb(96, 108, 131)),
+                    )
+                    .on_hover_text("Reload all currently loaded files")
+                    .clicked()
+                {
+                    app.reload_loaded_files();
+                }
             });
 
             ui.add_space(2.0);

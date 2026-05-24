@@ -17,6 +17,8 @@ struct LoadedDataState {
     gro_file: Option<GroFile>,
     top_file: Option<TopFile>,
     ndx_file: Option<NdxFile>,
+    top_file_path: Option<PathBuf>,
+    gro_file_path: Option<PathBuf>,
     ndx_file_path: Option<PathBuf>,
     current_file_path: Option<PathBuf>,
     loaded_summary: String,
@@ -28,6 +30,8 @@ impl LoadedDataState {
         self.pdb_file = None;
         self.gro_file = None;
         self.top_file = None;
+        self.top_file_path = None;
+        self.gro_file_path = None;
     }
 }
 
@@ -181,6 +185,8 @@ impl KuromameApp {
                 gro_file: None,
                 top_file: None,
                 ndx_file: None,
+                top_file_path: None,
+                gro_file_path: None,
                 ndx_file_path: None,
                 current_file_path: None,
                 loaded_summary: "No file loaded".to_string(),
@@ -286,6 +292,32 @@ impl KuromameApp {
             .pick_file()
         {
             self.load_ndx_file(path);
+        }
+    }
+
+    pub fn reload_loaded_files(&mut self) {
+        let top_path = self.data.top_file_path.clone();
+        let gro_path = self.data.gro_file_path.clone();
+        let current_file_path = self.data.current_file_path.clone();
+        let ndx_path = self.data.ndx_file_path.clone();
+
+        let mut reloaded_any = false;
+
+        if let (Some(top_path), Some(gro_path)) = (top_path, gro_path) {
+            self.load_top_and_gro_for_resname_sync(top_path, gro_path);
+            reloaded_any = true;
+        } else if let Some(path) = current_file_path {
+            self.load_file(path);
+            reloaded_any = true;
+        }
+
+        if let Some(path) = ndx_path {
+            self.load_ndx_file(path);
+            reloaded_any = true;
+        }
+
+        if !reloaded_any {
+            self.set_status("No loaded files to reload");
         }
     }
 
@@ -830,6 +862,9 @@ impl KuromameApp {
         self.viewport.set_state_by_type(InteractionPairsState {
             pairs: interaction_pairs,
         });
+        self.data.top_file_path = Some(top_path);
+        self.data.gro_file_path = Some(gro_path);
+        self.data.current_file_path = None;
         self.set_molecule_and_frame(molecule);
 
         self.post_load_cleanup();

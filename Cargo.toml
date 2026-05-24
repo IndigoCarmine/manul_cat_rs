@@ -1,6 +1,6 @@
 [package]
 name = "manul_cat_rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -13,3 +13,7 @@ anyhow = "1.0"
 lin_alg = "1.3.14"
 material-icons = "0.3.0"
 image = "0.25"
+
+
+[build-dependencies]
+winresource = "0.1"
