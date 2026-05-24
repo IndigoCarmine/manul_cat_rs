@@ -5,9 +5,7 @@ use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile};
 use crate::view_rs::To3dViewMolecule;
 use eframe::egui::{self};
-use moleucle_3dview_rs::{
-    Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender,
-};
+use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender};
 use rfd::FileDialog;
 use std::path::PathBuf;
 
@@ -169,7 +167,7 @@ impl KuromameApp {
         }
         cc.egui_ctx.set_fonts(fonts);
         Self::apply_visual_theme(&cc.egui_ctx);
-        let mut viewport = InteractiveMoleculeViewport::new();
+        let mut viewport = InteractiveMoleculeViewport::new(None);
         viewport.add_additional_render_box(Box::new(SelectedAtomRender::new()));
         viewport.add_additional_render_box(Box::new(InterMolecularInteractionRender::new()));
         viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
@@ -321,7 +319,10 @@ impl KuromameApp {
         self.ui.ndx_visible = true;
         self.refresh_ndx_selection_state();
 
-        self.set_status(format!("Imported NDX {} ({} groups)", file_name, group_count));
+        self.set_status(format!(
+            "Imported NDX {} ({} groups)",
+            file_name, group_count
+        ));
     }
 
     pub fn ndx_group_options(&self) -> Vec<String> {
@@ -1207,13 +1208,7 @@ impl eframe::App for KuromameApp {
             }
         });
 
-        if let Some(atom_index) = self.viewport.hovered_atom_index() {
-            self.ui.hovered_atom_info = self
-                .hovered_atom_info(atom_index)
-                .unwrap_or_else(|| "Hover an atom for details".to_string());
-        } else {
-            self.ui.hovered_atom_info = "Hover an atom for details".to_string();
-        }
+        self.ui.hovered_atom_info = "Hover an atom for details".to_string();
 
         app_ui::render_bottom_status_bar(self, &ctx);
 
