@@ -3,6 +3,7 @@ use crate::inter_molecular_interaction_render::{
 };
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile};
+use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::view_rs::To3dViewMolecule;
 use eframe::egui::{self};
 use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender};
@@ -175,6 +176,7 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(SelectedAtomRender::new()));
         viewport.add_additional_render_box(Box::new(InterMolecularInteractionRender::new()));
         viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
+        viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
 
         Self {
             molecule: None,
@@ -303,7 +305,7 @@ impl KuromameApp {
 
         let mut reloaded_any = false;
 
-        if let (Some(top_path), Some(gro_path)) = (top_path, gro_path) {
+        if let (Some(top_path), Some(gro_path)) = (top_path, gro_path.clone()) {
             self.load_top_and_gro_for_resname_sync(top_path, gro_path);
             reloaded_any = true;
         } else if let Some(path) = current_file_path {
@@ -867,6 +869,9 @@ impl KuromameApp {
         self.data.current_file_path = None;
         self.set_molecule_and_frame(molecule);
 
+        self.viewport
+            .set_state_by_type(SimulationCellRenderState::new(gro.box_line));
+
         self.post_load_cleanup();
     }
 
@@ -946,10 +951,13 @@ impl KuromameApp {
         match GroFile::load_from_path(&path) {
             Ok(gro) => {
                 let mol = gro.to_molecule_with_metadata(!large_gro, None);
+                let boxsize = gro.box_line;
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
                 self.data.gro_file = if large_gro { None } else { Some(gro) };
                 self.data.current_file_path = Some(path);
+                self.viewport
+                    .set_state_by_type(SimulationCellRenderState::new(boxsize));
                 self.set_loaded_summary(format!("GRO: {}", file_name));
                 self.mark_clean();
                 if large_gro {

@@ -101,7 +101,7 @@ pub struct GroFile {
     pub title: String,
     pub atom_count_line: String,
     pub atoms: Vec<GroAtomRecord>,
-    pub box_line: String,
+    pub box_line: (f32, f32, f32),
 }
 
 impl GroFile {
@@ -112,17 +112,37 @@ impl GroFile {
         let declared_atom_count = atom_count_line.trim().parse::<usize>().unwrap_or(0);
 
         let mut atoms = Vec::with_capacity(declared_atom_count);
-        let mut box_line = String::new();
+        let mut box_line = (0.0, 0.0, 0.0);
 
         for line in iter {
-            if box_line.is_empty() && !line.trim().is_empty() {
+            if box_line == (0.0, 0.0, 0.0) && !line.trim().is_empty() {
                 if let Some(atom) = GroAtomRecord::from_line(line) {
                     atoms.push(atom);
                 } else {
-                    box_line = line.to_string();
+                    box_line = line
+                        .split_whitespace()
+                        .filter_map(|s| s.parse::<f32>().ok())
+                        .take(3)
+                        .fold((0.0, 0.0, 0.0), |acc, val| {
+                            (
+                                if acc.0 == 0.0 { val } else { acc.0 },
+                                if acc.1 == 0.0 { val } else { acc.1 },
+                                if acc.2 == 0.0 { val } else { acc.2 },
+                            )
+                        });
                 }
-            } else if !box_line.is_empty() {
-                box_line = line.to_string();
+            } else if !box_line.eq(&(0.0, 0.0, 0.0)) {
+                box_line = line
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<f32>().ok())
+                    .take(3)
+                    .fold(box_line, |acc, val| {
+                        (
+                            if acc.0 == 0.0 { val } else { acc.0 },
+                            if acc.1 == 0.0 { val } else { acc.1 },
+                            if acc.2 == 0.0 { val } else { acc.2 },
+                        )
+                    });
             }
         }
 
@@ -132,6 +152,10 @@ impl GroFile {
             atoms,
             box_line,
         }
+    }
+
+    fn vec3_to_box_line(vec: Vec<f32>) -> (f32, f32, f32) {
+        (vec[0], vec[1], vec[2])
     }
 
     pub fn load_from_reader<R: BufRead>(reader: R) -> io::Result<Self> {
@@ -160,7 +184,13 @@ impl GroFile {
             title,
             atom_count_line,
             atoms,
-            box_line,
+            box_line: Self::vec3_to_box_line(
+                box_line
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<f32>().ok())
+                    .take(3)
+                    .collect::<Vec<f32>>(),
+            ),
         })
     }
 
@@ -181,7 +211,12 @@ impl GroFile {
         for atom in &self.atoms {
             writeln!(out, "{}", atom.to_line()).unwrap();
         }
-        writeln!(out, "{}", self.box_line).unwrap();
+        writeln!(
+            out,
+            "{} {} {}",
+            self.box_line.0, self.box_line.1, self.box_line.2
+        )
+        .unwrap();
         out
     }
 
