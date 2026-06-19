@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "manul_cat_rs"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
