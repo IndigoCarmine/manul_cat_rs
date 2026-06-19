@@ -41,154 +41,106 @@ pub fn render_edit_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
     }
 }
 
-pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
+pub fn render_menu_bar(app: &mut KuromameApp, ctx: &egui::Context) {
+    egui::Panel::top("menu_bar").show(ctx, |ui| {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui
+                    .button(format!("{} Open Molecule", mi(MaterialIcon::FolderOpen)))
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                {
+                    app.open_file();
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{} Open TOP+GRO", mi(MaterialIcon::FileOpen)))
+                    .on_hover_text("Ctrl+Shift+O")
+                    .clicked()
+                {
+                    app.open_top_and_gro_for_resname_sync();
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{} Import NDX", mi(MaterialIcon::UploadFile)))
+                    .clicked()
+                {
+                    app.open_ndx_file();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} Export", mi(MaterialIcon::Save)))
+                    .on_hover_text("Ctrl+S")
+                    .clicked()
+                {
+                    app.export_structure();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} Update All", mi(MaterialIcon::Refresh)))
+                    .on_hover_text("Reload all currently loaded files")
+                    .clicked()
+                {
+                    app.reload_loaded_files();
+                    ui.close();
+                }
+            });
+        });
+    });
+}
+
+pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
     let font_size = 17.0;
     let font_family = egui::FontFamily::Proportional;
     let primary = egui::Color32::from_rgb(19, 161, 152);
     let secondary = egui::Color32::from_rgb(241, 98, 69);
 
-    egui::Panel::top("help")
-        .resizable(false)
+    egui::SidePanel::left("left_panel")
+        .resizable(true)
+        .default_width(260.0)
+        .min_width(180.0)
         .frame(
             egui::Frame::new()
                 .fill(egui::Color32::WHITE)
                 .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::WHITE)
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // Loaded file info
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(245, 245, 245))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
                         ui.label(egui::RichText::new("Loaded").strong());
                         ui.monospace(&app.data.loaded_summary);
-
                         if app.data.is_modified {
-                            ui.colored_label(egui::Color32::YELLOW, "modified");
+                            ui.colored_label(egui::Color32::from_rgb(200, 160, 0), "modified");
                         } else {
-                            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "saved");
+                            ui.colored_label(egui::Color32::from_rgb(80, 180, 80), "saved");
                         }
-
-                        ui.separator();
-                        ui.small("Ctrl+O open");
-                        ui.small("Ctrl+Shift+O TOP+GRO");
-                        ui.small("Ctrl+R edit");
-                        ui.small("Ctrl+S export");
-                        ui.small("Ctrl+B path");
-                        ui.small("Ctrl+H hbond");
-                        ui.small("Ctrl+Shift+A clear");
                     });
+
+                ui.add_space(4.0);
+
+                // Keyboard shortcut hints
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("Ctrl+O open");
+                    ui.small("Ctrl+Shift+O TOP+GRO");
+                    ui.small("Ctrl+R edit");
+                    ui.small("Ctrl+S export");
+                    ui.small("Ctrl+B path");
+                    ui.small("Ctrl+H hbond");
+                    ui.small("Ctrl+Shift+A clear");
                 });
 
-            ui.add_space(4.0);
+                ui.separator();
 
-            // Row 1: Main operations
-            ui.horizontal_wrapped(|ui| {
-                let btn_size = egui::vec2(220.0, 38.0);
-
-                if ui
-                    .add_sized(
-                        btn_size,
-                        egui::Button::new(
-                            egui::RichText::new(format!(
-                                "{} Open Molecule",
-                                mi(MaterialIcon::FolderOpen)
-                            ))
-                            .color(egui::Color32::WHITE)
-                            .size(font_size - 2.0)
-                            .family(font_family.clone()),
-                        )
-                        .fill(primary),
-                    )
-                    .on_hover_text("Ctrl+O")
-                    .clicked()
-                {
-                    app.open_file();
-                }
-
-                if ui
-                    .add_sized(
-                        btn_size,
-                        egui::Button::new(
-                            egui::RichText::new(format!(
-                                "{} Open TOP+GRO",
-                                mi(MaterialIcon::FileOpen)
-                            ))
-                            .color(egui::Color32::WHITE)
-                            .size(font_size - 2.0)
-                            .family(font_family.clone()),
-                        )
-                        .fill(secondary),
-                    )
-                    .on_hover_text("Ctrl+Shift+O")
-                    .clicked()
-                {
-                    app.open_top_and_gro_for_resname_sync();
-                }
-
-                if ui
-                    .add_sized(
-                        btn_size,
-                        egui::Button::new(
-                            egui::RichText::new(format!(
-                                "{} Import NDX",
-                                mi(MaterialIcon::UploadFile)
-                            ))
-                            .color(egui::Color32::WHITE)
-                            .size(font_size - 2.0)
-                            .family(font_family.clone()),
-                        )
-                        .fill(egui::Color32::from_rgb(79, 125, 163)),
-                    )
-                    .clicked()
-                {
-                    app.open_ndx_file();
-                }
-
-                if ui
-                    .add_sized(
-                        btn_size,
-                        egui::Button::new(
-                            egui::RichText::new(format!("{} Export", mi(MaterialIcon::Save)))
-                                .color(egui::Color32::WHITE)
-                                .size(font_size - 2.0)
-                                .family(font_family.clone()),
-                        )
-                        .fill(egui::Color32::from_rgb(84, 98, 125)),
-                    )
-                    .on_hover_text("Ctrl+S")
-                    .clicked()
-                {
-                    app.export_structure();
-                }
-
-                if ui
-                    .add_sized(
-                        btn_size,
-                        egui::Button::new(
-                            egui::RichText::new(format!(
-                                "{} Update All",
-                                mi(MaterialIcon::Refresh)
-                            ))
-                            .color(egui::Color32::WHITE)
-                            .size(font_size - 2.0)
-                            .family(font_family.clone()),
-                        )
-                        .fill(egui::Color32::from_rgb(96, 108, 131)),
-                    )
-                    .on_hover_text("Reload all currently loaded files")
-                    .clicked()
-                {
-                    app.reload_loaded_files();
-                }
-            });
-
-            ui.add_space(2.0);
-
-            // Row 2: Selection operations
-            ui.horizontal_wrapped(|ui| {
-                let btn_size = egui::vec2(220.0, 38.0);
+                // Selection buttons — full panel width
+                let w = ui.available_width();
+                let btn_size = egui::vec2(w, 34.0);
 
                 let can_select_path = app.selection.selected_atom_indices.len() == 2;
                 if ui
@@ -217,6 +169,8 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                     );
                 }
 
+                ui.add_space(2.0);
+
                 if ui
                     .add_enabled_ui(!app.selection.selected_atom_indices.is_empty(), |ui| {
                         ui.add_sized(
@@ -240,6 +194,8 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                     app.open_resname_dialog();
                 }
 
+                ui.add_space(2.0);
+
                 if ui
                     .add_sized(
                         btn_size,
@@ -259,47 +215,47 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 {
                     app.clear_selection();
                 }
-            });
 
-            ui.add_space(4.0);
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
+                ui.separator();
+
+                // Selector
                 ui.label("Selector:");
                 let input = ui.add_sized(
-                    egui::vec2(360.0, 30.0),
+                    egui::vec2(ui.available_width(), 30.0),
                     egui::TextEdit::singleline(&mut app.ui.selector_input)
-                        .hint_text("select by gromacs-like selector, aC1|aC2"),
+                        .hint_text("aC1|aC2"),
                 );
                 let apply_by_enter =
                     input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let apply_by_button = ui.button("Apply Selector").clicked();
-                let output_by_button = ui.button("Selection -> Text").clicked();
-                if apply_by_enter || apply_by_button {
-                    app.apply_selector_expression();
-                }
-                if output_by_button {
-                    if let Some(selector_text) = app.update_selector_input_from_selection() {
-                        ui.ctx().copy_text(selector_text);
-                        app.ui.status_msg =
-                            "Selection exported to selector text and copied".to_string();
-                    } else {
-                        app.ui.status_msg = "No selected atoms with usable atom names".to_string();
+                ui.horizontal(|ui| {
+                    let apply_by_button = ui.button("Apply").clicked();
+                    let output_by_button = ui.button("-> Text").clicked();
+                    if apply_by_enter || apply_by_button {
+                        app.apply_selector_expression();
                     }
-                }
-            });
+                    if output_by_button {
+                        if let Some(selector_text) = app.update_selector_input_from_selection() {
+                            ui.ctx().copy_text(selector_text);
+                            app.ui.status_msg =
+                                "Selection exported to selector text and copied".to_string();
+                        } else {
+                            app.ui.status_msg =
+                                "No selected atoms with usable atom names".to_string();
+                        }
+                    }
+                });
 
-            ui.label(
-                egui::RichText::new(format!(
-                    "Selected: {}",
-                    app.selection.selected_atom_indices.len()
-                ))
-                .strong(),
-            );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Selected: {}",
+                        app.selection.selected_atom_indices.len()
+                    ))
+                    .strong(),
+                );
 
-            if app.ndx_group_count() > 0 {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
+                if app.ndx_group_count() > 0 {
+                    ui.separator();
+
                     let mut ndx_visible = app.ndx_visible();
                     if ui.checkbox(&mut ndx_visible, "Show NDX Group").changed() {
                         app.set_ndx_visible(ndx_visible);
@@ -314,6 +270,7 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                     }
 
                     egui::ComboBox::from_id_salt("ndx_group_selector")
+                        .width(ui.available_width())
                         .selected_text(
                             options
                                 .get(selected_index)
@@ -339,10 +296,10 @@ pub fn render_top_info_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                     ui.label(format!("File: {}", file_name));
                     ui.label(format!("Group: {}", group_name));
                     ui.label(format!("Rendered atoms: {}", app.ndx_selected_atom_count()));
-                });
-            }
+                }
 
-            ui.horizontal(|ui| {
+                ui.separator();
+
                 ui.label("Render Style:");
                 let mut style = app.viewport.render_style();
                 ui.selectable_value(&mut style, RenderStyle::BallStick, "BallStick");

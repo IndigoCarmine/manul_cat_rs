@@ -6,9 +6,11 @@ use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::view_rs::To3dViewMolecule;
 use eframe::egui::{self};
-use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender};
+use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
+use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent};
 use rfd::FileDialog;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[path = "app_ui.rs"]
 mod app_ui;
@@ -116,6 +118,7 @@ pub struct KuromameApp {
     data: LoadedDataState,
     selection: SelectionState,
     ui: UiState,
+    hovered_atom: Arc<Mutex<Option<usize>>>,
 }
 
 impl KuromameApp {
@@ -178,6 +181,28 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
 
+        let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+        let hovered_atom_for_handler = Arc::clone(&hovered_atom);
+        viewport.register_event_handler(Box::new(move |vp, event| match event {
+            ViewPortEvent::hovered { atom } => {
+                if let Ok(mut g) = hovered_atom_for_handler.lock() {
+                    *g = Some(atom);
+                }
+            }
+            ViewPortEvent::clicked { atom } => {
+                let mut atoms = vp.selected_atoms();
+                if let Some(pos) = atoms.iter().position(|&a| a == atom) {
+                    atoms.remove(pos);
+                } else {
+                    atoms.push(atom);
+                }
+                vp.set_state_by_type(SelectedAtomRenderState {
+                    selected_atoms: atoms,
+                    color: [1.0, 0.0, 0.0],
+                });
+            }
+        }));
+
         Self {
             molecule: None,
             viewport,
@@ -208,6 +233,7 @@ impl KuromameApp {
                 ndx_visible: true,
                 ndx_selected_atom_count: 0,
             },
+            hovered_atom,
         }
     }
 
@@ -697,7 +723,7 @@ impl KuromameApp {
 
         Some(format!(
             "Index={} AtomName={} Resname={}",
-            atom_index,
+            atom_index + 1,
             atom_name.unwrap_or_else(|| "-".to_string()),
             res_name.unwrap_or_else(|| "-".to_string())
         ))
@@ -1233,13 +1259,20 @@ impl KuromameApp {
 impl eframe::App for KuromameApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Update hover info from the previous frame's viewport pick result.
+        let last_hovered = self.hovered_atom.lock().ok().and_then(|mut g| g.take());
+        self.ui.hovered_atom_info = last_hovered
+            .and_then(|atom| self.hovered_atom_info(atom))
+            .unwrap_or_else(|| "Hover an atom for details".to_string());
+
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
 
-        app_ui::render_top_info_panel(self, &ctx);
-        app_ui::render_edit_dialog(self, &ctx);
-
+        app_ui::render_menu_bar(self, &ctx);
         app_ui::render_bottom_status_bar(self, &ctx);
+        app_ui::render_left_panel(self, &ctx);
+        app_ui::render_edit_dialog(self, &ctx);
 
         egui::CentralPanel::default().show(&ctx, |ui| {
             let Some(render_state) = &self.render_state else {
@@ -1253,7 +1286,29 @@ impl eframe::App for KuromameApp {
             }
         });
 
-        self.ui.hovered_atom_info = "Hover an atom for details".to_string();
+        // Show a drop-target overlay while files are being dragged over the window.
+        // This provides visual feedback on Linux (X11/Wayland) and other platforms.
+        let is_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if is_dragging {
+            egui::Area::new(egui::Id::new("dnd_overlay"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    let rect = ctx.content_rect();
+                    ui.painter().rect_filled(
+                        rect,
+                        egui::CornerRadius::ZERO,
+                        egui::Color32::from_rgba_unmultiplied(30, 140, 240, 100),
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drop molecular file here",
+                        egui::FontId::proportional(28.0),
+                        egui::Color32::WHITE,
+                    );
+                });
+        }
     }
 
     fn on_exit(&mut self) {
