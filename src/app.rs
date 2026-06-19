@@ -15,26 +15,58 @@ use std::sync::{Arc, Mutex};
 #[path = "app_ui.rs"]
 mod app_ui;
 
+enum StructureFile {
+    Pdb(PdbFile),
+    Gro(GroFile),
+}
+
+impl StructureFile {
+    fn gro(&self) -> Option<&GroFile> {
+        match self {
+            StructureFile::Gro(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    fn gro_mut(&mut self) -> Option<&mut GroFile> {
+        match self {
+            StructureFile::Gro(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    fn pdb(&self) -> Option<&PdbFile> {
+        match self {
+            StructureFile::Pdb(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    fn pdb_mut(&mut self) -> Option<&mut PdbFile> {
+        match self {
+            StructureFile::Pdb(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
 struct LoadedDataState {
-    pdb_file: Option<PdbFile>,
-    gro_file: Option<GroFile>,
+    structure_file: Option<StructureFile>,
+    structure_file_path: Option<PathBuf>,
     top_file: Option<TopFile>,
-    ndx_file: Option<NdxFile>,
     top_file_path: Option<PathBuf>,
-    gro_file_path: Option<PathBuf>,
+    ndx_file: Option<NdxFile>,
     ndx_file_path: Option<PathBuf>,
-    current_file_path: Option<PathBuf>,
     loaded_summary: String,
     is_modified: bool,
 }
 
 impl LoadedDataState {
     fn clear_structures(&mut self) {
-        self.pdb_file = None;
-        self.gro_file = None;
+        self.structure_file = None;
+        self.structure_file_path = None;
         self.top_file = None;
         self.top_file_path = None;
-        self.gro_file_path = None;
     }
 }
 
@@ -208,14 +240,12 @@ impl KuromameApp {
             viewport,
             render_state: cc.wgpu_render_state.clone(),
             data: LoadedDataState {
-                pdb_file: None,
-                gro_file: None,
+                structure_file: None,
+                structure_file_path: None,
                 top_file: None,
-                ndx_file: None,
                 top_file_path: None,
-                gro_file_path: None,
+                ndx_file: None,
                 ndx_file_path: None,
-                current_file_path: None,
                 loaded_summary: "No file loaded".to_string(),
                 is_modified: false,
             },
@@ -256,12 +286,18 @@ impl KuromameApp {
     fn sync_viewer_molecule(&mut self) {
         if let Some(molecule) = self.molecule.clone() {
             self.viewport.set_molecule(molecule);
+        }
+    }
+
+    fn sync_viewer_molecule_and_focus(&mut self) {
+        if let Some(molecule) = self.molecule.clone() {
+            self.viewport.set_molecule(molecule);
             self.viewport.focus_on_molecule_center();
         }
     }
 
     fn post_load_cleanup(&mut self) {
-        self.sync_viewer_molecule();
+        self.sync_viewer_molecule_and_focus();
         self.refresh_ndx_selection_state();
     }
 
@@ -325,18 +361,35 @@ impl KuromameApp {
 
     pub fn reload_loaded_files(&mut self) {
         let top_path = self.data.top_file_path.clone();
-        let gro_path = self.data.gro_file_path.clone();
-        let current_file_path = self.data.current_file_path.clone();
+        let gro_path = self.data.structure_file_path.clone().filter(|_| {
+            matches!(self.data.structure_file, Some(StructureFile::Gro(_)))
+        });
+        let current_file_path = self.data.structure_file_path.clone().filter(|_| {
+            matches!(self.data.structure_file, Some(StructureFile::Pdb(_)))
+        });
         let ndx_path = self.data.ndx_file_path.clone();
 
         let mut reloaded_any = false;
 
-        if let (Some(top_path), Some(gro_path)) = (top_path, gro_path.clone()) {
-            self.load_top_and_gro_for_resname_sync(top_path, gro_path);
-            reloaded_any = true;
-        } else if let Some(path) = current_file_path {
-            self.load_file(path);
-            reloaded_any = true;
+        match (top_path, gro_path) {
+            (Some(top), Some(gro)) => {
+                self.load_top_and_gro_for_resname_sync(top, gro);
+                reloaded_any = true;
+            }
+            (Some(top), None) => {
+                self.load_top_file_only(top);
+                reloaded_any = true;
+            }
+            (None, Some(gro)) => {
+                self.load_gro_file_only(gro);
+                reloaded_any = true;
+            }
+            (None, None) => {
+                if let Some(path) = current_file_path {
+                    self.load_file(path);
+                    reloaded_any = true;
+                }
+            }
         }
 
         if let Some(path) = ndx_path {
@@ -485,7 +538,7 @@ impl KuromameApp {
             }
         }
 
-        if let Some(gro) = &self.data.gro_file {
+        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
             if let Some(atom) = gro.atoms().nth(atom_index) {
                 let name = atom.atom_name.trimmed();
                 if !name.is_empty() {
@@ -494,7 +547,7 @@ impl KuromameApp {
             }
         }
 
-        if let Some(pdb) = &self.data.pdb_file {
+        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb()) {
             if let Some(atom) = pdb.atoms().nth(atom_index) {
                 let name = atom.name.trim();
                 if !name.is_empty() {
@@ -623,6 +676,8 @@ impl KuromameApp {
                 ctrl && !shift && i.key_pressed(egui::Key::H),
                 ctrl && !shift && i.key_pressed(egui::Key::B),
                 ctrl && shift && i.key_pressed(egui::Key::A),
+                ctrl && !shift && i.key_pressed(egui::Key::T),
+                ctrl && !shift && i.key_pressed(egui::Key::G),
             )
         });
 
@@ -649,6 +704,12 @@ impl KuromameApp {
         }
         if shortcuts.6 {
             self.clear_selection();
+        }
+        if shortcuts.7 {
+            self.open_top_file();
+        }
+        if shortcuts.8 {
+            self.open_gro_file();
         }
     }
 
@@ -678,7 +739,7 @@ impl KuromameApp {
             }
         }
 
-        if let Some(pdb) = &self.data.pdb_file {
+        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb()) {
             if let Some(atom) = pdb.atoms().nth(atom_index) {
                 if atom_name.is_none() && !atom.name.trim().is_empty() {
                     atom_name = Some(atom.name.trim().to_string());
@@ -689,7 +750,7 @@ impl KuromameApp {
             }
         }
 
-        if let Some(gro) = &self.data.gro_file {
+        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
             if let Some(atom) = gro.atoms().nth(atom_index) {
                 if atom_name.is_none() {
                     let name = atom.atom_name.trimmed();
@@ -746,13 +807,13 @@ impl KuromameApp {
                 .collect::<Vec<_>>()
         });
 
-        let gro_resnames = self.data.gro_file.as_ref().map(|gro| {
+        let gro_resnames = self.data.structure_file.as_ref().and_then(|s| s.gro()).map(|gro| {
             gro.atoms()
                 .map(|atom| atom.res_name.trimmed().to_string())
                 .collect::<Vec<_>>()
         });
 
-        let pdb_resnames = self.data.pdb_file.as_ref().map(|pdb| {
+        let pdb_resnames = self.data.structure_file.as_ref().and_then(|s| s.pdb()).map(|pdb| {
             pdb.atoms()
                 .map(|atom| atom.res_name.trim().to_string())
                 .collect::<Vec<_>>()
@@ -833,11 +894,29 @@ impl KuromameApp {
         if let Some(path) = FileDialog::new()
             .add_filter("PDB Files", &["pdb", "ent", "cif"])
             .add_filter("MOL2 Files", &["mol2"])
-            .add_filter("GRO Files", &["gro"])
-            .add_filter("TOP/ITP Files", &["top", "itp"])
             .pick_file()
         {
             self.load_file(path);
+        }
+    }
+
+    pub fn open_top_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("TOP/ITP Files", &["top", "itp"])
+            .set_title("Select TOP file")
+            .pick_file()
+        {
+            self.load_top_file_only(path);
+        }
+    }
+
+    pub fn open_gro_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("GRO Files", &["gro"])
+            .set_title("Select GRO file")
+            .pick_file()
+        {
+            self.load_gro_file_only(path);
         }
     }
 
@@ -859,6 +938,59 @@ impl KuromameApp {
         }
     }
 
+    fn generate_and_set_molecule_from_stored_files(&mut self) -> bool {
+        let top = match self.data.top_file.clone() {
+            Some(t) => t,
+            None => return false,
+        };
+        let gro = match self.data.structure_file.as_ref().and_then(|s| s.gro()) {
+            Some(g) => g.clone(),
+            None => return false,
+        };
+
+        match top.generate_molecule_with_gro(&gro) {
+            Ok((molecule, interaction_pairs)) => {
+                let boxsize = gro.box_line;
+                self.viewport.set_state_by_type(InteractionPairsState {
+                    pairs: interaction_pairs,
+                });
+                self.set_molecule_and_frame(molecule);
+                self.viewport
+                    .set_state_by_type(SimulationCellRenderState::new(boxsize));
+                true
+            }
+            Err(err) => {
+                self.set_status(err);
+                false
+            }
+        }
+    }
+
+    fn update_loaded_summary(&mut self) {
+        let top_name = self
+            .data
+            .top_file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        let coord_name = self
+            .data
+            .structure_file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+
+        let summary = match (top_name, coord_name) {
+            (Some(t), Some(c)) => format!("TOP: {}\n{}", t, c),
+            (Some(t), None) => format!("TOP: {} (no coord file)", t),
+            (None, Some(c)) => c,
+            _ => String::new(),
+        };
+        self.set_loaded_summary(summary);
+    }
+
     fn load_top_and_gro_for_resname_sync(&mut self, top_path: PathBuf, gro_path: PathBuf) {
         let top = match TopFile::load_from_path(&top_path) {
             Ok(top) => top,
@@ -875,29 +1007,96 @@ impl KuromameApp {
             }
         };
 
-        let (molecule, interaction_pairs) = match top.generate_molecule_with_gro(&gro) {
-            Ok(result) => result,
-            Err(error_message) => {
-                self.set_status(error_message);
+        self.data.top_file = Some(top);
+        self.data.top_file_path = Some(top_path);
+        self.data.structure_file = Some(StructureFile::Gro(gro));
+        self.data.structure_file_path = Some(gro_path);
+
+        self.generate_and_set_molecule_from_stored_files();
+        self.update_loaded_summary();
+        self.mark_clean();
+        self.set_status("Loaded TOP+GRO");
+        self.post_load_cleanup();
+    }
+
+    fn load_top_file_only(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let top = match TopFile::load_from_path(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                self.set_status(err);
                 return;
             }
         };
-        println!(
-            "Generated molecule with {} atoms and {} interaction pairs",
-            molecule.atoms.len(),
-            interaction_pairs.len()
-        );
-        self.viewport.set_state_by_type(InteractionPairsState {
-            pairs: interaction_pairs,
-        });
-        self.data.top_file_path = Some(top_path);
-        self.data.gro_file_path = Some(gro_path);
-        self.data.current_file_path = None;
-        self.set_molecule_and_frame(molecule);
 
+        self.data.top_file = Some(top);
+        self.data.top_file_path = Some(path);
+
+        let has_gro = self
+            .data
+            .structure_file
+            .as_ref()
+            .and_then(|s| s.gro())
+            .is_some();
+
+        if has_gro {
+            self.generate_and_set_molecule_from_stored_files();
+            self.set_status(format!("Loaded TOP: {}", file_name));
+            self.update_loaded_summary();
+            self.mark_clean();
+            self.post_load_cleanup();
+        } else {
+            self.update_loaded_summary();
+            self.mark_clean();
+            self.set_status(format!(
+                "Loaded TOP: {}. Load a GRO file to display the molecule.",
+                file_name
+            ));
+        }
+    }
+
+    fn load_gro_file_only(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let gro = match GroFile::load_from_path(&path) {
+            Ok(g) => g,
+            Err(_) => {
+                self.set_status("Failed to read GRO file");
+                return;
+            }
+        };
+
+        let boxsize = gro.box_line;
+        self.data.structure_file = Some(StructureFile::Gro(gro));
+        self.data.structure_file_path = Some(path);
         self.viewport
-            .set_state_by_type(SimulationCellRenderState::new(gro.box_line));
+            .set_state_by_type(SimulationCellRenderState::new(boxsize));
 
+        if self.data.top_file.is_some() {
+            self.generate_and_set_molecule_from_stored_files();
+        } else {
+            let mol = self
+                .data
+                .structure_file
+                .as_ref()
+                .and_then(|s| s.gro())
+                .unwrap()
+                .to_molecule_with_metadata(true, None);
+            self.set_molecule_and_frame(mol);
+        }
+
+        self.update_loaded_summary();
+        self.mark_clean();
+        self.set_status(format!("Loaded GRO: {}", file_name));
         self.post_load_cleanup();
     }
 
@@ -910,7 +1109,6 @@ impl KuromameApp {
         match ext.to_lowercase().as_str() {
             "pdb" | "ent" => self.load_pdb_file(path),
             "mol2" => self.load_mol2_file(path),
-            "gro" => self.load_gro_file(path),
             _ => {
                 self.set_status("Unsupported file type");
             }
@@ -930,11 +1128,11 @@ impl KuromameApp {
                 let mol = pdb.to_molecule();
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
-                self.data.pdb_file = Some(pdb);
-                self.data.current_file_path = Some(path);
-                self.set_loaded_summary(format!("PDB: {}", file_name));
+                self.data.structure_file = Some(StructureFile::Pdb(pdb));
+                self.data.structure_file_path = Some(path);
+                self.update_loaded_summary();
                 self.mark_clean();
-                self.set_status("Loaded PDB");
+                self.set_status(format!("Loaded PDB: {}", file_name));
             }
             Err(_) => self.set_status("Failed to load PDB file"),
         }
@@ -953,66 +1151,19 @@ impl KuromameApp {
                 let pdb_from_mol2 = PdbFile::from_molecule(&mol);
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
-                self.data.pdb_file = Some(pdb_from_mol2);
-                self.data.current_file_path = Some(path);
-                self.set_loaded_summary(format!("MOL2: {}", file_name));
+                self.data.structure_file = Some(StructureFile::Pdb(pdb_from_mol2));
+                self.data.structure_file_path = Some(path);
+                self.update_loaded_summary();
                 self.mark_clean();
-                self.set_status("Loaded MOL2");
+                self.set_status(format!("Loaded MOL2: {}", file_name));
             }
             Err(_) => self.set_status("Failed to load MOL2 file"),
         }
     }
 
-    fn load_gro_file(&mut self, path: PathBuf) {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        const LARGE_GRO_THRESHOLD_BYTES: u64 = 20 * 1024 * 1024;
-        let large_gro = std::fs::metadata(&path)
-            .map(|m| m.len() >= LARGE_GRO_THRESHOLD_BYTES)
-            .unwrap_or(false);
-
-        match GroFile::load_from_path(&path) {
-            Ok(gro) => {
-                let mol = gro.to_molecule_with_metadata(!large_gro, None);
-                let boxsize = gro.box_line;
-                self.set_molecule_and_frame(mol);
-                self.data.clear_structures();
-                self.data.gro_file = if large_gro { None } else { Some(gro) };
-                self.data.current_file_path = Some(path);
-                self.viewport
-                    .set_state_by_type(SimulationCellRenderState::new(boxsize));
-                self.set_loaded_summary(format!("GRO: {}", file_name));
-                self.mark_clean();
-                if large_gro {
-                    self.set_status(
-                        "Loaded GRO (compact mode: reduced memory, GRO edit/export disabled)",
-                    );
-                } else {
-                    self.set_status("Loaded GRO");
-                }
-            }
-            Err(_) => self.set_status("Failed to load GRO file"),
-        }
-    }
-
     fn set_molecule_and_frame(&mut self, molecule: Molecule) {
         self.molecule = Some(molecule);
-        self.sync_viewer_molecule();
-
-        let Some(mol) = self.molecule.as_ref() else {
-            return;
-        };
-
-        if mol.atoms.is_empty() {
-            return;
-        }
-
-        // Note: Camera setup would be handled by viewport if needed
-        // For now, just sync the molecule to the viewport
-        self.sync_viewer_molecule();
+        // Syncing to the viewport is handled by post_load_cleanup() — callers are responsible.
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -1031,20 +1182,31 @@ impl KuromameApp {
         let mut top_path: Option<PathBuf> = None;
         let mut gro_path: Option<PathBuf> = None;
         let mut ndx_path: Option<PathBuf> = None;
+        let mut other_path: Option<PathBuf> = None;
 
         for path in &dropped_paths {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 match ext.to_ascii_lowercase().as_str() {
-                    "top" => top_path = Some(path.clone()),
+                    "top" | "itp" => top_path = Some(path.clone()),
                     "gro" => gro_path = Some(path.clone()),
                     "ndx" => ndx_path = Some(path.clone()),
-                    _ => {}
+                    _ => other_path = Some(path.clone()),
                 }
             }
         }
 
-        if let (Some(top), Some(gro)) = (top_path, gro_path) {
+        if let (Some(top), Some(gro)) = (top_path.clone(), gro_path.clone()) {
             self.load_top_and_gro_for_resname_sync(top, gro);
+            return;
+        }
+
+        if let Some(top) = top_path {
+            self.load_top_file_only(top);
+            return;
+        }
+
+        if let Some(gro) = gro_path {
+            self.load_gro_file_only(gro);
             return;
         }
 
@@ -1053,7 +1215,7 @@ impl KuromameApp {
             return;
         }
 
-        if let Some(path) = dropped_paths.into_iter().next() {
+        if let Some(path) = other_path {
             self.load_file(path);
         }
     }
@@ -1183,8 +1345,7 @@ impl KuromameApp {
             return;
         }
 
-        if let Some(pdb) = &mut self.data.pdb_file {
-            // Update PDB atoms
+        if let Some(pdb) = self.data.structure_file.as_mut().and_then(|s| s.pdb_mut()) {
             let mut atoms_vec: Vec<&mut AtomRecord> = pdb.atoms_mut().collect();
             for &idx in &indices_to_update {
                 if let Some(atom) = atoms_vec.get_mut(idx) {
@@ -1193,8 +1354,7 @@ impl KuromameApp {
             }
         }
 
-        if let Some(gro) = &mut self.data.gro_file {
-            // In GRO, the 2nd field is residue name (resname).
+        if let Some(gro) = self.data.structure_file.as_mut().and_then(|s| s.gro_mut()) {
             let mut atoms_vec: Vec<_> = gro.atoms_mut().collect();
             for &idx in &indices_to_update {
                 if let Some(atom) = atoms_vec.get_mut(idx) {
@@ -1223,12 +1383,9 @@ impl KuromameApp {
     }
 
     fn export_structure(&mut self) {
-        if self.data.top_file.is_none()
-            && self.data.gro_file.is_none()
-            && self.data.pdb_file.is_none()
-        {
+        if self.data.top_file.is_none() && self.data.structure_file.is_none() {
             if let Some(mol) = &self.molecule {
-                self.data.pdb_file = Some(PdbFile::from_molecule(mol));
+                self.data.structure_file = Some(StructureFile::Pdb(PdbFile::from_molecule(mol)));
             }
         }
 
@@ -1236,10 +1393,10 @@ impl KuromameApp {
             let saved = if let Some(top) = &self.data.top_file {
                 let content = top.dump();
                 std::fs::write(&path, content).is_ok()
-            } else if let Some(gro) = &self.data.gro_file {
+            } else if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
                 let content = gro.dump();
                 std::fs::write(&path, content).is_ok()
-            } else if let Some(pdb) = &mut self.data.pdb_file {
+            } else if let Some(pdb) = self.data.structure_file.as_mut().and_then(|s| s.pdb_mut()) {
                 let content = pdb.dump();
                 std::fs::write(&path, content).is_ok()
             } else {

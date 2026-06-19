@@ -47,10 +47,26 @@ pub fn render_menu_bar(app: &mut KuromameApp, ctx: &egui::Context) {
             ui.menu_button("File", |ui| {
                 if ui
                     .button(format!("{} Open Molecule", mi(MaterialIcon::FolderOpen)))
-                    .on_hover_text("Ctrl+O")
+                    .on_hover_text("Ctrl+O (PDB/MOL2)")
                     .clicked()
                 {
                     app.open_file();
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{} Open TOP", mi(MaterialIcon::Description)))
+                    .on_hover_text("Ctrl+T")
+                    .clicked()
+                {
+                    app.open_top_file();
+                    ui.close();
+                }
+                if ui
+                    .button(format!("{} Open GRO", mi(MaterialIcon::GridOn)))
+                    .on_hover_text("Ctrl+G")
+                    .clicked()
+                {
+                    app.open_gro_file();
                     ui.close();
                 }
                 if ui
@@ -128,6 +144,8 @@ pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 // Keyboard shortcut hints
                 ui.horizontal_wrapped(|ui| {
                     ui.small("Ctrl+O open");
+                    ui.small("Ctrl+T TOP");
+                    ui.small("Ctrl+G GRO");
                     ui.small("Ctrl+Shift+O TOP+GRO");
                     ui.small("Ctrl+R edit");
                     ui.small("Ctrl+S export");
