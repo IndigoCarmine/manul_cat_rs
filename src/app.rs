@@ -1261,10 +1261,10 @@ impl eframe::App for KuromameApp {
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
 
-        app_ui::render_top_info_panel(self, &ctx);
-        app_ui::render_edit_dialog(self, &ctx);
-
+        app_ui::render_menu_bar(self, &ctx);
         app_ui::render_bottom_status_bar(self, &ctx);
+        app_ui::render_left_panel(self, &ctx);
+        app_ui::render_edit_dialog(self, &ctx);
 
         egui::CentralPanel::default().show(&ctx, |ui| {
             let Some(render_state) = &self.render_state else {
