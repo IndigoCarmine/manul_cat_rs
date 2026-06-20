@@ -2,10 +2,11 @@ use crate::inter_molecular_interaction_render::{
     InterMolecularInteractionRender, InteractionPairsState,
 };
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
-use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile};
+use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile, XtcFile, XtcFrame};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::view_rs::To3dViewMolecule;
 use eframe::egui::{self};
+use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
 use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent};
 use rfd::FileDialog;
@@ -86,6 +87,13 @@ struct UiState {
     ndx_selected_atom_count: usize,
 }
 
+struct TrajectoryUiState {
+    current_frame: usize,
+    is_playing: bool,
+    playback_fps: f32,
+    last_advance_time: f64,
+}
+
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
@@ -151,6 +159,10 @@ pub struct KuromameApp {
     selection: SelectionState,
     ui: UiState,
     hovered_atom: Arc<Mutex<Option<usize>>>,
+    trajectory: Vec<XtcFrame>,
+    trajectory_path: Option<PathBuf>,
+    base_molecule: Option<Molecule>,
+    traj_ui: TrajectoryUiState,
 }
 
 impl KuromameApp {
@@ -264,6 +276,15 @@ impl KuromameApp {
                 ndx_selected_atom_count: 0,
             },
             hovered_atom,
+            trajectory: Vec::new(),
+            trajectory_path: None,
+            base_molecule: None,
+            traj_ui: TrajectoryUiState {
+                current_frame: 0,
+                is_playing: false,
+                playback_fps: 10.0,
+                last_advance_time: 0.0,
+            },
         }
     }
 
@@ -1166,6 +1187,168 @@ impl KuromameApp {
         // Syncing to the viewport is handled by post_load_cleanup() — callers are responsible.
     }
 
+    pub fn open_xtc_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("XTC Trajectory", &["xtc"])
+            .set_title("Select XTC trajectory file")
+            .pick_file()
+        {
+            self.load_xtc_file(path);
+        }
+    }
+
+    fn load_xtc_file(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let xtc = match XtcFile::load_from_path(&path) {
+            Ok(x) => x,
+            Err(e) => {
+                self.set_status(format!("Failed to load XTC: {e}"));
+                return;
+            }
+        };
+
+        if xtc.frames.is_empty() {
+            self.set_status("XTC file contains no frames");
+            return;
+        }
+
+        // Validate atom count against current molecule
+        if let Some(mol) = &self.molecule {
+            if mol.atoms.len() != xtc.natoms {
+                self.set_status(format!(
+                    "XTC atom count ({}) does not match loaded structure ({})",
+                    xtc.natoms,
+                    mol.atoms.len()
+                ));
+                return;
+            }
+            self.base_molecule = Some(mol.clone());
+        } else {
+            // No reference structure: create minimal atoms (positions only, no bonds/names)
+            let atoms = (0..xtc.natoms)
+                .map(|i| Atom {
+                    position: Vec3::new(0.0, 0.0, 0.0),
+                    element: "C".to_string(),
+                    id: i,
+                    name: None,
+                    res_name: None,
+                    chain_id: None,
+                    res_seq: None,
+                    occupancy: None,
+                    temp_factor: None,
+                    charge: None,
+                })
+                .collect();
+            self.base_molecule = Some(Molecule { atoms, bonds: Vec::new() });
+        }
+
+        let frame_count = xtc.frames.len();
+        self.trajectory = xtc.frames;
+        self.trajectory_path = Some(path);
+        self.traj_ui.current_frame = 0;
+        self.traj_ui.is_playing = false;
+
+        self.apply_trajectory_frame(0);
+        self.set_status(format!("Loaded XTC: {} ({} frames)", file_name, frame_count));
+    }
+
+    fn apply_trajectory_frame(&mut self, idx: usize) {
+        let Some(frame) = self.trajectory.get(idx) else {
+            return;
+        };
+        let Some(base) = self.base_molecule.clone() else {
+            return;
+        };
+
+        // Update box for simulation cell render
+        let box_diag = (
+            frame.box_matrix[0][0],
+            frame.box_matrix[1][1],
+            frame.box_matrix[2][2],
+        );
+        self.viewport
+            .set_state_by_type(SimulationCellRenderState::new(box_diag));
+
+        // Clone base molecule and update positions from XTC frame
+        let mut mol = base;
+        for (atom, pos) in mol.atoms.iter_mut().zip(frame.positions.iter()) {
+            atom.position = Vec3::new(pos[0], pos[1], pos[2]);
+        }
+        self.molecule = Some(mol);
+        self.traj_ui.current_frame = idx;
+        self.sync_viewer_molecule();
+    }
+
+    pub fn toggle_playback(&mut self) {
+        self.traj_ui.is_playing = !self.traj_ui.is_playing;
+    }
+
+    pub fn go_to_first_frame(&mut self) {
+        self.traj_ui.is_playing = false;
+        self.apply_trajectory_frame(0);
+    }
+
+    pub fn go_to_last_frame(&mut self) {
+        self.traj_ui.is_playing = false;
+        let last = self.trajectory.len().saturating_sub(1);
+        self.apply_trajectory_frame(last);
+    }
+
+    pub fn step_frame(&mut self, delta: i32) {
+        self.traj_ui.is_playing = false;
+        if self.trajectory.is_empty() {
+            return;
+        }
+        let n = self.trajectory.len() as i32;
+        let next = ((self.traj_ui.current_frame as i32 + delta).rem_euclid(n)) as usize;
+        self.apply_trajectory_frame(next);
+    }
+
+    fn advance_trajectory_if_playing(&mut self, current_time: f64) {
+        if !self.traj_ui.is_playing || self.trajectory.is_empty() {
+            return;
+        }
+        let interval = 1.0 / self.traj_ui.playback_fps as f64;
+        if current_time - self.traj_ui.last_advance_time < interval {
+            return;
+        }
+        self.traj_ui.last_advance_time = current_time;
+        let next = (self.traj_ui.current_frame + 1) % self.trajectory.len();
+        self.apply_trajectory_frame(next);
+    }
+
+    pub fn trajectory_frame_count(&self) -> usize {
+        self.trajectory.len()
+    }
+
+    pub fn trajectory_current_frame(&self) -> usize {
+        self.traj_ui.current_frame
+    }
+
+    pub fn trajectory_current_time(&self) -> f32 {
+        self.trajectory
+            .get(self.traj_ui.current_frame)
+            .map(|f| f.time)
+            .unwrap_or(0.0)
+    }
+
+    pub fn trajectory_is_playing(&self) -> bool {
+        self.traj_ui.is_playing
+    }
+
+    pub fn trajectory_playback_fps(&mut self) -> &mut f32 {
+        &mut self.traj_ui.playback_fps
+    }
+
+    pub fn set_trajectory_frame(&mut self, idx: usize) {
+        self.apply_trajectory_frame(idx);
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1182,6 +1365,7 @@ impl KuromameApp {
         let mut top_path: Option<PathBuf> = None;
         let mut gro_path: Option<PathBuf> = None;
         let mut ndx_path: Option<PathBuf> = None;
+        let mut xtc_path: Option<PathBuf> = None;
         let mut other_path: Option<PathBuf> = None;
 
         for path in &dropped_paths {
@@ -1190,6 +1374,7 @@ impl KuromameApp {
                     "top" | "itp" => top_path = Some(path.clone()),
                     "gro" => gro_path = Some(path.clone()),
                     "ndx" => ndx_path = Some(path.clone()),
+                    "xtc" => xtc_path = Some(path.clone()),
                     _ => other_path = Some(path.clone()),
                 }
             }
@@ -1207,6 +1392,11 @@ impl KuromameApp {
 
         if let Some(gro) = gro_path {
             self.load_gro_file_only(gro);
+            return;
+        }
+
+        if let Some(path) = xtc_path {
+            self.load_xtc_file(path);
             return;
         }
 
@@ -1425,6 +1615,13 @@ impl eframe::App for KuromameApp {
 
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
+
+        // Advance trajectory playback
+        if self.traj_ui.is_playing {
+            let t = ctx.input(|i| i.time);
+            self.advance_trajectory_if_playing(t);
+            ctx.request_repaint();
+        }
 
         app_ui::render_menu_bar(self, &ctx);
         app_ui::render_bottom_status_bar(self, &ctx);

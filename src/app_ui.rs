@@ -78,6 +78,14 @@ pub fn render_menu_bar(app: &mut KuromameApp, ctx: &egui::Context) {
                     ui.close();
                 }
                 if ui
+                    .button(format!("{} Open XTC", mi(MaterialIcon::Movie)))
+                    .on_hover_text("Load XTC trajectory")
+                    .clicked()
+                {
+                    app.open_xtc_file();
+                    ui.close();
+                }
+                if ui
                     .button(format!("{} Import NDX", mi(MaterialIcon::UploadFile)))
                     .clicked()
                 {
@@ -337,6 +345,52 @@ pub fn render_bottom_status_bar(app: &mut KuromameApp, ctx: &egui::Context) {
                 .inner_margin(egui::Margin::symmetric(12, 8)),
         )
         .show(ctx, |ui| {
+            // Trajectory playback controls (shown only when trajectory is loaded)
+            if app.trajectory_frame_count() > 0 {
+                ui.horizontal(|ui| {
+                    if ui.button("|<").on_hover_text("First frame").clicked() {
+                        app.go_to_first_frame();
+                    }
+                    if ui.button("<").on_hover_text("Previous frame").clicked() {
+                        app.step_frame(-1);
+                    }
+                    let play_label = if app.trajectory_is_playing() { "⏸" } else { "▶" };
+                    if ui.button(play_label).on_hover_text("Play/Pause").clicked() {
+                        app.toggle_playback();
+                    }
+                    if ui.button(">").on_hover_text("Next frame").clicked() {
+                        app.step_frame(1);
+                    }
+                    if ui.button(">|").on_hover_text("Last frame").clicked() {
+                        app.go_to_last_frame();
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Frame: {} / {}",
+                        app.trajectory_current_frame() + 1,
+                        app.trajectory_frame_count()
+                    ));
+                    ui.label(format!("Time: {:.3} ps", app.trajectory_current_time()));
+                    ui.separator();
+                    ui.label("FPS:");
+                    ui.add(
+                        egui::DragValue::new(app.trajectory_playback_fps())
+                            .range(0.1..=200.0)
+                            .speed(0.5),
+                    );
+                });
+
+                // Frame slider
+                let mut frame_idx = app.trajectory_current_frame();
+                let max_frame = app.trajectory_frame_count().saturating_sub(1);
+                let slider = egui::Slider::new(&mut frame_idx, 0..=max_frame).show_value(false);
+                if ui.add(slider).changed() {
+                    app.set_trajectory_frame(frame_idx);
+                }
+
+                ui.separator();
+            }
+
             ui.horizontal(|ui| {
                 ui.checkbox(&mut app.selection.with_hbond_chk, "Select with hbond");
                 ui.separator();
