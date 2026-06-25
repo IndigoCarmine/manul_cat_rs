@@ -4,7 +4,7 @@ use crate::inter_molecular_interaction_render::{
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile, XtcFile, XtcFrame};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
-use crate::view_rs::To3dViewMolecule;
+use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
@@ -1235,20 +1235,9 @@ impl KuromameApp {
         } else {
             // No reference structure: create minimal atoms (positions only, no bonds/names)
             let atoms = (0..xtc.natoms)
-                .map(|i| Atom {
-                    position: Vec3::new(0.0, 0.0, 0.0),
-                    element: "C".to_string(),
-                    id: i,
-                    name: None,
-                    res_name: None,
-                    chain_id: None,
-                    res_seq: None,
-                    occupancy: None,
-                    temp_factor: None,
-                    charge: None,
-                })
+                .map(|i| view_atom(Vec3::new(0.0, 0.0, 0.0), "C", i, None))
                 .collect();
-            self.base_molecule = Some(Molecule { atoms, bonds: Vec::new() });
+            self.base_molecule = Some(molecule_from_parts(atoms, Vec::new()));
         }
 
         let frame_count = xtc.frames.len();
@@ -1265,9 +1254,6 @@ impl KuromameApp {
         let Some(frame) = self.trajectory.get(idx) else {
             return;
         };
-        let Some(base) = self.base_molecule.clone() else {
-            return;
-        };
 
         // Update box for simulation cell render
         let box_diag = (
@@ -1278,14 +1264,40 @@ impl KuromameApp {
         self.viewport
             .set_state_by_type(SimulationCellRenderState::new(box_diag));
 
-        // Clone base molecule and update positions from XTC frame
-        let mut mol = base;
-        for (atom, pos) in mol.atoms.iter_mut().zip(frame.positions.iter()) {
-            atom.position = Vec3::new(pos[0], pos[1], pos[2]);
+        let positions: Vec<Vec3> = frame
+            .positions
+            .iter()
+            .map(|p| Vec3::new(p[0], p[1], p[2]))
+            .collect();
+
+        let same_atom_count = self
+            .molecule
+            .as_ref()
+            .map(|mol| mol.atoms.len() == positions.len())
+            .unwrap_or(false);
+
+        if same_atom_count {
+            // Smooth playback: move atoms in place, keeping bonds, metadata and the
+            // user's camera. moleucle_3dview_rs 0.6 updates the GPU buffers without
+            // rebuilding the molecule.
+            if let Some(mol) = &mut self.molecule {
+                for (atom, &pos) in mol.atoms.iter_mut().zip(positions.iter()) {
+                    atom.position = pos;
+                }
+            }
+            let _ = self.viewport.update_positions(&positions);
+        } else if let Some(base) = self.base_molecule.clone() {
+            // First frame (or the molecule was swapped): establish the molecule and
+            // fit the camera once.
+            let mut mol = base;
+            for (atom, &pos) in mol.atoms.iter_mut().zip(positions.iter()) {
+                atom.position = pos;
+            }
+            self.molecule = Some(mol);
+            self.sync_viewer_molecule();
         }
-        self.molecule = Some(mol);
+
         self.traj_ui.current_frame = idx;
-        self.sync_viewer_molecule();
     }
 
     pub fn toggle_playback(&mut self) {
