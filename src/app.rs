@@ -8,11 +8,12 @@ use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
-use moleucle_3dview_rs::molecule::AtomMeta;
+use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 use moleucle_3dview_rs::{
     Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent,
 };
 use rfd::FileDialog;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -97,6 +98,65 @@ struct TrajectoryUiState {
     last_advance_time: f64,
 }
 
+/// Per-residue-name show/hide state plus the index mapping between the full
+/// molecule (`self.molecule`, original indices) and the possibly-filtered
+/// molecule actually handed to the viewport (view indices).
+///
+/// The maps are empty when nothing is hidden, which means "identity" — the
+/// viewport gets the full molecule and `to_view`/`to_orig` are no-ops. This
+/// keeps the common (all-visible) case allocation-free and behaviour-identical
+/// to before the feature existed.
+#[derive(Default)]
+struct VisibilityState {
+    res_visible: BTreeMap<String, bool>,
+    view_to_orig: Vec<usize>,
+    orig_to_view: Vec<Option<u32>>,
+}
+
+impl VisibilityState {
+    fn any_hidden(&self) -> bool {
+        self.res_visible.values().any(|&v| !v)
+    }
+
+    fn is_filtered(&self) -> bool {
+        !self.view_to_orig.is_empty()
+    }
+
+    /// Original atom index -> viewport atom index (None if currently hidden).
+    fn to_view(&self, orig: usize) -> Option<usize> {
+        if self.orig_to_view.is_empty() {
+            Some(orig) // identity: nothing hidden
+        } else {
+            self.orig_to_view
+                .get(orig)
+                .copied()
+                .flatten()
+                .map(|v| v as usize)
+        }
+    }
+
+    /// Viewport atom index -> original atom index.
+    fn to_orig(&self, view: usize) -> usize {
+        self.view_to_orig.get(view).copied().unwrap_or(view)
+    }
+
+    /// Remap 1-based interaction pairs into viewport space, dropping any pair
+    /// with a hidden endpoint.
+    fn map_pairs(&self, pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        if !self.is_filtered() {
+            return pairs.to_vec();
+        }
+        pairs
+            .iter()
+            .filter_map(|&(a, b)| {
+                let va = self.to_view(a.checked_sub(1)?)?;
+                let vb = self.to_view(b.checked_sub(1)?)?;
+                Some((va + 1, vb + 1))
+            })
+            .collect()
+    }
+}
+
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
@@ -165,6 +225,10 @@ pub struct KuromameApp {
     trajectory_path: Option<PathBuf>,
     base_molecule: Option<Molecule>,
     traj_ui: TrajectoryUiState,
+    visibility: VisibilityState,
+    /// Inter-molecular interaction pairs (1-based, original indices) kept so they
+    /// can be remapped whenever the visible set changes.
+    interaction_pairs: Vec<(usize, usize)>,
 }
 
 impl KuromameApp {
@@ -287,6 +351,8 @@ impl KuromameApp {
                 playback_fps: 10.0,
                 last_advance_time: 0.0,
             },
+            visibility: VisibilityState::default(),
+            interaction_pairs: Vec::new(),
         }
     }
 
@@ -307,21 +373,130 @@ impl KuromameApp {
     }
 
     fn sync_viewer_molecule(&mut self) {
-        if let Some(molecule) = self.molecule.clone() {
-            self.viewport.set_molecule(molecule);
-        }
+        self.rebuild_viewport(false);
     }
 
     fn sync_viewer_molecule_and_focus(&mut self) {
-        if let Some(molecule) = self.molecule.clone() {
-            self.viewport.set_molecule(molecule);
+        self.rebuild_viewport(true);
+    }
+
+    /// Push the molecule to the viewport, applying the current per-residue
+    /// visibility filter, and re-derive every index-based render state (NDX,
+    /// interaction pairs) in the resulting viewport-index space. This is the one
+    /// place geometry is handed to the viewport.
+    fn rebuild_viewport(&mut self, focus: bool) {
+        let Some(full) = self.molecule.as_ref() else {
+            return;
+        };
+
+        if !self.visibility.any_hidden() {
+            // Identity: hand over the full molecule, no remapping needed.
+            self.visibility.view_to_orig.clear();
+            self.visibility.orig_to_view.clear();
+            self.viewport.set_molecule(full.clone());
+        } else {
+            let mut view_to_orig: Vec<usize> = Vec::with_capacity(full.atoms.len());
+            let mut orig_to_view: Vec<Option<u32>> = vec![None; full.atoms.len()];
+            let mut atoms: Vec<Atom> = Vec::new();
+            for (orig, atom) in full.atoms.iter().enumerate() {
+                let res = atom.res_name().unwrap_or("");
+                let visible = self.visibility.res_visible.get(res).copied().unwrap_or(true);
+                if visible {
+                    orig_to_view[orig] = Some(view_to_orig.len() as u32);
+                    view_to_orig.push(orig);
+                    atoms.push(atom.clone());
+                }
+            }
+            let mut bonds: Vec<Bond> = Vec::new();
+            for bond in &full.bonds {
+                if let (Some(a), Some(b)) = (orig_to_view[bond.atom_a], orig_to_view[bond.atom_b]) {
+                    bonds.push(Bond {
+                        atom_a: a as usize,
+                        atom_b: b as usize,
+                        order: bond.order,
+                    });
+                }
+            }
+            self.visibility.view_to_orig = view_to_orig;
+            self.visibility.orig_to_view = orig_to_view;
+            self.viewport.set_molecule(molecule_from_parts(atoms, bonds));
+        }
+
+        if focus {
             self.viewport.focus_on_molecule_center();
+        }
+
+        // Re-apply index-based render states in the new viewport-index space.
+        self.refresh_ndx_selection_state();
+        self.refresh_interaction_pairs();
+        // The red click-selection is stored in viewport indices, which just
+        // changed; clear it rather than highlight the wrong atoms.
+        self.viewport.set_state_by_type(SelectedAtomRenderState {
+            selected_atoms: Vec::new(),
+            color: [1.0, 0.0, 0.0],
+        });
+    }
+
+    fn refresh_interaction_pairs(&mut self) {
+        let pairs = self.visibility.map_pairs(&self.interaction_pairs);
+        self.viewport
+            .set_state_by_type(InteractionPairsState { pairs });
+    }
+
+    /// Refresh the set of residue names known to the UI from the current
+    /// molecule, keeping any existing show/hide choices for names that persist.
+    fn refresh_res_names(&mut self) {
+        let Some(mol) = self.molecule.as_ref() else {
+            return;
+        };
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for atom in &mol.atoms {
+            seen.insert(atom.res_name().unwrap_or("").to_string());
+        }
+        self.visibility.res_visible.retain(|name, _| seen.contains(name));
+        for name in seen {
+            self.visibility.res_visible.entry(name).or_insert(true);
+        }
+    }
+
+    /// Residue names with their current visibility, for the UI panel.
+    pub fn res_visibility_list(&self) -> Vec<(String, bool)> {
+        self.visibility
+            .res_visible
+            .iter()
+            .map(|(name, &visible)| (name.clone(), visible))
+            .collect()
+    }
+
+    pub fn has_res_names(&self) -> bool {
+        !self.visibility.res_visible.is_empty()
+    }
+
+    pub fn set_res_visible(&mut self, name: &str, visible: bool) {
+        if let Some(entry) = self.visibility.res_visible.get_mut(name) {
+            if *entry != visible {
+                *entry = visible;
+                self.rebuild_viewport(false);
+            }
+        }
+    }
+
+    pub fn set_all_res_visible(&mut self, visible: bool) {
+        let mut changed = false;
+        for value in self.visibility.res_visible.values_mut() {
+            if *value != visible {
+                *value = visible;
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_viewport(false);
         }
     }
 
     fn post_load_cleanup(&mut self) {
+        self.refresh_res_names();
         self.sync_viewer_molecule_and_focus();
-        self.refresh_ndx_selection_state();
     }
 
     fn normalized_ndx_indices(entries: &[u32], atom_count: usize) -> Vec<usize> {
@@ -359,11 +534,17 @@ impl KuromameApp {
     }
 
     fn refresh_ndx_selection_state(&mut self) {
-        let atom_indices = if self.ui.ndx_visible {
+        let orig_indices = if self.ui.ndx_visible {
             self.current_ndx_indices()
         } else {
             Vec::new()
         };
+
+        // Map into viewport space and drop atoms that are currently hidden.
+        let atom_indices: Vec<usize> = orig_indices
+            .iter()
+            .filter_map(|&orig| self.visibility.to_view(orig))
+            .collect();
 
         self.ui.ndx_selected_atom_count = atom_indices.len();
         self.viewport.set_state_by_type(NdxSelectionState {
@@ -976,9 +1157,9 @@ impl KuromameApp {
         match top.generate_molecule_with_gro(&gro) {
             Ok((molecule, interaction_pairs)) => {
                 let boxsize = gro.box_line;
-                self.viewport.set_state_by_type(InteractionPairsState {
-                    pairs: interaction_pairs,
-                });
+                // Stored in original index space; rebuild_viewport() remaps and
+                // pushes them whenever the visible set changes.
+                self.interaction_pairs = interaction_pairs;
                 self.set_molecule_and_frame(molecule);
                 self.viewport
                     .set_state_by_type(SimulationCellRenderState::new(boxsize));
@@ -1116,6 +1297,7 @@ impl KuromameApp {
                 .and_then(|s| s.gro())
                 .unwrap()
                 .to_molecule_with_metadata(true, None);
+            self.interaction_pairs.clear();
             self.set_molecule_and_frame(mol);
         }
 
@@ -1151,6 +1333,7 @@ impl KuromameApp {
             Ok(content) => {
                 let pdb = PdbFile::load(&content);
                 let mol = pdb.to_molecule();
+                self.interaction_pairs.clear();
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
                 self.data.structure_file = Some(StructureFile::Pdb(pdb));
@@ -1174,6 +1357,7 @@ impl KuromameApp {
                 let mol2 = Mol2File::load(&content);
                 let mol = mol2.to_molecule();
                 let pdb_from_mol2 = PdbFile::from_molecule(&mol);
+                self.interaction_pairs.clear();
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
                 self.data.structure_file = Some(StructureFile::Pdb(pdb_from_mol2));
@@ -1285,7 +1469,19 @@ impl KuromameApp {
                     atom.position = pos;
                 }
             }
-            let _ = self.viewport.update_positions(&positions);
+            // The viewport may hold a filtered subset; feed it positions in
+            // viewport-index order.
+            if self.visibility.is_filtered() {
+                let view_positions: Vec<Vec3> = self
+                    .visibility
+                    .view_to_orig
+                    .iter()
+                    .map(|&orig| positions[orig])
+                    .collect();
+                let _ = self.viewport.update_positions(&view_positions);
+            } else {
+                let _ = self.viewport.update_positions(&positions);
+            }
         } else if let Some(base) = self.base_molecule.clone() {
             // First frame (or the molecule was swapped): establish the molecule and
             // fit the camera once.
@@ -1294,6 +1490,7 @@ impl KuromameApp {
                 atom.position = pos;
             }
             self.molecule = Some(mol);
+            self.refresh_res_names();
             self.sync_viewer_molecule();
         }
 
@@ -1623,9 +1820,11 @@ impl eframe::App for KuromameApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Update hover info from the previous frame's viewport pick result.
+        // Update hover info from the previous frame's viewport pick result. The
+        // picked index is in viewport space; translate it to the full molecule.
         let last_hovered = self.hovered_atom.lock().ok().and_then(|mut g| g.take());
         self.ui.hovered_atom_info = last_hovered
+            .map(|view| self.visibility.to_orig(view))
             .and_then(|atom| self.hovered_atom_info(atom))
             .unwrap_or_else(|| "Hover an atom for details".to_string());
 

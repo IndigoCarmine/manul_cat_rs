@@ -333,6 +333,36 @@ pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 ui.selectable_value(&mut style, RenderStyle::Wireframe, "Wireframe");
                 ui.selectable_value(&mut style, RenderStyle::Circles, "Circles");
                 app.viewport.set_render_style(style);
+
+                if app.has_res_names() {
+                    ui.separator();
+                    ui.label("Residues (show/hide):");
+                    ui.horizontal(|ui| {
+                        if ui.button("Show all").clicked() {
+                            app.set_all_res_visible(true);
+                        }
+                        if ui.button("Hide all").clicked() {
+                            app.set_all_res_visible(false);
+                        }
+                    });
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("res_visibility_scroll")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (name, visible) in app.res_visibility_list() {
+                                let mut shown = visible;
+                                let label = if name.is_empty() {
+                                    "(no residue)".to_string()
+                                } else {
+                                    name.clone()
+                                };
+                                if ui.checkbox(&mut shown, label).changed() {
+                                    app.set_res_visible(&name, shown);
+                                }
+                            }
+                        });
+                }
             });
         });
 }
