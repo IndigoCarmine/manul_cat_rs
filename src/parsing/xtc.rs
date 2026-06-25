@@ -64,14 +64,15 @@ fn decode_bits(buf: &[u8], cnt: &mut usize, num: usize) -> u64 {
     let bit_off = *cnt & 7;
     *cnt += num;
 
+    // bit_off (up to 7) + num (up to 64) can span 9 bytes; use u128 to avoid shift overflow.
     let bytes_needed = (bit_off + num + 7) >> 3;
-    let mut val = 0u64;
+    let mut val = 0u128;
     for i in 0..bytes_needed.min(9) {
-        let b = *buf.get(byte_start + i).unwrap_or(&0) as u64;
+        let b = *buf.get(byte_start + i).unwrap_or(&0) as u128;
         val |= b << (i * 8);
     }
     let mask = if num >= 64 { u64::MAX } else { (1u64 << num) - 1 };
-    (val >> bit_off) & mask
+    ((val >> bit_off) as u64) & mask
 }
 
 // Decode 3 integers packed as mixed-radix in `buf`:
@@ -120,9 +121,11 @@ fn decompress_coords(
     let mut positions = Vec::with_capacity(natoms);
 
     for _ in 0..natoms {
-        // Two header bits: is_small | is_smaller
+        // Bit layout per atom (GROMACS xdrfile format):
+        //   1 bit : is_small
+        //   N bits: coordinate (small or large encoding)
+        //   1 bit : is_smaller  ← comes AFTER the coordinate, not before
         let is_small = decode_bits(buf, &mut cnt, 1) != 0;
-        let is_smaller = decode_bits(buf, &mut cnt, 1) != 0;
 
         let coord = if is_small {
             let d = decode_ints(buf, &mut cnt, sizesmall);
@@ -135,6 +138,9 @@ fn decompress_coords(
             let c = decode_ints(buf, &mut cnt, sizeint);
             [c[0] + minint[0], c[1] + minint[1], c[2] + minint[2]]
         };
+
+        // is_smaller comes after the coordinate data
+        let is_smaller = decode_bits(buf, &mut cnt, 1) != 0;
 
         // Adjust small encoding range for next atom
         if is_small && is_smaller && sidx > 0 {
