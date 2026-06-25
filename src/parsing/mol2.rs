@@ -1,9 +1,6 @@
-use crate::view_rs::To3dViewMolecule;
+use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::{
-    molecule::{Atom, Bond},
-    Molecule,
-};
+use moleucle_3dview_rs::{Molecule, molecule::Bond};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -189,27 +186,22 @@ impl To3dViewMolecule for Mol2File {
 
         for (i, record) in self.atoms().enumerate() {
             id_to_index.insert(record.atom_id, i);
-            atoms.push(Atom {
-                position: Vec3::new(
+            let element = record
+                .atom_type
+                .split('.')
+                .next()
+                .unwrap_or("?")
+                .to_uppercase();
+            atoms.push(view_atom(
+                Vec3::new(
                     record.x * ANGSTROM_TO_NM,
                     record.y * ANGSTROM_TO_NM,
                     record.z * ANGSTROM_TO_NM,
                 ),
-                element: record
-                    .atom_type
-                    .split('.')
-                    .next()
-                    .unwrap_or("?")
-                    .to_uppercase(),
-                id: i,
-                name: None,
-                res_name: None,
-                chain_id: None,
-                res_seq: None,
-                occupancy: None,
-                temp_factor: None,
-                charge: None,
-            });
+                &element,
+                i,
+                None,
+            ));
         }
 
         for record in self.bonds() {
@@ -230,6 +222,6 @@ impl To3dViewMolecule for Mol2File {
             }
         }
 
-        Molecule { atoms, bonds }
+        molecule_from_parts(atoms, bonds)
     }
 }

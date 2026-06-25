@@ -1,8 +1,5 @@
 use crate::parsing::GroFile;
-use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::OffscreenRenderer;
-use moleucle_3dview_rs::molecule::Atom as ViewAtom;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 

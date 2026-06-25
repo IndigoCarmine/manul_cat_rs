@@ -1,8 +1,7 @@
-use egui::debug_text::print;
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{
-    AdditionalRender, Molecule, RenderFrameState, Scene, SharedRenderStates,
-    render_state::get_state_clone_by_type, vdw_radius,
+    AdditionalRender, RenderFrameState, Scene, SharedRenderStates,
+    render_state::get_state_clone_by_type,
 };
 
 pub struct SimulationCellRender {
@@ -36,7 +35,6 @@ impl AdditionalRender for SimulationCellRender {
 
         let state = get_state_clone_by_type::<SimulationCellRenderState>(states)
             .unwrap_or(SimulationCellRenderState::new((0.0, 0.0, 0.0)));
-        print!("SimulationCellRenderState size: {:?}", state.size);
 
         let size = state.size;
         let lines = [

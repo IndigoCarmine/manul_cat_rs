@@ -51,7 +51,6 @@ impl AdditionalRender for InterMolecularInteractionRender {
         };
 
         if state.pairs.is_empty() {
-            println!("No interaction pairs found in state, skipping rendering");
             return;
         }
 

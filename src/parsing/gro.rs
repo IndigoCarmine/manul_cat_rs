@@ -1,4 +1,4 @@
-use crate::view_rs::To3dViewMolecule;
+use crate::view_rs::{AtomMeta, To3dViewMolecule, molecule_from_parts, view_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{
     Molecule,
@@ -335,25 +335,20 @@ impl GroFile {
         let atoms = self
             .atoms()
             .enumerate()
-            .map(|(idx, atom)| Atom {
-                position: Vec3::new(atom.x, atom.y, atom.z),
-                element: Self::infer_element(atom.atom_name.trimmed()),
-                id: idx,
-                name: if include_metadata {
-                    Some(atom.atom_name.trimmed().to_string())
-                } else {
-                    None
-                },
-                res_name: if include_metadata {
-                    Some(atom.res_name.trimmed().to_string())
-                } else {
-                    None
-                },
-                chain_id: Some('A'),
-                res_seq: Some(atom.res_num),
-                occupancy: None,
-                temp_factor: None,
-                charge: None,
+            .map(|(idx, atom)| {
+                let meta = AtomMeta {
+                    name: include_metadata.then(|| atom.atom_name.trimmed().to_string()),
+                    res_name: include_metadata.then(|| atom.res_name.trimmed().to_string()),
+                    chain_id: Some('A'),
+                    res_seq: Some(atom.res_num),
+                    ..AtomMeta::default()
+                };
+                view_atom(
+                    Vec3::new(atom.x, atom.y, atom.z),
+                    &Self::infer_element(atom.atom_name.trimmed()),
+                    idx,
+                    Some(meta),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -378,7 +373,7 @@ impl GroFile {
             Self::infer_single_bonds_from_distance(&atoms)
         };
 
-        Molecule { atoms, bonds }
+        molecule_from_parts(atoms, bonds)
     }
 }
 

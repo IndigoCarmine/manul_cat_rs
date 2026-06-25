@@ -7,7 +7,10 @@ use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderSt
 use crate::view_rs::To3dViewMolecule;
 use eframe::egui::{self};
 use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
-use moleucle_3dview_rs::{Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent};
+use moleucle_3dview_rs::molecule::AtomMeta;
+use moleucle_3dview_rs::{
+    Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent,
+};
 use rfd::FileDialog;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -98,8 +101,7 @@ fn color_by_res_name(atom: &Atom, is_selected: bool) -> (f32, f32, f32) {
     }
 
     let key = atom
-        .res_name
-        .as_deref()
+        .res_name()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(atom.element.as_str());
 
@@ -471,7 +473,7 @@ impl KuromameApp {
     fn atom_name_at(&self, atom_index: usize) -> Option<String> {
         if let Some(mol) = &self.molecule {
             if let Some(atom) = mol.atoms.get(atom_index) {
-                if let Some(name) = atom.name.as_deref() {
+                if let Some(name) = atom.name() {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         return Some(trimmed.to_ascii_uppercase());
@@ -658,7 +660,7 @@ impl KuromameApp {
 
         if let Some(mol) = &self.molecule {
             if let Some(atom) = mol.atoms.get(atom_index) {
-                if let Some(name) = atom.name.as_deref() {
+                if let Some(name) = atom.name() {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         atom_name = Some(trimmed.to_string());
@@ -669,7 +671,7 @@ impl KuromameApp {
                     atom_name = Some(atom.element.trim().to_string());
                 }
 
-                if let Some(name) = atom.res_name.as_deref() {
+                if let Some(name) = atom.res_name() {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         res_name = Some(trimmed.to_string());
@@ -780,7 +782,9 @@ impl KuromameApp {
 
         if let Some(mol) = &mut self.molecule {
             for (atom, name) in mol.atoms.iter_mut().zip(resnames.into_iter()) {
-                atom.res_name = Some(name);
+                atom.meta
+                    .get_or_insert_with(|| Box::new(AtomMeta::default()))
+                    .res_name = Some(name);
             }
             self.sync_viewer_molecule();
         }

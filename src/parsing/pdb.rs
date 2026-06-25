@@ -1,9 +1,6 @@
-use crate::view_rs::To3dViewMolecule;
+use crate::view_rs::{AtomMeta, To3dViewMolecule, molecule_from_parts, view_atom};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::{
-    molecule::{Atom, Bond},
-    Molecule,
-};
+use moleucle_3dview_rs::{Molecule, molecule::Bond};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -158,16 +155,14 @@ impl PdbFile {
         for (idx, atom) in molecule.atoms.iter().enumerate() {
             let serial = idx + 1;
             let name = atom
-                .name
-                .as_deref()
+                .name()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| atom.element.clone());
+                .unwrap_or_else(|| atom.element.to_string());
 
             let res_name = atom
-                .res_name
-                .as_deref()
+                .res_name()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
@@ -186,16 +181,16 @@ impl PdbFile {
                 name,
                 alt_loc: ' ',
                 res_name,
-                chain_id: atom.chain_id.unwrap_or('A'),
-                res_seq: atom.res_seq.unwrap_or(1),
+                chain_id: atom.chain_id().unwrap_or('A'),
+                res_seq: atom.res_seq().unwrap_or(1),
                 i_code: ' ',
                 x: atom.position.x * NM_TO_ANGSTROM,
                 y: atom.position.y * NM_TO_ANGSTROM,
                 z: atom.position.z * NM_TO_ANGSTROM,
-                occupancy: atom.occupancy.unwrap_or(1.0),
-                temp_factor: atom.temp_factor.unwrap_or(0.0),
+                occupancy: atom.occupancy().unwrap_or(1.0),
+                temp_factor: atom.temp_factor().unwrap_or(0.0),
                 element,
-                charge: atom.charge.clone().unwrap_or_default(),
+                charge: atom.charge().unwrap_or_default().to_string(),
             }));
         }
 
@@ -230,22 +225,24 @@ impl To3dViewMolecule for PdbFile {
 
         for (i, record) in self.atoms().enumerate() {
             serial_to_index.insert(record.serial, i);
-            atoms.push(Atom {
-                position: Vec3::new(
+            atoms.push(view_atom(
+                Vec3::new(
                     record.x * ANGSTROM_TO_NM,
                     record.y * ANGSTROM_TO_NM,
                     record.z * ANGSTROM_TO_NM,
                 ),
-                element: record.element.clone(),
-                id: i,
-                name: Some(record.name.clone()),
-                res_name: Some(record.res_name.clone()),
-                chain_id: Some(record.chain_id),
-                res_seq: Some(record.res_seq),
-                occupancy: Some(record.occupancy),
-                temp_factor: Some(record.temp_factor),
-                charge: Some(record.charge.clone()),
-            });
+                &record.element,
+                i,
+                Some(AtomMeta {
+                    name: Some(record.name.clone()),
+                    res_name: Some(record.res_name.clone()),
+                    chain_id: Some(record.chain_id),
+                    res_seq: Some(record.res_seq),
+                    occupancy: Some(record.occupancy),
+                    temp_factor: Some(record.temp_factor),
+                    charge: Some(record.charge.clone()),
+                }),
+            ));
         }
 
         for line in &self.lines {
@@ -266,6 +263,6 @@ impl To3dViewMolecule for PdbFile {
             }
         }
 
-        Molecule { atoms, bonds }
+        molecule_from_parts(atoms, bonds)
     }
 }

@@ -1,10 +1,10 @@
 [package]
 name = "manul_cat_rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git" }
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.6.0" }
 
 eframe = "0.34.2"
 egui = "0.34.2"

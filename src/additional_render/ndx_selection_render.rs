@@ -3,10 +3,6 @@ use moleucle_3dview_rs::{
     render_state::get_state_clone_by_type, vdw_radius,
 };
 
-use lin_alg::f32::Quaternion;
-use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::scene_types::{Entity, Mesh};
-
 #[derive(Clone)]
 pub struct NdxSelectionRender {
     color: (f32, f32, f32),
