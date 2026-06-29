@@ -233,42 +233,77 @@ pub struct KuromameApp {
 
 impl KuromameApp {
     fn apply_visual_theme(ctx: &egui::Context) {
-        let primary = egui::Color32::from_rgb(19, 161, 152);
-        let secondary = egui::Color32::from_rgb(241, 98, 69);
+        use app_ui::theme;
 
         let mut style = (*ctx.global_style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
 
         style.text_styles.insert(
             egui::TextStyle::Heading,
-            egui::FontId::new(24.0, egui::FontFamily::Proportional),
+            egui::FontId::new(20.0, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Body,
-            egui::FontId::new(18.0, egui::FontFamily::Proportional),
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Button,
-            egui::FontId::new(18.0, egui::FontFamily::Proportional),
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
         );
         style.text_styles.insert(
             egui::TextStyle::Monospace,
-            egui::FontId::new(16.0, egui::FontFamily::Monospace),
+            egui::FontId::new(13.0, egui::FontFamily::Monospace),
         );
         style.text_styles.insert(
             egui::TextStyle::Small,
-            egui::FontId::new(15.0, egui::FontFamily::Proportional),
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
         );
 
-        style.visuals.widgets.active.bg_fill = primary;
-        style.visuals.widgets.hovered.bg_fill = secondary;
-        style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
-        style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
-        style.visuals.selection.bg_fill = primary;
-        style.visuals.hyperlink_color = secondary;
+        // Dark palette matching the "Viewer UI" design.
+        let mut v = egui::Visuals::dark();
+        v.dark_mode = true;
+        v.override_text_color = Some(theme::TEXT);
+        v.panel_fill = theme::PANEL;
+        v.window_fill = theme::PANEL;
+        v.extreme_bg_color = theme::INPUT_BG;
+        v.faint_bg_color = theme::HOVER_BG;
+        v.window_stroke = egui::Stroke::new(1.0, theme::BORDER);
+        v.hyperlink_color = theme::ACCENT;
+        v.selection.bg_fill = theme::ACCENT.gamma_multiply(0.35);
+        v.selection.stroke = egui::Stroke::new(1.0, theme::ACCENT);
 
+        let w = &mut v.widgets;
+        w.noninteractive.bg_fill = theme::PANEL;
+        w.noninteractive.weak_bg_fill = theme::PANEL;
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+        w.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+        w.inactive.bg_fill = theme::HOVER_BG;
+        w.inactive.weak_bg_fill = theme::HOVER_BG;
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER2);
+        w.inactive.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+        w.inactive.corner_radius = egui::CornerRadius::same(7);
+        w.hovered.bg_fill = theme::BORDER2;
+        w.hovered.weak_bg_fill = theme::BORDER2;
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, theme::MUTED);
+        w.hovered.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+        w.hovered.corner_radius = egui::CornerRadius::same(7);
+        w.active.bg_fill = theme::ACCENT;
+        w.active.weak_bg_fill = theme::ACCENT;
+        w.active.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT);
+        w.active.fg_stroke = egui::Stroke::new(1.0, theme::ACCENT_FG);
+        w.active.corner_radius = egui::CornerRadius::same(7);
+        w.open.bg_fill = theme::HOVER_BG;
+        w.open.bg_stroke = egui::Stroke::new(1.0, theme::BORDER2);
+        w.open.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+
+        style.visuals = v;
         ctx.set_global_style(style);
+    }
+
+    /// Number of atoms in the currently loaded molecule (0 when none).
+    pub fn atom_count(&self) -> usize {
+        self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0)
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -1841,19 +1876,64 @@ impl eframe::App for KuromameApp {
         app_ui::render_menu_bar(self, &ctx);
         app_ui::render_bottom_status_bar(self, &ctx);
         app_ui::render_left_panel(self, &ctx);
+        app_ui::render_bottom_dock(self, &ctx);
         app_ui::render_edit_dialog(self, &ctx);
 
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let Some(render_state) = &self.render_state else {
-                ui.heading("WGPU backend is unavailable");
-                ui.label("Start with the wgpu backend enabled in eframe.");
-                return;
-            };
+        // Top-left overlay text: filename · frame.
+        let overlay_label = if self.trajectory_frame_count() > 0 {
+            format!(
+                "{} · frame {}",
+                self.data.loaded_summary,
+                self.trajectory_current_frame() + 1
+            )
+        } else {
+            self.data.loaded_summary.clone()
+        };
 
-            if let Err(err) = self.viewport.show(ui, render_state) {
-                ui.colored_label(egui::Color32::RED, format!("Render failed: {err}"));
-            }
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(app_ui::theme::BG))
+            .show(&ctx, |ui| {
+                let Some(render_state) = &self.render_state else {
+                    ui.heading("WGPU backend is unavailable");
+                    ui.label("Start with the wgpu backend enabled in eframe.");
+                    return;
+                };
+
+                if let Err(err) = self.viewport.show(ui, render_state) {
+                    ui.colored_label(egui::Color32::RED, format!("Render failed: {err}"));
+                }
+
+                // Corner overlays drawn on top of the 3D view.
+                let rect = ui.max_rect();
+                let painter = ui.painter().clone();
+                painter.text(
+                    rect.left_top() + egui::vec2(14.0, 12.0),
+                    egui::Align2::LEFT_TOP,
+                    &overlay_label,
+                    egui::FontId::proportional(11.0),
+                    app_ui::theme::MUTED2,
+                );
+                painter.text(
+                    rect.left_bottom() + egui::vec2(14.0, -12.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "X · Y · Z",
+                    egui::FontId::proportional(10.0),
+                    app_ui::theme::MUTED2,
+                );
+
+                // Top-right reset-view button.
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 40.0, rect.top() + 12.0),
+                    egui::vec2(28.0, 28.0),
+                );
+                if ui
+                    .put(btn_rect, egui::Button::new("⟳"))
+                    .on_hover_text("Reset view")
+                    .clicked()
+                {
+                    self.viewport.focus_on_molecule_center();
+                }
+            });
 
         // Show a drop-target overlay while files are being dragged over the window.
         // This provides visual feedback on Linux (X11/Wayland) and other platforms.
