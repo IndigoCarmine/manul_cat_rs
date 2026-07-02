@@ -2,8 +2,11 @@ use crate::inter_molecular_interaction_render::{
     InterMolecularInteractionRender, InteractionPairsState,
 };
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
-use crate::parsing::{AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, TopFile, XtcFile, XtcFrame};
+use crate::parsing::{
+    AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile, XtcFile, XtcFrame,
+};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
+use crate::surface_mesh_render::{SurfaceMeshRender, SurfaceMeshState};
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
@@ -229,6 +232,17 @@ pub struct KuromameApp {
     /// Inter-molecular interaction pairs (1-based, original indices) kept so they
     /// can be remapped whenever the visible set changes.
     interaction_pairs: Vec<(usize, usize)>,
+    /// Dot-surface positions (nm) parsed from the loaded PDB, empty when none.
+    surface_dots: Vec<Vec3>,
+    /// Whether the dot surface is currently drawn.
+    surface_visible: bool,
+    /// Monotonic counter bumped on every viewport rebuild. Used to give each
+    /// filtered molecule a distinct generation so the renderer's geometry cache
+    /// (keyed on `(molecule_ptr, generation, …)`) actually rebuilds when the
+    /// visible atom set changes — otherwise hiding/showing residues has no
+    /// visible effect because every filtered molecule starts at generation 0 and
+    /// lives at the same viewer address.
+    view_revision: u64,
 }
 
 impl KuromameApp {
@@ -325,6 +339,7 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(InterMolecularInteractionRender::new()));
         viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
+        viewport.add_additional_render_box(Box::new(SurfaceMeshRender::new()));
 
         let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let hovered_atom_for_handler = Arc::clone(&hovered_atom);
@@ -388,6 +403,9 @@ impl KuromameApp {
             },
             visibility: VisibilityState::default(),
             interaction_pairs: Vec::new(),
+            surface_dots: Vec::new(),
+            surface_visible: true,
+            view_revision: 0,
         }
     }
 
@@ -424,10 +442,12 @@ impl KuromameApp {
             return;
         };
 
+        let pushed_positions: Vec<Vec3>;
         if !self.visibility.any_hidden() {
             // Identity: hand over the full molecule, no remapping needed.
             self.visibility.view_to_orig.clear();
             self.visibility.orig_to_view.clear();
+            pushed_positions = full.atoms.iter().map(|a| a.position).collect();
             self.viewport.set_molecule(full.clone());
         } else {
             let mut view_to_orig: Vec<usize> = Vec::with_capacity(full.atoms.len());
@@ -454,8 +474,21 @@ impl KuromameApp {
             }
             self.visibility.view_to_orig = view_to_orig;
             self.visibility.orig_to_view = orig_to_view;
+            pushed_positions = atoms.iter().map(|a| a.position).collect();
             self.viewport.set_molecule(molecule_from_parts(atoms, bonds));
         }
+
+        // `set_molecule` always installs a molecule at generation 0, and the
+        // viewer stores it at a fixed address, so two successive filtered
+        // molecules would share the renderer's geometry-cache key and the view
+        // would not update. Bump the generation to a value that cycles so each
+        // rebuild differs from the previous one, forcing a cache miss. The
+        // position payload is unchanged; only the generation counter advances.
+        let bump = (self.view_revision % 4) + 1;
+        for _ in 0..bump {
+            let _ = self.viewport.update_positions(&pushed_positions);
+        }
+        self.view_revision = self.view_revision.wrapping_add(1);
 
         if focus {
             self.viewport.focus_on_molecule_center();
@@ -531,7 +564,45 @@ impl KuromameApp {
 
     fn post_load_cleanup(&mut self) {
         self.refresh_res_names();
+        // When a dot surface is present, draw it through the dedicated surface
+        // renderer and hide the raw "DOT" atoms from the main geometry so they
+        // do not show up as a blob of large spheres on top of the surface.
+        if !self.surface_dots.is_empty() {
+            self.visibility
+                .res_visible
+                .insert(SURFACE_RES_NAME.to_string(), false);
+        }
+        self.refresh_surface_state();
         self.sync_viewer_molecule_and_focus();
+    }
+
+    /// Push the current dot-surface positions and visibility to the viewport.
+    fn refresh_surface_state(&mut self) {
+        self.viewport.set_state_by_type(SurfaceMeshState {
+            positions: self.surface_dots.clone(),
+            visible: self.surface_visible && !self.surface_dots.is_empty(),
+        });
+    }
+
+    /// Whether the currently loaded structure carries a dot surface.
+    pub fn has_surface(&self) -> bool {
+        !self.surface_dots.is_empty()
+    }
+
+    /// Number of dots in the loaded surface (0 when none).
+    pub fn surface_dot_count(&self) -> usize {
+        self.surface_dots.len()
+    }
+
+    pub fn surface_visible(&self) -> bool {
+        self.surface_visible
+    }
+
+    pub fn set_surface_visible(&mut self, visible: bool) {
+        if self.surface_visible != visible {
+            self.surface_visible = visible;
+            self.refresh_surface_state();
+        }
     }
 
     fn normalized_ndx_indices(entries: &[u32], atom_count: usize) -> Vec<usize> {
@@ -1195,6 +1266,7 @@ impl KuromameApp {
                 // Stored in original index space; rebuild_viewport() remaps and
                 // pushes them whenever the visible set changes.
                 self.interaction_pairs = interaction_pairs;
+                self.surface_dots.clear();
                 self.set_molecule_and_frame(molecule);
                 self.viewport
                     .set_state_by_type(SimulationCellRenderState::new(boxsize));
@@ -1333,6 +1405,7 @@ impl KuromameApp {
                 .unwrap()
                 .to_molecule_with_metadata(true, None);
             self.interaction_pairs.clear();
+            self.surface_dots.clear();
             self.set_molecule_and_frame(mol);
         }
 
@@ -1369,6 +1442,7 @@ impl KuromameApp {
                 let pdb = PdbFile::load(&content);
                 let mol = pdb.to_molecule();
                 self.interaction_pairs.clear();
+                self.surface_dots = pdb.surface_dots();
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
                 self.data.structure_file = Some(StructureFile::Pdb(pdb));
@@ -1393,6 +1467,7 @@ impl KuromameApp {
                 let mol = mol2.to_molecule();
                 let pdb_from_mol2 = PdbFile::from_molecule(&mol);
                 self.interaction_pairs.clear();
+                self.surface_dots.clear();
                 self.set_molecule_and_frame(mol);
                 self.data.clear_structures();
                 self.data.structure_file = Some(StructureFile::Pdb(pdb_from_mol2));

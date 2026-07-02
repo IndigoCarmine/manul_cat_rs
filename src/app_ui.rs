@@ -436,6 +436,26 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
         );
     }
 
+    // Dot-surface block (only when the loaded PDB carries a "DOT" surface).
+    if app.has_surface() {
+        ui.add_space(12.0);
+        section_label(ui, "SURFACE");
+        ui.add_space(6.0);
+
+        let mut surface_visible = app.surface_visible();
+        if ui
+            .checkbox(&mut surface_visible, "Show dot surface")
+            .changed()
+        {
+            app.set_surface_visible(surface_visible);
+        }
+        ui.label(
+            egui::RichText::new(format!("{} dots", app.surface_dot_count()))
+                .color(theme::MUTED2)
+                .size(12.0),
+        );
+    }
+
     // NDX group block (only when an NDX file with groups is loaded).
     if app.ndx_group_count() > 0 {
         ui.add_space(12.0);

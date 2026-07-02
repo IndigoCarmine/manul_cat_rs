@@ -9,6 +9,10 @@ use super::AtomRecord;
 const ANGSTROM_TO_NM: f32 = 0.1;
 const NM_TO_ANGSTROM: f32 = 10.0;
 
+/// Residue name that `gmx sasa` (and similar tools) use for the dots of a
+/// Connolly / solvent-accessible-surface point cloud embedded in a PDB.
+pub const SURFACE_RES_NAME: &str = "DOT";
+
 // --- PDB Structures ---
 
 #[derive(Debug, Clone)]
@@ -85,6 +89,22 @@ impl PdbFile {
             }
         }
         out
+    }
+
+    /// Positions (in nanometers) of the surface dots embedded in this PDB, i.e.
+    /// atoms whose residue name is [`SURFACE_RES_NAME`]. Empty when the file has
+    /// no dot surface.
+    pub fn surface_dots(&self) -> Vec<Vec3> {
+        self.atoms()
+            .filter(|a| a.res_name.trim() == SURFACE_RES_NAME)
+            .map(|a| {
+                Vec3::new(
+                    a.x * ANGSTROM_TO_NM,
+                    a.y * ANGSTROM_TO_NM,
+                    a.z * ANGSTROM_TO_NM,
+                )
+            })
+            .collect()
     }
 
     pub fn atoms(&self) -> impl Iterator<Item = &AtomRecord> {
@@ -264,5 +284,32 @@ impl To3dViewMolecule for PdbFile {
         }
 
         molecule_from_parts(atoms, bonds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(name: &str) -> String {
+        let path = format!("{}/sample/{}", env!("CARGO_MANIFEST_DIR"), name);
+        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing sample: {path}"))
+    }
+
+    #[test]
+    fn extracts_dot_surface_from_gmx_sasa_pdb() {
+        let pdb = PdbFile::load(&sample("mch_C3_surface.pdb"));
+
+        // 3 coarse-grained beads (MCH) + 802 surface dots (DOT).
+        assert_eq!(pdb.atoms().count(), 805);
+        assert_eq!(pdb.surface_dots().len(), 802);
+
+        // Dots are converted to nanometers.
+        let first = pdb.surface_dots()[0];
+        assert!((first.x - 1.139).abs() < 1e-4, "x was {}", first.x);
+
+        // Non-surface files yield no dots.
+        let plain = PdbFile::load("ATOM      1  CA  ALA     1      0.000   0.000   0.000\n");
+        assert!(plain.surface_dots().is_empty());
     }
 }
