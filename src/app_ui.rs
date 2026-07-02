@@ -171,6 +171,14 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             app.open_ndx_file();
             ui.close();
         }
+        if ui
+            .button(format!("{} Add Overlay Surface", mi(MaterialIcon::Layers)))
+            .on_hover_text("Overlay a PDB dot surface on top of the current structure")
+            .clicked()
+        {
+            app.open_overlay_surface_file();
+            ui.close();
+        }
         ui.separator();
         if ui
             .button(format!("{} Export", mi(MaterialIcon::Save)))
@@ -501,6 +509,115 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
             .color(theme::MUTED2)
             .size(12.0),
         );
+    }
+}
+
+/// Right-side, tab-based panel for overlaying additional dot surfaces on top of
+/// the base structure. Independent of the left panel: each loaded surface file
+/// is a tab, and the active tab exposes its color, visibility and removal.
+pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
+    egui::SidePanel::right("overlay_panel")
+        .resizable(true)
+        .default_width(240.0)
+        .min_width(190.0)
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(16, 16)),
+        )
+        .show(ctx, |ui| {
+            section_label(ui, "OVERLAY SURFACES");
+            ui.add_space(6.0);
+
+            if secondary_button(
+                ui,
+                format!("{}  Add surface…", mi(MaterialIcon::Layers)),
+                true,
+            )
+            .on_hover_text("Load a PDB dot surface as a new overlay layer")
+            .clicked()
+            {
+                app.open_overlay_surface_file();
+            }
+            ui.add_space(8.0);
+
+            let count = app.overlay_count();
+            if count == 0 {
+                ui.label(
+                    egui::RichText::new("No overlay surfaces.\nAdd PDBs with a DOT surface to compare them over the base structure.")
+                        .color(theme::MUTED2)
+                        .size(12.0),
+                );
+                return;
+            }
+
+            // Tab bar: one selectable chip per overlay surface.
+            let names = app.overlay_names();
+            let mut active = app.active_overlay_index();
+            egui::ScrollArea::horizontal()
+                .id_salt("overlay_tabs_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            let label = format!("{}. {}", i + 1, tab_short_name(name));
+                            if ui.selectable_label(i == active, label).clicked() {
+                                active = i;
+                            }
+                        }
+                    });
+                });
+            if active != app.active_overlay_index() {
+                app.set_active_overlay(active);
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            let idx = app.active_overlay_index();
+            if let Some(name) = app.overlay_name(idx) {
+                ui.label(egui::RichText::new(name).color(theme::TEXT).size(13.0).strong());
+                ui.label(
+                    egui::RichText::new(format!("{} dots", app.overlay_dot_count(idx)))
+                        .color(theme::MUTED2)
+                        .size(12.0),
+                );
+                ui.add_space(8.0);
+
+                let mut visible = app.overlay_visible(idx);
+                if ui.checkbox(&mut visible, "Show").changed() {
+                    app.set_overlay_visible(idx, visible);
+                }
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Color").color(theme::TEXT).size(12.5));
+                    let mut color = app.overlay_color(idx);
+                    if ui.color_edit_button_rgb(&mut color).changed() {
+                        app.set_overlay_color(idx, color);
+                    }
+                });
+                ui.add_space(12.0);
+
+                if secondary_button(ui, format!("{}  Remove", mi(MaterialIcon::Delete)), true)
+                    .clicked()
+                {
+                    app.remove_overlay(idx);
+                }
+            }
+        });
+}
+
+/// Trim an overlay's file name so it fits on a tab chip.
+fn tab_short_name(name: &str) -> String {
+    let stem = name.strip_suffix(".pdb").unwrap_or(name);
+    let stem = stem.strip_suffix(".ent").unwrap_or(stem);
+    if stem.chars().count() > 12 {
+        let short: String = stem.chars().take(11).collect();
+        format!("{short}…")
+    } else {
+        stem.to_string()
     }
 }
 

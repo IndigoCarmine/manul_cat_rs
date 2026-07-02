@@ -6,7 +6,7 @@ use crate::parsing::{
     AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile, XtcFile, XtcFrame,
 };
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
-use crate::surface_mesh_render::{SurfaceMeshRender, SurfaceMeshState};
+use crate::surface_mesh_render::{SurfaceLayer, SurfaceMeshRender, SurfaceMeshState};
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
@@ -160,6 +160,30 @@ impl VisibilityState {
     }
 }
 
+/// Default color for the base structure's own dot surface.
+const BASE_SURFACE_COLOR: [f32; 3] = [0.35, 0.72, 0.95];
+
+/// Palette cycled through when new overlay surfaces are added, so each loaded
+/// file starts with a distinct color the user can then override.
+const OVERLAY_SURFACE_PALETTE: [[f32; 3]; 6] = [
+    [0.95, 0.35, 0.35], // red
+    [0.45, 0.85, 0.45], // green
+    [0.95, 0.72, 0.30], // orange
+    [0.80, 0.45, 0.95], // purple
+    [0.30, 0.85, 0.85], // cyan
+    [0.95, 0.55, 0.80], // pink
+];
+
+/// An additional dot surface loaded from a separate file and overlaid on top of
+/// the base structure. Managed independently of the base structure through the
+/// overlay tab UI, with a user-configurable color.
+struct OverlaySurface {
+    name: String,
+    dots: Vec<Vec3>,
+    color: [f32; 3],
+    visible: bool,
+}
+
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
@@ -232,10 +256,15 @@ pub struct KuromameApp {
     /// Inter-molecular interaction pairs (1-based, original indices) kept so they
     /// can be remapped whenever the visible set changes.
     interaction_pairs: Vec<(usize, usize)>,
-    /// Dot-surface positions (nm) parsed from the loaded PDB, empty when none.
+    /// Dot-surface positions (nm) parsed from the base PDB, empty when none.
     surface_dots: Vec<Vec3>,
-    /// Whether the dot surface is currently drawn.
+    /// Whether the base dot surface is currently drawn.
     surface_visible: bool,
+    /// Extra dot surfaces loaded from separate files and overlaid on top of the
+    /// base structure, each with its own color. Managed by the overlay tab UI.
+    overlay_surfaces: Vec<OverlaySurface>,
+    /// Index of the overlay surface whose controls the tab UI currently shows.
+    active_overlay: usize,
     /// Monotonic counter bumped on every viewport rebuild. Used to give each
     /// filtered molecule a distinct generation so the renderer's geometry cache
     /// (keyed on `(molecule_ptr, generation, …)`) actually rebuilds when the
@@ -405,6 +434,8 @@ impl KuromameApp {
             interaction_pairs: Vec::new(),
             surface_dots: Vec::new(),
             surface_visible: true,
+            overlay_surfaces: Vec::new(),
+            active_overlay: 0,
             view_revision: 0,
         }
     }
@@ -576,12 +607,140 @@ impl KuromameApp {
         self.sync_viewer_molecule_and_focus();
     }
 
-    /// Push the current dot-surface positions and visibility to the viewport.
+    /// Collect the base surface (if visible) and every visible overlay surface
+    /// into a single layered render state and push it to the viewport.
     fn refresh_surface_state(&mut self) {
-        self.viewport.set_state_by_type(SurfaceMeshState {
-            positions: self.surface_dots.clone(),
-            visible: self.surface_visible && !self.surface_dots.is_empty(),
+        let mut layers: Vec<SurfaceLayer> = Vec::new();
+        if self.surface_visible && !self.surface_dots.is_empty() {
+            layers.push(SurfaceLayer {
+                positions: self.surface_dots.clone(),
+                color: (
+                    BASE_SURFACE_COLOR[0],
+                    BASE_SURFACE_COLOR[1],
+                    BASE_SURFACE_COLOR[2],
+                ),
+            });
+        }
+        for overlay in &self.overlay_surfaces {
+            if overlay.visible && !overlay.dots.is_empty() {
+                layers.push(SurfaceLayer {
+                    positions: overlay.dots.clone(),
+                    color: (overlay.color[0], overlay.color[1], overlay.color[2]),
+                });
+            }
+        }
+        self.viewport.set_state_by_type(SurfaceMeshState { layers });
+    }
+
+    /// Open a file dialog to add an overlay surface from a PDB with a dot surface.
+    pub fn open_overlay_surface_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("Surface PDB", &["pdb", "ent"])
+            .set_title("Add overlay surface (PDB with DOT surface)")
+            .pick_file()
+        {
+            self.load_overlay_surface_file(path);
+        }
+    }
+
+    fn load_overlay_surface_file(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.set_status(format!("Failed to read {file_name}"));
+                return;
+            }
+        };
+
+        let dots = PdbFile::load(&content).surface_dots();
+        if dots.is_empty() {
+            self.set_status(format!("{file_name} contains no DOT surface"));
+            return;
+        }
+
+        let count = dots.len();
+        let color = OVERLAY_SURFACE_PALETTE
+            [self.overlay_surfaces.len() % OVERLAY_SURFACE_PALETTE.len()];
+        self.overlay_surfaces.push(OverlaySurface {
+            name: file_name.clone(),
+            dots,
+            color,
+            visible: true,
         });
+        self.active_overlay = self.overlay_surfaces.len() - 1;
+        self.refresh_surface_state();
+        self.set_status(format!("Added overlay surface {file_name} ({count} dots)"));
+    }
+
+    pub fn overlay_count(&self) -> usize {
+        self.overlay_surfaces.len()
+    }
+
+    pub fn overlay_names(&self) -> Vec<String> {
+        self.overlay_surfaces.iter().map(|o| o.name.clone()).collect()
+    }
+
+    pub fn active_overlay_index(&self) -> usize {
+        self.active_overlay
+    }
+
+    pub fn set_active_overlay(&mut self, idx: usize) {
+        if idx < self.overlay_surfaces.len() {
+            self.active_overlay = idx;
+        }
+    }
+
+    pub fn overlay_name(&self, idx: usize) -> Option<String> {
+        self.overlay_surfaces.get(idx).map(|o| o.name.clone())
+    }
+
+    pub fn overlay_dot_count(&self, idx: usize) -> usize {
+        self.overlay_surfaces.get(idx).map(|o| o.dots.len()).unwrap_or(0)
+    }
+
+    pub fn overlay_visible(&self, idx: usize) -> bool {
+        self.overlay_surfaces.get(idx).map(|o| o.visible).unwrap_or(false)
+    }
+
+    pub fn set_overlay_visible(&mut self, idx: usize, visible: bool) {
+        if let Some(overlay) = self.overlay_surfaces.get_mut(idx) {
+            if overlay.visible != visible {
+                overlay.visible = visible;
+                self.refresh_surface_state();
+            }
+        }
+    }
+
+    pub fn overlay_color(&self, idx: usize) -> [f32; 3] {
+        self.overlay_surfaces
+            .get(idx)
+            .map(|o| o.color)
+            .unwrap_or([1.0, 1.0, 1.0])
+    }
+
+    pub fn set_overlay_color(&mut self, idx: usize, color: [f32; 3]) {
+        if let Some(overlay) = self.overlay_surfaces.get_mut(idx) {
+            if overlay.color != color {
+                overlay.color = color;
+                self.refresh_surface_state();
+            }
+        }
+    }
+
+    pub fn remove_overlay(&mut self, idx: usize) {
+        if idx < self.overlay_surfaces.len() {
+            self.overlay_surfaces.remove(idx);
+            if self.active_overlay >= self.overlay_surfaces.len() {
+                self.active_overlay = self.overlay_surfaces.len().saturating_sub(1);
+            }
+            self.refresh_surface_state();
+        }
     }
 
     /// Whether the currently loaded structure carries a dot surface.
@@ -1951,6 +2110,7 @@ impl eframe::App for KuromameApp {
         app_ui::render_menu_bar(self, &ctx);
         app_ui::render_bottom_status_bar(self, &ctx);
         app_ui::render_left_panel(self, &ctx);
+        app_ui::render_overlay_panel(self, &ctx);
         app_ui::render_bottom_dock(self, &ctx);
         app_ui::render_edit_dialog(self, &ctx);
 

@@ -5,37 +5,38 @@ use moleucle_3dview_rs::{
     render_state::get_state_clone_by_type,
 };
 
-/// Renders a molecular dot surface (e.g. the Connolly / SASA "DOT" surface that
-/// `gmx sasa` writes into a PDB). Each dot is drawn as a small 3-axis cross via
-/// the wireframe pipeline, so the surface is always shown as a see-through
-/// wireframe regardless of the viewer's current render style. The dot positions
-/// are supplied through [`SurfaceMeshState`] and are independent of the loaded
-/// molecule, so the surface stays put even while a trajectory animates the atoms.
+/// Renders one or more molecular dot surfaces (e.g. the Connolly / SASA "DOT"
+/// surface that `gmx sasa` writes into a PDB). Each dot is drawn as a small
+/// 3-axis cross via the wireframe pipeline, so surfaces are always shown as a
+/// see-through wireframe regardless of the viewer's current render style.
+///
+/// Several surfaces can be overlaid at once; each [`SurfaceLayer`] carries its
+/// own color so multiple loaded files can be told apart. Positions are supplied
+/// through [`SurfaceMeshState`] and are independent of the loaded molecule, so
+/// surfaces stay put even while a trajectory animates the atoms.
 pub struct SurfaceMeshRender {
-    color: (f32, f32, f32),
     /// Half-length of each cross arm, in nanometers.
     radius: f32,
 }
 
-/// State type for the surface dot cloud stored in SharedRenderStates.
-///
-/// `positions` are in the crate's nanometer units.
+/// A single overlaid dot surface: positions (in the crate's nanometer units)
+/// with the color it should be drawn in.
+#[derive(Clone)]
+pub struct SurfaceLayer {
+    pub positions: Vec<Vec3>,
+    pub color: (f32, f32, f32),
+}
+
+/// State type for the surface overlays stored in SharedRenderStates. Only the
+/// layers that should currently be drawn are included.
 #[derive(Clone, Default)]
 pub struct SurfaceMeshState {
-    pub positions: Vec<Vec3>,
-    pub visible: bool,
+    pub layers: Vec<SurfaceLayer>,
 }
 
 impl SurfaceMeshRender {
     pub fn new() -> Self {
-        Self {
-            color: (0.35, 0.72, 0.95),
-            radius: 0.04,
-        }
-    }
-
-    pub fn set_color(&mut self, color: (f32, f32, f32)) {
-        self.color = color;
+        Self { radius: 0.04 }
     }
 
     pub fn set_radius(&mut self, radius: f32) {
@@ -81,23 +82,28 @@ impl AdditionalRender for SurfaceMeshRender {
             return;
         };
 
-        if !state.visible || state.positions.is_empty() {
+        let total: usize = state.layers.iter().map(|l| l.positions.len()).sum();
+        if total == 0 {
             return;
         }
 
+        // All crosses share one unit mesh; per-dot placement/scale/color lives on
+        // the entities.
         let mesh_idx = scene.meshes.len();
         scene.meshes.push(Self::unit_cross_mesh());
 
-        scene.entities.reserve(state.positions.len());
-        for &position in &state.positions {
-            scene.entities.push(Entity::new(
-                mesh_idx,
-                position,
-                Quaternion::new_identity(),
-                self.radius,
-                self.color,
-                0.1,
-            ));
+        scene.entities.reserve(total);
+        for layer in &state.layers {
+            for &position in &layer.positions {
+                scene.entities.push(Entity::new(
+                    mesh_idx,
+                    position,
+                    Quaternion::new_identity(),
+                    self.radius,
+                    layer.color,
+                    0.1,
+                ));
+            }
         }
     }
 }
