@@ -1,6 +1,7 @@
 pub use moleucle_3dview_rs::AtomRecord;
 
 mod gro;
+mod martini;
 mod mol2;
 mod ndx;
 mod pdb;
@@ -8,6 +9,7 @@ mod top;
 mod xtc;
 
 pub use gro::{GroAtomRecord, GroFile, GroFixed5};
+pub use martini::MartiniForceField;
 pub use mol2::{Mol2AtomRecord, Mol2BondRecord, Mol2File, Mol2Line};
 pub use ndx::{NdxFile, NdxGroup, ParseNdxError};
 pub use pdb::{ConectRecord, PdbFile, PdbLine, SURFACE_RES_NAME};

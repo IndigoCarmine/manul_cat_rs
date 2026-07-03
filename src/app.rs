@@ -1,9 +1,14 @@
+use crate::layer_overlay_render::{
+    LayerOverlayGeom, LayerOverlayRender, LayerOverlayState, OverlayAtom,
+};
 use crate::inter_molecular_interaction_render::{
     InterMolecularInteractionRender, InteractionPairsState,
 };
+use crate::martini_bead_render::{BeadStyle, MartiniBeadRender, MartiniBeadState};
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{
-    AtomRecord, GroFile, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile, XtcFile, XtcFrame,
+    AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
+    XtcFile, XtcFrame,
 };
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::surface_mesh_render::{SurfaceLayer, SurfaceMeshRender, SurfaceMeshState};
@@ -14,6 +19,7 @@ use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
 use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 use moleucle_3dview_rs::{
     Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent,
+    ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
 use std::collections::BTreeMap;
@@ -58,6 +64,7 @@ impl StructureFile {
     }
 }
 
+#[derive(Default)]
 struct LoadedDataState {
     structure_file: Option<StructureFile>,
     structure_file_path: Option<PathBuf>,
@@ -78,6 +85,7 @@ impl LoadedDataState {
     }
 }
 
+#[derive(Default)]
 struct SelectionState {
     with_hbond_chk: bool,
     selected_atom_indices: Vec<usize>,
@@ -94,11 +102,19 @@ struct UiState {
     ndx_selected_atom_count: usize,
 }
 
+#[derive(Default)]
 struct TrajectoryUiState {
     current_frame: usize,
     is_playing: bool,
     playback_fps: f32,
     last_advance_time: f64,
+    /// Number of sub-steps each real-frame transition is divided into during
+    /// playback. `1` disables smoothing (frames shown as-is); `N` inserts
+    /// `N - 1` linearly-interpolated frames between consecutive real frames.
+    interp_steps: u32,
+    /// Current sub-step within the transition out of `current_frame` (`0` means
+    /// the exact frame is displayed). Always `< interp_steps`.
+    interp_sub: u32,
 }
 
 /// Per-residue-name show/hide state plus the index mapping between the full
@@ -184,6 +200,79 @@ struct OverlaySurface {
     visible: bool,
 }
 
+/// One document layer: a complete, independent structure with its own files,
+/// visibility, selection, trajectory and Martini/surface state. Every layer is
+/// the same type; the only special one is the *active* layer, whose state is
+/// checked out into `KuromameApp`'s working fields and drawn as the viewer's
+/// full "main" molecule. Non-active layers render as spheres.
+///
+/// While a layer is active its heavy payload lives in the app's working fields
+/// (moved out via [`KuromameApp::save_active_layer`]/`load_active_layer`); the
+/// slot kept here then holds only a valid `name`/`visible` plus placeholder
+/// payload. `name`/`visible` are never moved, so they stay valid for all layers.
+#[derive(Default)]
+struct Layer {
+    name: String,
+    /// Whether this layer is drawn as spheres while it is not the active layer.
+    visible: bool,
+    molecule: Option<Molecule>,
+    base_molecule: Option<Molecule>,
+    data: LoadedDataState,
+    selection: SelectionState,
+    trajectory: Vec<XtcFrame>,
+    trajectory_path: Option<PathBuf>,
+    traj_ui: TrajectoryUiState,
+    visibility: VisibilityState,
+    interaction_pairs: Vec<(usize, usize)>,
+    surface_dots: Vec<Vec3>,
+    surface_visible: bool,
+    martini_ff: Option<MartiniForceField>,
+    bead_types: Vec<String>,
+    martini_visible: bool,
+    // Per-structure UI state (mirrors the working copies in `UiState`).
+    selector_input: String,
+    ndx_selected_group_index: Option<usize>,
+    ndx_visible: bool,
+    ndx_selected_atom_count: usize,
+}
+
+impl Layer {
+    /// A fresh, empty layer with the same initial field values the app used for
+    /// its single structure (`surface_visible`/`martini_visible`/`ndx_visible`
+    /// on, `playback_fps` 10, summary "No file loaded").
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            visible: true,
+            molecule: None,
+            base_molecule: None,
+            data: LoadedDataState {
+                loaded_summary: "No file loaded".to_string(),
+                ..LoadedDataState::default()
+            },
+            selection: SelectionState::default(),
+            trajectory: Vec::new(),
+            trajectory_path: None,
+            traj_ui: TrajectoryUiState {
+                playback_fps: 10.0,
+                interp_steps: 1,
+                ..TrajectoryUiState::default()
+            },
+            visibility: VisibilityState::default(),
+            interaction_pairs: Vec::new(),
+            surface_dots: Vec::new(),
+            surface_visible: true,
+            martini_ff: None,
+            bead_types: Vec::new(),
+            martini_visible: true,
+            selector_input: String::new(),
+            ndx_selected_group_index: None,
+            ndx_visible: true,
+            ndx_selected_atom_count: 0,
+        }
+    }
+}
+
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
@@ -265,6 +354,23 @@ pub struct KuromameApp {
     overlay_surfaces: Vec<OverlaySurface>,
     /// Index of the overlay surface whose controls the tab UI currently shows.
     active_overlay: usize,
+    /// All document layers. The active layer's heavy payload is checked out into
+    /// the working fields above (`molecule`, `data`, `visibility`, …); every
+    /// other layer holds its full state here and is drawn as spheres. There is
+    /// always at least one layer.
+    layers: Vec<Layer>,
+    /// Index into `layers` of the active layer (the viewer's main molecule).
+    active_layer: usize,
+    /// Martini bead-type registry parsed from a loaded Martini force-field
+    /// `.itp` (its `[ atomtypes ]` / `[ nonbond_params ]`). `None` until one is
+    /// loaded; drives coarse-grained bead rendering.
+    martini_ff: Option<MartiniForceField>,
+    /// Bead type of each atom in `self.molecule` (original-index order), taken
+    /// from the topology's `atom_type` or the atom name. Empty when no molecule.
+    bead_types: Vec<String>,
+    /// Whether Martini bead spheres are drawn (only has an effect once a Martini
+    /// force field is loaded and beads resolve to known types).
+    martini_visible: bool,
     /// Monotonic counter bumped on every viewport rebuild. Used to give each
     /// filtered molecule a distinct generation so the renderer's geometry cache
     /// (keyed on `(molecule_ptr, generation, …)`) actually rebuilds when the
@@ -369,6 +475,8 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
         viewport.add_additional_render_box(Box::new(SurfaceMeshRender::new()));
+        viewport.add_additional_render_box(Box::new(LayerOverlayRender::new()));
+        viewport.add_additional_render_box(Box::new(MartiniBeadRender::new()));
 
         let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let hovered_atom_for_handler = Arc::clone(&hovered_atom);
@@ -428,6 +536,8 @@ impl KuromameApp {
                 current_frame: 0,
                 is_playing: false,
                 playback_fps: 10.0,
+                interp_steps: 1,
+                interp_sub: 0,
                 last_advance_time: 0.0,
             },
             visibility: VisibilityState::default(),
@@ -436,6 +546,11 @@ impl KuromameApp {
             surface_visible: true,
             overlay_surfaces: Vec::new(),
             active_overlay: 0,
+            layers: vec![Layer::new("Layer 1".to_string())],
+            active_layer: 0,
+            martini_ff: None,
+            bead_types: Vec::new(),
+            martini_visible: true,
             view_revision: 0,
         }
     }
@@ -469,6 +584,10 @@ impl KuromameApp {
     /// interaction pairs) in the resulting viewport-index space. This is the one
     /// place geometry is handed to the viewport.
     fn rebuild_viewport(&mut self, focus: bool) {
+        // Keep bead types aligned with the current molecule before we (re)derive
+        // any index-based render state below.
+        self.recompute_bead_types();
+
         let Some(full) = self.molecule.as_ref() else {
             return;
         };
@@ -528,6 +647,7 @@ impl KuromameApp {
         // Re-apply index-based render states in the new viewport-index space.
         self.refresh_ndx_selection_state();
         self.refresh_interaction_pairs();
+        self.refresh_martini_bead_state();
         // The red click-selection is stored in viewport indices, which just
         // changed; clear it rather than highlight the wrong atoms.
         self.viewport.set_state_by_type(SelectedAtomRenderState {
@@ -540,6 +660,102 @@ impl KuromameApp {
         let pairs = self.visibility.map_pairs(&self.interaction_pairs);
         self.viewport
             .set_state_by_type(InteractionPairsState { pairs });
+    }
+
+    /// Re-derive the bead type of every atom in `self.molecule` (original-index
+    /// order). Prefers the topology's per-atom `atom_type`; falls back to the
+    /// atom name when there is no matching topology (e.g. a bare CG `.gro`).
+    fn recompute_bead_types(&mut self) {
+        let Some(mol) = self.molecule.as_ref() else {
+            self.bead_types.clear();
+            return;
+        };
+        let from_top = self
+            .data
+            .top_file
+            .as_ref()
+            .map(|t| t.expanded_atom_types())
+            .filter(|types| types.len() == mol.atoms.len());
+
+        self.bead_types = match from_top {
+            Some(types) => types,
+            None => mol
+                .atoms
+                .iter()
+                .map(|a| a.name().unwrap_or_else(|| a.element.as_str()).to_string())
+                .collect(),
+        };
+    }
+
+    /// Push the current Martini bead styling to the viewport in viewport-index
+    /// order (matching the possibly-filtered molecule). A no-op display when no
+    /// Martini force field is loaded, so nothing changes for ordinary structures.
+    fn refresh_martini_bead_state(&mut self) {
+        let Some(ff) = self.martini_ff.as_ref() else {
+            self.viewport.set_state_by_type(MartiniBeadState {
+                styles: Vec::new(),
+                visible: false,
+            });
+            return;
+        };
+
+        let style_for = |orig: usize| -> Option<BeadStyle> {
+            let bead = self.bead_types.get(orig)?;
+            let radius = ff.radius_nm(bead)?;
+            Some(BeadStyle {
+                radius,
+                color: MartiniForceField::color(bead),
+            })
+        };
+
+        let styles: Vec<Option<BeadStyle>> = if self.visibility.is_filtered() {
+            self.visibility
+                .view_to_orig
+                .iter()
+                .map(|&orig| style_for(orig))
+                .collect()
+        } else {
+            (0..self.bead_types.len()).map(style_for).collect()
+        };
+
+        self.viewport.set_state_by_type(MartiniBeadState {
+            styles,
+            visible: self.martini_visible,
+        });
+    }
+
+    /// Parse `path` as a Martini force field and, if it defines bead types,
+    /// register it and refresh bead styling for any loaded structure. Returns the
+    /// bead-type count when a force field was found.
+    fn try_load_martini_ff(&mut self, path: &std::path::Path) -> Option<usize> {
+        // Parse from the include-expanded content so a Martini force field that a
+        // system `.top` pulls in via `#include` is still found.
+        let expanded = TopFile::expand_includes(path).ok()?;
+        let ff = MartiniForceField::parse(&expanded);
+        if !ff.is_forcefield() {
+            return None;
+        }
+        let count = ff.bead_type_count();
+        self.martini_ff = Some(ff);
+        self.recompute_bead_types();
+        self.refresh_martini_bead_state();
+        Some(count)
+    }
+
+    /// Whether a Martini force field is loaded (enables the bead-view toggle).
+    pub fn has_martini_ff(&self) -> bool {
+        self.martini_ff.is_some()
+    }
+
+    pub fn martini_visible(&self) -> bool {
+        self.martini_visible
+    }
+
+    pub fn set_martini_visible(&mut self, visible: bool) {
+        if self.martini_visible != visible {
+            self.martini_visible = visible;
+            self.refresh_martini_bead_state();
+        }
     }
 
     /// Refresh the set of residue names known to the UI from the current
@@ -605,6 +821,8 @@ impl KuromameApp {
         }
         self.refresh_surface_state();
         self.sync_viewer_molecule_and_focus();
+        // Redraw the other layers as spheres in case atom counts/positions moved.
+        self.refresh_layer_overlays();
     }
 
     /// Collect the base surface (if visible) and every visible overlay surface
@@ -740,6 +958,296 @@ impl KuromameApp {
                 self.active_overlay = self.overlay_surfaces.len().saturating_sub(1);
             }
             self.refresh_surface_state();
+        }
+    }
+
+    // --- Document layers ---------------------------------------------------
+
+    /// Move the active layer's working state (the app's `molecule`/`data`/… and
+    /// the per-structure `ui` bits) out of the app fields and into its slot in
+    /// `layers`, leaving the working fields empty. `name`/`visible` in the slot
+    /// are untouched (they never live in the working fields).
+    fn save_active_layer(&mut self) {
+        let a = self.active_layer;
+        self.layers[a].molecule = self.molecule.take();
+        self.layers[a].base_molecule = self.base_molecule.take();
+        self.layers[a].data = std::mem::take(&mut self.data);
+        self.layers[a].selection = std::mem::take(&mut self.selection);
+        self.layers[a].trajectory = std::mem::take(&mut self.trajectory);
+        self.layers[a].trajectory_path = self.trajectory_path.take();
+        self.layers[a].traj_ui = std::mem::take(&mut self.traj_ui);
+        self.layers[a].visibility = std::mem::take(&mut self.visibility);
+        self.layers[a].interaction_pairs = std::mem::take(&mut self.interaction_pairs);
+        self.layers[a].surface_dots = std::mem::take(&mut self.surface_dots);
+        self.layers[a].surface_visible = self.surface_visible;
+        self.layers[a].martini_ff = self.martini_ff.take();
+        self.layers[a].bead_types = std::mem::take(&mut self.bead_types);
+        self.layers[a].martini_visible = self.martini_visible;
+        self.layers[a].selector_input = std::mem::take(&mut self.ui.selector_input);
+        self.layers[a].ndx_selected_group_index = self.ui.ndx_selected_group_index;
+        self.layers[a].ndx_visible = self.ui.ndx_visible;
+        self.layers[a].ndx_selected_atom_count = self.ui.ndx_selected_atom_count;
+    }
+
+    /// Check `layers[idx]` out into the working fields, making it the active
+    /// layer. Inverse of [`save_active_layer`](Self::save_active_layer); the
+    /// caller is responsible for refreshing the view afterwards.
+    fn load_active_layer(&mut self, idx: usize) {
+        self.active_layer = idx;
+        self.molecule = self.layers[idx].molecule.take();
+        self.base_molecule = self.layers[idx].base_molecule.take();
+        self.data = std::mem::take(&mut self.layers[idx].data);
+        self.selection = std::mem::take(&mut self.layers[idx].selection);
+        self.trajectory = std::mem::take(&mut self.layers[idx].trajectory);
+        self.trajectory_path = self.layers[idx].trajectory_path.take();
+        self.traj_ui = std::mem::take(&mut self.layers[idx].traj_ui);
+        self.visibility = std::mem::take(&mut self.layers[idx].visibility);
+        self.interaction_pairs = std::mem::take(&mut self.layers[idx].interaction_pairs);
+        self.surface_dots = std::mem::take(&mut self.layers[idx].surface_dots);
+        self.surface_visible = self.layers[idx].surface_visible;
+        self.martini_ff = self.layers[idx].martini_ff.take();
+        self.bead_types = std::mem::take(&mut self.layers[idx].bead_types);
+        self.martini_visible = self.layers[idx].martini_visible;
+        self.ui.selector_input = std::mem::take(&mut self.layers[idx].selector_input);
+        self.ui.ndx_selected_group_index = self.layers[idx].ndx_selected_group_index;
+        self.ui.ndx_visible = self.layers[idx].ndx_visible;
+        self.ui.ndx_selected_atom_count = self.layers[idx].ndx_selected_atom_count;
+    }
+
+    /// Push the active layer to the viewport as the main molecule (or clear it
+    /// when the layer is empty), restore its simulation cell, and redraw the
+    /// non-active layers as spheres. Call after any active-layer swap.
+    fn refresh_active_view(&mut self, focus: bool) {
+        if self.molecule.is_some() {
+            self.rebuild_viewport(focus);
+        } else {
+            // Empty layer: clear the main molecule and its index-based overlays.
+            self.viewport
+                .set_molecule(molecule_from_parts(Vec::new(), Vec::new()));
+            // Bump the generation like rebuild_viewport does, so the renderer's
+            // geometry cache drops the previously-active layer's atoms instead of
+            // leaving them on screen.
+            let bump = (self.view_revision % 4) + 1;
+            for _ in 0..bump {
+                let _ = self.viewport.update_positions(&[]);
+            }
+            self.view_revision = self.view_revision.wrapping_add(1);
+            self.refresh_ndx_selection_state();
+            self.refresh_interaction_pairs();
+            self.refresh_martini_bead_state();
+            self.viewport.set_state_by_type(SelectedAtomRenderState {
+                selected_atoms: Vec::new(),
+                color: [1.0, 0.0, 0.0],
+            });
+        }
+        self.refresh_surface_state();
+        self.refresh_active_sim_cell();
+        self.refresh_layer_overlays();
+    }
+
+    /// Restore the simulation-cell box for the active layer from its current
+    /// trajectory frame, else its GRO box, else none.
+    fn refresh_active_sim_cell(&mut self) {
+        let box_diag = if let Some(frame) = self.trajectory.get(self.traj_ui.current_frame) {
+            (
+                frame.box_matrix[0][0],
+                frame.box_matrix[1][1],
+                frame.box_matrix[2][2],
+            )
+        } else if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
+            gro.box_line
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        self.viewport
+            .set_state_by_type(SimulationCellRenderState::new(box_diag));
+    }
+
+    /// Rebuild the sphere geometry for every non-active, visible layer and push
+    /// it to the viewport. Respects each layer's own residue-visibility filter.
+    fn refresh_layer_overlays(&mut self) {
+        let active = self.active_layer;
+        let mut geoms: Vec<LayerOverlayGeom> = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            if i == active || !layer.visible {
+                continue;
+            }
+            let Some(mol) = layer.molecule.as_ref() else {
+                continue;
+            };
+            let filtered = layer.visibility.any_hidden();
+            let atoms: Vec<OverlayAtom> = mol
+                .atoms
+                .iter()
+                .filter(|atom| {
+                    !filtered || {
+                        let res = atom.res_name().unwrap_or("");
+                        layer
+                            .visibility
+                            .res_visible
+                            .get(res)
+                            .copied()
+                            .unwrap_or(true)
+                    }
+                })
+                .map(|a| OverlayAtom {
+                    position: a.position,
+                    radius: ball_stick_radius(&a.element, false),
+                    color: default_color_fn(a, false),
+                })
+                .collect();
+            if !atoms.is_empty() {
+                geoms.push(LayerOverlayGeom { atoms });
+            }
+        }
+        self.viewport
+            .set_state_by_type(LayerOverlayState { layers: geoms });
+    }
+
+    /// Switch which layer is active (drawn as the main molecule). No-op when the
+    /// index is already active or out of range.
+    pub fn set_active_layer(&mut self, idx: usize) {
+        if idx >= self.layers.len() || idx == self.active_layer {
+            return;
+        }
+        self.save_active_layer();
+        self.load_active_layer(idx);
+        self.refresh_active_view(false);
+        self.set_status(format!("Layer {} active", idx + 1));
+    }
+
+    /// Create a new empty layer, make it active, and prompt to load a structure
+    /// into it. The normal file loaders then target this layer.
+    pub fn add_layer(&mut self) {
+        self.save_active_layer();
+        let name = format!("Layer {}", self.layers.len() + 1);
+        self.layers.push(Layer::new(name));
+        let idx = self.layers.len() - 1;
+        self.load_active_layer(idx);
+        self.refresh_active_view(false);
+        self.open_structure_into_active_layer();
+    }
+
+    /// Remove a layer, keeping at least one, and re-activate a neighbour.
+    pub fn remove_layer(&mut self, idx: usize) {
+        if idx >= self.layers.len() {
+            return;
+        }
+        // Persist the active layer so every slot holds its own full state, then
+        // drop the requested one.
+        self.save_active_layer();
+        self.layers.remove(idx);
+        if self.layers.is_empty() {
+            self.layers.push(Layer::new("Layer 1".to_string()));
+        }
+        let new_active = if self.active_layer == idx {
+            idx.min(self.layers.len() - 1)
+        } else if self.active_layer > idx {
+            self.active_layer - 1
+        } else {
+            self.active_layer
+        };
+        self.load_active_layer(new_active);
+        self.refresh_active_view(false);
+    }
+
+    /// Open a structure/topology file dialog and load the pick into the active
+    /// (typically just-created) layer via the existing loaders.
+    fn open_structure_into_active_layer(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("Structures", &["gro", "pdb", "ent", "cif", "mol2"])
+            .add_filter("Topology", &["top", "itp"])
+            .set_title("Load structure into new layer")
+            .pick_file()
+        {
+            self.load_structure_path(path);
+        }
+    }
+
+    /// Dispatch a path to the right loader by extension (all operate on the
+    /// active layer).
+    fn load_structure_path(&mut self, path: PathBuf) {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "gro" => self.load_gro_file_only(path),
+            "top" | "itp" => self.load_top_file_only(path),
+            _ => self.load_file(path),
+        }
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn layer_names(&self) -> Vec<String> {
+        (0..self.layers.len()).map(|i| self.layer_label(i)).collect()
+    }
+
+    pub fn active_layer_index(&self) -> usize {
+        self.active_layer
+    }
+
+    pub fn active_layer_name(&self) -> String {
+        self.layer_label(self.active_layer)
+    }
+
+    pub fn layer_name(&self, idx: usize) -> Option<String> {
+        (idx < self.layers.len()).then(|| self.layer_label(idx))
+    }
+
+    /// Display label for a layer: its loaded structure's file name when present,
+    /// otherwise the layer's default `"Layer N"` name. The active layer's file
+    /// path lives in the working `data`; parked layers keep theirs in the slot.
+    fn layer_label(&self, idx: usize) -> String {
+        let data = if idx == self.active_layer {
+            &self.data
+        } else {
+            match self.layers.get(idx) {
+                Some(l) => &l.data,
+                None => return String::new(),
+            }
+        };
+        data.structure_file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                self.layers
+                    .get(idx)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_default()
+            })
+    }
+
+    /// Atom count of a layer — from the working molecule for the active layer,
+    /// from the parked slot otherwise.
+    pub fn layer_atom_count(&self, idx: usize) -> usize {
+        if idx == self.active_layer {
+            self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0)
+        } else {
+            self.layers
+                .get(idx)
+                .and_then(|l| l.molecule.as_ref())
+                .map(|m| m.atoms.len())
+                .unwrap_or(0)
+        }
+    }
+
+    pub fn layer_visible(&self, idx: usize) -> bool {
+        self.layers.get(idx).map(|l| l.visible).unwrap_or(false)
+    }
+
+    pub fn set_layer_visible(&mut self, idx: usize, visible: bool) {
+        if let Some(layer) = self.layers.get_mut(idx) {
+            if layer.visible != visible {
+                layer.visible = visible;
+                self.refresh_layer_overlays();
+            }
         }
     }
 
@@ -1419,6 +1927,21 @@ impl KuromameApp {
             None => return false,
         };
 
+        // A force-field-only `.itp` (e.g. the Martini master file) has no
+        // molecule template, so there is no connectivity to apply — build the
+        // molecule straight from the GRO (distance-inferred bonds) instead of
+        // handing `generate_molecule_with_gro` an empty bond list.
+        if top.expanded_atom_types().is_empty() {
+            let boxsize = gro.box_line;
+            let mol = gro.to_molecule_with_metadata(true, None);
+            self.interaction_pairs.clear();
+            self.surface_dots.clear();
+            self.set_molecule_and_frame(mol);
+            self.viewport
+                .set_state_by_type(SimulationCellRenderState::new(boxsize));
+            return true;
+        }
+
         match top.generate_molecule_with_gro(&gro) {
             Ok((molecule, interaction_pairs)) => {
                 let boxsize = gro.box_line;
@@ -1480,6 +2003,7 @@ impl KuromameApp {
         };
 
         self.data.top_file = Some(top);
+        let martini_types = self.try_load_martini_ff(&top_path);
         self.data.top_file_path = Some(top_path);
         self.data.structure_file = Some(StructureFile::Gro(gro));
         self.data.structure_file_path = Some(gro_path);
@@ -1487,7 +2011,10 @@ impl KuromameApp {
         self.generate_and_set_molecule_from_stored_files();
         self.update_loaded_summary();
         self.mark_clean();
-        self.set_status("Loaded TOP+GRO");
+        match martini_types {
+            Some(n) => self.set_status(format!("Loaded Martini FF + GRO ({} bead types)", n)),
+            None => self.set_status("Loaded TOP+GRO"),
+        }
         self.post_load_cleanup();
     }
 
@@ -1507,6 +2034,7 @@ impl KuromameApp {
         };
 
         self.data.top_file = Some(top);
+        let martini_types = self.try_load_martini_ff(&path);
         self.data.top_file_path = Some(path);
 
         let has_gro = self
@@ -1518,17 +2046,29 @@ impl KuromameApp {
 
         if has_gro {
             self.generate_and_set_molecule_from_stored_files();
-            self.set_status(format!("Loaded TOP: {}", file_name));
             self.update_loaded_summary();
             self.mark_clean();
             self.post_load_cleanup();
+            match martini_types {
+                Some(n) => self.set_status(format!(
+                    "Loaded Martini force field: {} ({} bead types)",
+                    file_name, n
+                )),
+                None => self.set_status(format!("Loaded TOP: {}", file_name)),
+            }
         } else {
             self.update_loaded_summary();
             self.mark_clean();
-            self.set_status(format!(
-                "Loaded TOP: {}. Load a GRO file to display the molecule.",
-                file_name
-            ));
+            match martini_types {
+                Some(n) => self.set_status(format!(
+                    "Loaded Martini force field: {} ({} bead types). Load a GRO to display beads.",
+                    file_name, n
+                )),
+                None => self.set_status(format!(
+                    "Loaded TOP: {}. Load a GRO file to display the molecule.",
+                    file_name
+                )),
+            }
         }
     }
 
@@ -1714,14 +2254,79 @@ impl KuromameApp {
             frame.box_matrix[1][1],
             frame.box_matrix[2][2],
         );
-        self.viewport
-            .set_state_by_type(SimulationCellRenderState::new(box_diag));
 
         let positions: Vec<Vec3> = frame
             .positions
             .iter()
             .map(|p| Vec3::new(p[0], p[1], p[2]))
             .collect();
+
+        self.apply_positions(positions, box_diag);
+        self.traj_ui.current_frame = idx;
+        self.traj_ui.interp_sub = 0;
+    }
+
+    /// Display a linearly-interpolated frame `t` (0..1) of the way from real
+    /// frame `idx` to `idx + 1` (wrapping at the end). Used by smoothed
+    /// playback; the integer base frame (`current_frame`) is left unchanged.
+    fn apply_interpolated_frame(&mut self, idx: usize, t: f32) {
+        let n = self.trajectory.len();
+        if n == 0 {
+            return;
+        }
+        let next = (idx + 1) % n;
+        let (Some(a), Some(b)) = (self.trajectory.get(idx), self.trajectory.get(next)) else {
+            return;
+        };
+        if a.positions.len() != b.positions.len() {
+            // Atom count changed between frames: fall back to the base frame.
+            return self.apply_trajectory_frame(idx);
+        }
+
+        let lerp = |x: f32, y: f32| x + (y - x) * t;
+        let box_diag = (
+            lerp(a.box_matrix[0][0], b.box_matrix[0][0]),
+            lerp(a.box_matrix[1][1], b.box_matrix[1][1]),
+            lerp(a.box_matrix[2][2], b.box_matrix[2][2]),
+        );
+
+        // Minimum-image (nearest-image) interpolation: when an atom wraps across
+        // a periodic boundary between the two frames its raw displacement spans
+        // almost the whole box, which plain lerp would draw as a fast sweep
+        // across the cell. Instead, fold each per-axis displacement into
+        // [-L/2, L/2] so we interpolate along the shortest path, then start from
+        // frame `a`'s coordinate. `L = 0` (no box on that axis) disables the
+        // correction for that axis.
+        let box_len = [a.box_matrix[0][0], a.box_matrix[1][1], a.box_matrix[2][2]];
+        let min_image = |pa: f32, pb: f32, l: f32| -> f32 {
+            let mut d = pb - pa;
+            if l > 0.0 {
+                d -= l * (d / l).round();
+            }
+            pa + d * t
+        };
+        let positions: Vec<Vec3> = a
+            .positions
+            .iter()
+            .zip(b.positions.iter())
+            .map(|(pa, pb)| {
+                Vec3::new(
+                    min_image(pa[0], pb[0], box_len[0]),
+                    min_image(pa[1], pb[1], box_len[1]),
+                    min_image(pa[2], pb[2], box_len[2]),
+                )
+            })
+            .collect();
+
+        self.apply_positions(positions, box_diag);
+    }
+
+    /// Push a set of atom positions (and simulation-cell box) into the viewport,
+    /// reusing the current molecule's bonds/metadata/camera when the atom count
+    /// matches. Shared by exact and interpolated frame display.
+    fn apply_positions(&mut self, positions: Vec<Vec3>, box_diag: (f32, f32, f32)) {
+        self.viewport
+            .set_state_by_type(SimulationCellRenderState::new(box_diag));
 
         let same_atom_count = self
             .molecule
@@ -1762,8 +2367,6 @@ impl KuromameApp {
             self.refresh_res_names();
             self.sync_viewer_molecule();
         }
-
-        self.traj_ui.current_frame = idx;
     }
 
     pub fn toggle_playback(&mut self) {
@@ -1795,13 +2398,27 @@ impl KuromameApp {
         if !self.traj_ui.is_playing || self.trajectory.is_empty() {
             return;
         }
-        let interval = 1.0 / self.traj_ui.playback_fps as f64;
+        // With smoothing each real-frame transition is split into `steps`
+        // sub-steps. To keep the trajectory playing at the same wall-clock speed
+        // (playback_fps real frames per second) regardless of smoothing, tick
+        // the sub-steps `steps` times as fast.
+        let steps = self.traj_ui.interp_steps.max(1);
+        let interval = 1.0 / (self.traj_ui.playback_fps as f64 * steps as f64);
         if current_time - self.traj_ui.last_advance_time < interval {
             return;
         }
         self.traj_ui.last_advance_time = current_time;
-        let next = (self.traj_ui.current_frame + 1) % self.trajectory.len();
-        self.apply_trajectory_frame(next);
+
+        let sub = self.traj_ui.interp_sub + 1;
+        if sub >= steps {
+            // Cross into the next real frame; resets interp_sub to 0.
+            let next = (self.traj_ui.current_frame + 1) % self.trajectory.len();
+            self.apply_trajectory_frame(next);
+        } else {
+            let t = sub as f32 / steps as f32;
+            self.apply_interpolated_frame(self.traj_ui.current_frame, t);
+            self.traj_ui.interp_sub = sub;
+        }
     }
 
     pub fn trajectory_frame_count(&self) -> usize {
@@ -1825,6 +2442,12 @@ impl KuromameApp {
 
     pub fn trajectory_playback_fps(&mut self) -> &mut f32 {
         &mut self.traj_ui.playback_fps
+    }
+
+    /// Smoothing subdivision: `1` = off, `N` = insert `N - 1` interpolated
+    /// frames between each pair of real frames during playback.
+    pub fn trajectory_interp_steps(&mut self) -> &mut u32 {
+        &mut self.traj_ui.interp_steps
     }
 
     pub fn set_trajectory_frame(&mut self, idx: usize) {

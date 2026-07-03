@@ -201,11 +201,18 @@ impl TopFile {
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
+        let expanded = Self::expand_includes(path.as_ref())?;
+        Ok(Self::parse(&expanded))
+    }
+
+    /// Read a TOP/ITP file and expand its `#include`s into a single string — the
+    /// same preprocessing `load_from_path` applies before parsing. Exposed so
+    /// callers can scan force-field sections (e.g. Martini `[ atomtypes ]`) that
+    /// often live in an included file rather than the top-level one.
+    pub fn expand_includes(path: &Path) -> Result<String, String> {
         let content = fs::read_to_string(path)
             .map_err(|err| format!("Failed to read TOP file {}: {}", path.display(), err))?;
-        let expanded = TopPreprocessor::default().expand(&content, Some(path))?;
-        Ok(Self::parse(&expanded))
+        TopPreprocessor::default().expand(&content, Some(path))
     }
 
     fn parse(content: &str) -> Self {
@@ -455,6 +462,27 @@ impl TopFile {
             TopLine::Atom(atom) => Some(atom),
             _ => None,
         })
+    }
+
+    /// The `atom_type` of every atom, expanded across `[ molecules ]` instances
+    /// in the same order the coordinates appear in the matching GRO — i.e. the
+    /// order `generate_molecule_with_gro` produces atoms in. For Martini
+    /// topologies this yields the bead type of each particle.
+    ///
+    /// Returns an empty vector when the file has no molecule templates/instances
+    /// (e.g. a force-field-only `.itp`), in which case there is nothing to align.
+    pub fn expanded_atom_types(&self) -> Vec<String> {
+        let (templates, instances) = self.parse_layout();
+        let mut out = Vec::new();
+        for instance in &instances {
+            let Some(template) = templates.iter().find(|t| t.name == instance.name) else {
+                continue;
+            };
+            for _ in 0..instance.nmols {
+                out.extend(template.atoms.iter().map(|a| a.atom_type.clone()));
+            }
+        }
+        out
     }
 }
 

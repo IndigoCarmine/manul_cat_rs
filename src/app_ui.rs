@@ -179,6 +179,14 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             app.open_overlay_surface_file();
             ui.close();
         }
+        if ui
+            .button(format!("{} Add Layer", mi(MaterialIcon::Layers)))
+            .on_hover_text("Add a new layer and load a structure into it")
+            .clicked()
+        {
+            app.add_layer();
+            ui.close();
+        }
         ui.separator();
         if ui
             .button(format!("{} Export", mi(MaterialIcon::Save)))
@@ -285,10 +293,14 @@ pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
 
 fn file_header(app: &mut KuromameApp, ui: &mut egui::Ui) {
     ui.label(
-        egui::RichText::new(&app.data.loaded_summary)
-            .color(theme::TEXT)
-            .size(14.0)
-            .strong(),
+        egui::RichText::new(format!(
+            "{}  ·  {}",
+            app.active_layer_name(),
+            &app.data.loaded_summary
+        ))
+        .color(theme::TEXT)
+        .size(14.0)
+        .strong(),
     );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -512,9 +524,8 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Right-side, tab-based panel for overlaying additional dot surfaces on top of
-/// the base structure. Independent of the left panel: each loaded surface file
-/// is a tab, and the active tab exposes its color, visibility and removal.
+/// Right-side panel: the LAYERS list (switch the active structure, toggle each
+/// layer's sphere overlay, add/remove) plus the dot-surface overlays below it.
 pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
     egui::SidePanel::right("overlay_panel")
         .resizable(true)
@@ -527,6 +538,12 @@ pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                 .inner_margin(egui::Margin::symmetric(16, 16)),
         )
         .show(ctx, |ui| {
+            render_layers_section(app, ui);
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(12.0);
+
             section_label(ui, "OVERLAY SURFACES");
             ui.add_space(6.0);
 
@@ -549,70 +566,152 @@ pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
                         .color(theme::MUTED2)
                         .size(12.0),
                 );
-                return;
-            }
-
-            // Tab bar: one selectable chip per overlay surface.
-            let names = app.overlay_names();
-            let mut active = app.active_overlay_index();
-            egui::ScrollArea::horizontal()
-                .id_salt("overlay_tabs_scroll")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            let label = format!("{}. {}", i + 1, tab_short_name(name));
-                            if ui.selectable_label(i == active, label).clicked() {
-                                active = i;
+            } else {
+                // Tab bar: one selectable chip per overlay surface.
+                let names = app.overlay_names();
+                let mut active = app.active_overlay_index();
+                egui::ScrollArea::horizontal()
+                    .id_salt("overlay_tabs_scroll")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                let label = format!("{}. {}", i + 1, tab_short_name(name));
+                                if ui.selectable_label(i == active, label).clicked() {
+                                    active = i;
+                                }
                             }
-                        }
+                        });
                     });
-                });
-            if active != app.active_overlay_index() {
-                app.set_active_overlay(active);
-            }
+                if active != app.active_overlay_index() {
+                    app.set_active_overlay(active);
+                }
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            let idx = app.active_overlay_index();
-            if let Some(name) = app.overlay_name(idx) {
-                ui.label(egui::RichText::new(name).color(theme::TEXT).size(13.0).strong());
-                ui.label(
-                    egui::RichText::new(format!("{} dots", app.overlay_dot_count(idx)))
-                        .color(theme::MUTED2)
-                        .size(12.0),
-                );
+                ui.add_space(8.0);
+                ui.separator();
                 ui.add_space(8.0);
 
-                let mut visible = app.overlay_visible(idx);
-                if ui.checkbox(&mut visible, "Show").changed() {
-                    app.set_overlay_visible(idx, visible);
-                }
-                ui.add_space(6.0);
+                let idx = app.active_overlay_index();
+                if let Some(name) = app.overlay_name(idx) {
+                    ui.label(egui::RichText::new(name).color(theme::TEXT).size(13.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("{} dots", app.overlay_dot_count(idx)))
+                            .color(theme::MUTED2)
+                            .size(12.0),
+                    );
+                    ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Color").color(theme::TEXT).size(12.5));
-                    let mut color = app.overlay_color(idx);
-                    if ui.color_edit_button_rgb(&mut color).changed() {
-                        app.set_overlay_color(idx, color);
+                    let mut visible = app.overlay_visible(idx);
+                    if ui.checkbox(&mut visible, "Show").changed() {
+                        app.set_overlay_visible(idx, visible);
                     }
-                });
-                ui.add_space(12.0);
+                    ui.add_space(6.0);
 
-                if secondary_button(ui, format!("{}  Remove", mi(MaterialIcon::Delete)), true)
-                    .clicked()
-                {
-                    app.remove_overlay(idx);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Color").color(theme::TEXT).size(12.5));
+                        let mut color = app.overlay_color(idx);
+                        if ui.color_edit_button_rgb(&mut color).changed() {
+                            app.set_overlay_color(idx, color);
+                        }
+                    });
+                    ui.add_space(12.0);
+
+                    if secondary_button(ui, format!("{}  Remove", mi(MaterialIcon::Delete)), true)
+                        .clicked()
+                    {
+                        app.remove_overlay(idx);
+                    }
                 }
             }
         });
+}
+
+/// LAYERS list: each row selects the active layer (drawn as the full main
+/// molecule) and toggles that layer's sphere overlay when it is not active.
+/// Only one layer is the main molecule at a time; the rest render as spheres.
+fn render_layers_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    section_label(ui, "LAYERS");
+    ui.add_space(6.0);
+
+    if secondary_button(ui, format!("{}  Add layer…", mi(MaterialIcon::Layers)), true)
+        .on_hover_text("Add a new layer and load a structure into it")
+        .clicked()
+    {
+        app.add_layer();
+    }
+    ui.add_space(8.0);
+
+    let count = app.layer_count();
+    let active = app.active_layer_index();
+    let names = app.layer_names();
+    // Precompute so the scroll closure needs no borrow of `app`.
+    let atom_counts: Vec<usize> = (0..count).map(|i| app.layer_atom_count(i)).collect();
+    let visibles: Vec<bool> = (0..count).map(|i| app.layer_visible(i)).collect();
+
+    let mut make_active: Option<usize> = None;
+    let mut toggle_vis: Option<(usize, bool)> = None;
+    let mut remove: Option<usize> = None;
+
+    egui::ScrollArea::vertical()
+        .id_salt("layers_scroll")
+        .max_height(280.0)
+        .show(ui, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                let is_active = i == active;
+                ui.horizontal(|ui| {
+                    let label = egui::RichText::new(format!("{}. {}", i + 1, tab_short_name(name)))
+                        .color(if is_active { theme::TEXT } else { theme::MUTED })
+                        .size(12.5);
+                    if ui.selectable_label(is_active, label).clicked() && !is_active {
+                        make_active = Some(i);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{}a", atom_counts[i]))
+                            .color(theme::MUTED2)
+                            .size(11.0),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                count > 1,
+                                egui::Button::new(mi(MaterialIcon::Delete)).frame(false),
+                            )
+                            .on_hover_text("Remove layer")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        // The active layer is always drawn as the main molecule,
+                        // so its sphere toggle is disabled.
+                        let mut vis = visibles[i];
+                        if ui
+                            .add_enabled(!is_active, egui::Checkbox::new(&mut vis, ""))
+                            .on_hover_text("Show as spheres while not active")
+                            .changed()
+                        {
+                            toggle_vis = Some((i, vis));
+                        }
+                    });
+                });
+            }
+        });
+
+    if let Some(i) = make_active {
+        app.set_active_layer(i);
+    }
+    if let Some((i, v)) = toggle_vis {
+        app.set_layer_visible(i, v);
+    }
+    if let Some(i) = remove {
+        app.remove_layer(i);
+    }
 }
 
 /// Trim an overlay's file name so it fits on a tab chip.
 fn tab_short_name(name: &str) -> String {
     let stem = name.strip_suffix(".pdb").unwrap_or(name);
     let stem = stem.strip_suffix(".ent").unwrap_or(stem);
+    let stem = stem.strip_suffix(".gro").unwrap_or(stem);
     if stem.chars().count() > 12 {
         let short: String = stem.chars().take(11).collect();
         format!("{short}…")
@@ -634,6 +733,18 @@ pub fn render_bottom_dock(app: &mut KuromameApp, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 section_label(ui, "STYLE");
                 style_segment(app, ui);
+
+                if app.has_martini_ff() {
+                    ui.add_space(10.0);
+                    let mut beads = app.martini_visible();
+                    if ui
+                        .checkbox(&mut beads, "Martini beads")
+                        .on_hover_text("Draw coarse-grained beads sized/coloured by bead type")
+                        .changed()
+                    {
+                        app.set_martini_visible(beads);
+                    }
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -728,8 +839,21 @@ fn trajectory_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
         app.trajectory_current_time()
     );
 
-    // Right-aligned FPS + frame/time, slider fills the middle.
+    // Right-aligned smoothing + FPS + frame/time, slider fills the middle.
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add(
+            egui::DragValue::new(app.trajectory_interp_steps())
+                .range(1..=20)
+                .speed(0.1),
+        )
+        .on_hover_text(
+            "Smoothing: number of linearly-interpolated frames per step (1 = off)",
+        );
+        ui.label(
+            egui::RichText::new("Smooth")
+                .color(theme::MUTED2)
+                .size(11.0),
+        );
         ui.add(
             egui::DragValue::new(app.trajectory_playback_fps())
                 .range(0.1..=200.0)
