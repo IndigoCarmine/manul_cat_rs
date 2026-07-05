@@ -63,7 +63,13 @@ impl AdditionalRender for NdxSelectionRender {
                 continue;
             };
 
-            self.add_sphere(scene, frame_state, atom.position, self.radius, self.color);
+            self.add_sphere(
+                scene,
+                frame_state,
+                atom.position,
+                self.radius,
+                (self.color.0, self.color.1, self.color.2, 1.0),
+            );
         }
     }
 }

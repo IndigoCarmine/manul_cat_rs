@@ -15,13 +15,14 @@ use moleucle_3dview_rs::{
 /// layer's structure changes.
 pub struct LayerOverlayRender;
 
-/// A single overlay atom: position (nm), sphere radius (nm) and RGB colour, all
-/// precomputed by the app.
+/// A single overlay atom: position (nm), sphere radius (nm) and RGBA colour, all
+/// precomputed by the app. The alpha component carries the owning layer's
+/// opacity so faded layers blend through to what is behind them.
 #[derive(Clone, Copy)]
 pub struct OverlayAtom {
     pub position: Vec3,
     pub radius: f32,
-    pub color: (f32, f32, f32),
+    pub color: (f32, f32, f32, f32),
 }
 
 /// One non-active layer's spheres.

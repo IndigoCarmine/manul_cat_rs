@@ -60,7 +60,13 @@ impl AdditionalRender for SimulationCellRender {
         for &edge in &lines {
             let start = Vec3::new(edge[0][0], edge[0][1], edge[0][2]);
             let end = Vec3::new(edge[1][0], edge[1][1], edge[1][2]);
-            self.add_cylinder(scene, start, end, edge_radius, self.color);
+            self.add_cylinder(
+                scene,
+                start,
+                end,
+                edge_radius,
+                (self.color.0, self.color.1, self.color.2, 1.0),
+            );
         }
     }
 

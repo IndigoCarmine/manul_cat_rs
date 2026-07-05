@@ -4,7 +4,6 @@ use crate::layer_overlay_render::{
 use crate::inter_molecular_interaction_render::{
     InterMolecularInteractionRender, InteractionPairsState,
 };
-use crate::martini_bead_render::{BeadStyle, MartiniBeadRender, MartiniBeadState};
 use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{
     AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
@@ -190,6 +189,17 @@ const OVERLAY_SURFACE_PALETTE: [[f32; 3]; 6] = [
     [0.95, 0.55, 0.80], // pink
 ];
 
+/// Identity colours cycled through as document layers are created, so each layer
+/// has a distinct swatch/eye tint in the LAYERS panel.
+const LAYER_PALETTE: [[f32; 3]; 6] = [
+    [0.30, 0.64, 1.00], // blue (accent)
+    [0.88, 0.70, 0.25], // amber
+    [0.35, 0.82, 0.76], // teal
+    [0.80, 0.45, 0.95], // purple
+    [0.45, 0.85, 0.45], // green
+    [0.95, 0.55, 0.80], // pink
+];
+
 /// An additional dot surface loaded from a separate file and overlaid on top of
 /// the base structure. Managed independently of the base structure through the
 /// overlay tab UI, with a user-configurable color.
@@ -215,6 +225,13 @@ struct Layer {
     name: String,
     /// Whether this layer is drawn as spheres while it is not the active layer.
     visible: bool,
+    /// Identity colour shown as the layer's swatch / eye tint in the LAYERS
+    /// panel, assigned from [`LAYER_PALETTE`] when the layer is created. A UI
+    /// marker only; the 3D spheres keep their element colours.
+    color: [f32; 3],
+    /// Overlay opacity in `0.0..=1.0` (alpha) used when this layer is drawn as
+    /// spheres (i.e. while it is not the active layer). `1.0` is fully opaque.
+    opacity: f32,
     molecule: Option<Molecule>,
     base_molecule: Option<Molecule>,
     data: LoadedDataState,
@@ -240,10 +257,12 @@ impl Layer {
     /// A fresh, empty layer with the same initial field values the app used for
     /// its single structure (`surface_visible`/`martini_visible`/`ndx_visible`
     /// on, `playback_fps` 10, summary "No file loaded").
-    fn new(name: String) -> Self {
+    fn new(name: String, color: [f32; 3]) -> Self {
         Self {
             name,
             visible: true,
+            color,
+            opacity: 1.0,
             molecule: None,
             base_molecule: None,
             data: LoadedDataState {
@@ -329,6 +348,15 @@ fn color_by_res_name(atom: &Atom, is_selected: bool) -> (f32, f32, f32) {
     hsl_to_rgb(hue, 0.65, 0.52)
 }
 
+/// One entry in the "loaded files" overview shown in the left panel: a short
+/// type badge (`GRO`/`TOP`/`NDX`/`XTC`/…), the file name, and a one-line detail
+/// (atom/frame/group count). Lets the user see everything loaded at a glance.
+pub struct LoadedFileRow {
+    pub badge: &'static str,
+    pub name: String,
+    pub detail: String,
+}
+
 pub struct KuromameApp {
     molecule: Option<Molecule>,
     viewport: InteractiveMoleculeViewport,
@@ -337,6 +365,13 @@ pub struct KuromameApp {
     selection: SelectionState,
     ui: UiState,
     hovered_atom: Arc<Mutex<Option<usize>>>,
+    /// Viewport-space atom indices clicked since the last frame. The viewport
+    /// event handler (a closure with no access to `self`) queues them here;
+    /// `update` drains the queue into the app-side selection
+    /// (`selection.selected_atom_indices`, original indices) each frame. Without
+    /// this bridge, clicking an atom would highlight it in the 3D view but never
+    /// reach the selection the panels and menu actions actually operate on.
+    clicked_atoms: Arc<Mutex<Vec<usize>>>,
     trajectory: Vec<XtcFrame>,
     trajectory_path: Option<PathBuf>,
     base_molecule: Option<Molecule>,
@@ -476,27 +511,24 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
         viewport.add_additional_render_box(Box::new(SurfaceMeshRender::new()));
         viewport.add_additional_render_box(Box::new(LayerOverlayRender::new()));
-        viewport.add_additional_render_box(Box::new(MartiniBeadRender::new()));
 
         let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let hovered_atom_for_handler = Arc::clone(&hovered_atom);
-        viewport.register_event_handler(Box::new(move |vp, event| match event {
+        let clicked_atoms: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let clicked_atoms_for_handler = Arc::clone(&clicked_atoms);
+        viewport.register_event_handler(Box::new(move |_vp, event| match event {
             ViewPortEvent::hovered { atom } => {
                 if let Ok(mut g) = hovered_atom_for_handler.lock() {
                     *g = Some(atom);
                 }
             }
+            // Only queue the click here; the app owns the selection and pushes
+            // the resulting red highlight back to the viewport in `update`, so a
+            // click and every other selection path share one source of truth.
             ViewPortEvent::clicked { atom } => {
-                let mut atoms = vp.selected_atoms();
-                if let Some(pos) = atoms.iter().position(|&a| a == atom) {
-                    atoms.remove(pos);
-                } else {
-                    atoms.push(atom);
+                if let Ok(mut g) = clicked_atoms_for_handler.lock() {
+                    g.push(atom);
                 }
-                vp.set_state_by_type(SelectedAtomRenderState {
-                    selected_atoms: atoms,
-                    color: [1.0, 0.0, 0.0],
-                });
             }
         }));
 
@@ -529,6 +561,7 @@ impl KuromameApp {
                 ndx_selected_atom_count: 0,
             },
             hovered_atom,
+            clicked_atoms,
             trajectory: Vec::new(),
             trajectory_path: None,
             base_molecule: None,
@@ -546,7 +579,7 @@ impl KuromameApp {
             surface_visible: true,
             overlay_surfaces: Vec::new(),
             active_overlay: 0,
-            layers: vec![Layer::new("Layer 1".to_string())],
+            layers: vec![Layer::new("Layer 1".to_string(), LAYER_PALETTE[0])],
             active_layer: 0,
             martini_ff: None,
             bead_types: Vec::new(),
@@ -648,12 +681,10 @@ impl KuromameApp {
         self.refresh_ndx_selection_state();
         self.refresh_interaction_pairs();
         self.refresh_martini_bead_state();
-        // The red click-selection is stored in viewport indices, which just
-        // changed; clear it rather than highlight the wrong atoms.
-        self.viewport.set_state_by_type(SelectedAtomRenderState {
-            selected_atoms: Vec::new(),
-            color: [1.0, 0.0, 0.0],
-        });
+        // Re-project the selection (stored in original indices) into the new
+        // viewport-index space so the red highlight follows residue-visibility
+        // toggles and layer swaps instead of being dropped.
+        self.sync_selection_to_viewport();
     }
 
     fn refresh_interaction_pairs(&mut self) {
@@ -690,38 +721,60 @@ impl KuromameApp {
     /// Push the current Martini bead styling to the viewport in viewport-index
     /// order (matching the possibly-filtered molecule). A no-op display when no
     /// Martini force field is loaded, so nothing changes for ordinary structures.
+    /// Apply Martini per-bead sizing/colouring as per-atom radius/colour
+    /// overrides on the main molecule (viewport-index order), so beads render as
+    /// the main molecule (shading, picking and opacity included) rather than a
+    /// separate overlay. Clears the overrides — restoring element rendering —
+    /// when no Martini force field is loaded or the bead view is off. Atoms
+    /// whose bead type is unknown fall back to their element radius/colour.
     fn refresh_martini_bead_state(&mut self) {
-        let Some(ff) = self.martini_ff.as_ref() else {
-            self.viewport.set_state_by_type(MartiniBeadState {
-                styles: Vec::new(),
-                visible: false,
-            });
+        let active =
+            self.martini_visible && self.martini_ff.is_some() && self.molecule.is_some();
+        if !active {
+            self.viewport.set_atom_radii(None);
+            self.viewport.set_atom_colors(None);
             return;
-        };
+        }
 
-        let style_for = |orig: usize| -> Option<BeadStyle> {
-            let bead = self.bead_types.get(orig)?;
-            let radius = ff.radius_nm(bead)?;
-            Some(BeadStyle {
-                radius,
-                color: MartiniForceField::color(bead),
-            })
+        let (radii, colors) = {
+            let ff = self.martini_ff.as_ref().unwrap();
+            let mol = self.molecule.as_ref().unwrap();
+            let filtered = self.visibility.is_filtered();
+            let count = if filtered {
+                self.visibility.view_to_orig.len()
+            } else {
+                mol.atoms.len()
+            };
+            let mut radii = Vec::with_capacity(count);
+            let mut colors = Vec::with_capacity(count);
+            for view in 0..count {
+                let orig = if filtered {
+                    self.visibility.view_to_orig[view]
+                } else {
+                    view
+                };
+                let atom = &mol.atoms[orig];
+                match self
+                    .bead_types
+                    .get(orig)
+                    .and_then(|bead| ff.radius_nm(bead).map(|r| (bead, r)))
+                {
+                    Some((bead, radius)) => {
+                        let (r, g, b) = MartiniForceField::color(bead);
+                        radii.push(radius);
+                        colors.push([r, g, b, 1.0]);
+                    }
+                    None => {
+                        radii.push(ball_stick_radius(&atom.element, false));
+                        let c = default_color_fn(atom, false);
+                        colors.push([c.0, c.1, c.2, c.3]);
+                    }
+                }
+            }
+            (radii, colors)
         };
-
-        let styles: Vec<Option<BeadStyle>> = if self.visibility.is_filtered() {
-            self.visibility
-                .view_to_orig
-                .iter()
-                .map(|&orig| style_for(orig))
-                .collect()
-        } else {
-            (0..self.bead_types.len()).map(style_for).collect()
-        };
-
-        self.viewport.set_state_by_type(MartiniBeadState {
-            styles,
-            visible: self.martini_visible,
-        });
+        self.viewport.set_atom_radii(Some(radii));
+        self.viewport.set_atom_colors(Some(colors));
     }
 
     /// Parse `path` as a Martini force field and, if it defines bead types,
@@ -810,6 +863,10 @@ impl KuromameApp {
     }
 
     fn post_load_cleanup(&mut self) {
+        // A freshly loaded structure invalidates any prior atom selection (its
+        // indices refer to the old molecule); clear it so `rebuild_viewport`
+        // does not project stale indices onto the new geometry.
+        self.selection.selected_atom_indices.clear();
         self.refresh_res_names();
         // When a dot surface is present, draw it through the dedicated surface
         // renderer and hide the raw "DOT" atoms from the main geometry so they
@@ -1035,14 +1092,16 @@ impl KuromameApp {
             self.refresh_ndx_selection_state();
             self.refresh_interaction_pairs();
             self.refresh_martini_bead_state();
-            self.viewport.set_state_by_type(SelectedAtomRenderState {
-                selected_atoms: Vec::new(),
-                color: [1.0, 0.0, 0.0],
-            });
+            // Empty layer: this also clears any stale highlight, since the
+            // freshly loaded layer's selection is what gets projected.
+            self.sync_selection_to_viewport();
         }
         self.refresh_surface_state();
         self.refresh_active_sim_cell();
         self.refresh_layer_overlays();
+        // Apply the now-active layer's stored opacity to the main molecule.
+        let active_opacity = self.layers[self.active_layer].opacity;
+        self.viewport.set_molecule_opacity(active_opacity);
     }
 
     /// Restore the simulation-cell box for the active layer from its current
@@ -1090,10 +1149,14 @@ impl KuromameApp {
                             .unwrap_or(true)
                     }
                 })
-                .map(|a| OverlayAtom {
-                    position: a.position,
-                    radius: ball_stick_radius(&a.element, false),
-                    color: default_color_fn(a, false),
+                .map(|a| {
+                    let (r, g, b, _) = default_color_fn(a, false);
+                    OverlayAtom {
+                        position: a.position,
+                        radius: ball_stick_radius(&a.element, false),
+                        // Element colour, faded by the layer's opacity (alpha).
+                        color: (r, g, b, layer.opacity),
+                    }
                 })
                 .collect();
             if !atoms.is_empty() {
@@ -1121,7 +1184,8 @@ impl KuromameApp {
     pub fn add_layer(&mut self) {
         self.save_active_layer();
         let name = format!("Layer {}", self.layers.len() + 1);
-        self.layers.push(Layer::new(name));
+        let color = LAYER_PALETTE[self.layers.len() % LAYER_PALETTE.len()];
+        self.layers.push(Layer::new(name, color));
         let idx = self.layers.len() - 1;
         self.load_active_layer(idx);
         self.refresh_active_view(false);
@@ -1138,7 +1202,7 @@ impl KuromameApp {
         self.save_active_layer();
         self.layers.remove(idx);
         if self.layers.is_empty() {
-            self.layers.push(Layer::new("Layer 1".to_string()));
+            self.layers.push(Layer::new("Layer 1".to_string(), LAYER_PALETTE[0]));
         }
         let new_active = if self.active_layer == idx {
             idx.min(self.layers.len() - 1)
@@ -1240,6 +1304,35 @@ impl KuromameApp {
 
     pub fn layer_visible(&self, idx: usize) -> bool {
         self.layers.get(idx).map(|l| l.visible).unwrap_or(false)
+    }
+
+    /// The layer's identity colour (swatch / eye tint in the LAYERS panel).
+    pub fn layer_color(&self, idx: usize) -> [f32; 3] {
+        self.layers.get(idx).map(|l| l.color).unwrap_or([0.5, 0.5, 0.5])
+    }
+
+    /// The layer's overlay opacity in `0.0..=1.0`.
+    pub fn layer_opacity(&self, idx: usize) -> f32 {
+        self.layers.get(idx).map(|l| l.opacity).unwrap_or(1.0)
+    }
+
+    /// Set the layer's opacity (clamped to `0.0..=1.0`). For the active layer it
+    /// fades the main molecule (atoms + bonds) via the viewport; for any other
+    /// layer it fades that layer's sphere overlay.
+    pub fn set_layer_opacity(&mut self, idx: usize, opacity: f32) {
+        let clamped = opacity.clamp(0.0, 1.0);
+        let Some(layer) = self.layers.get_mut(idx) else {
+            return;
+        };
+        if layer.opacity == clamped {
+            return;
+        }
+        layer.opacity = clamped;
+        if idx == self.active_layer {
+            self.viewport.set_molecule_opacity(clamped);
+        } else {
+            self.refresh_layer_overlays();
+        }
     }
 
     pub fn set_layer_visible(&mut self, idx: usize, visible: bool) {
@@ -1492,10 +1585,49 @@ impl KuromameApp {
 
     fn clear_selection(&mut self) {
         self.selection.selected_atom_indices.clear();
+        self.sync_selection_to_viewport();
     }
 
     fn toggle_hbond_selection(&mut self) {
         self.selection.with_hbond_chk = !self.selection.with_hbond_chk;
+    }
+
+    /// Push the app-side atom selection (`selection.selected_atom_indices`, in
+    /// original-molecule index space) to the viewport's red highlight, projected
+    /// into the current viewport-index space and dropping atoms hidden by the
+    /// residue filter. This is the single point where selection state reaches the
+    /// rendered view, so every selection path (click, selector expression,
+    /// "Select Between", clear) stays visually consistent.
+    fn sync_selection_to_viewport(&mut self) {
+        let selected_atoms: Vec<usize> = self
+            .selection
+            .selected_atom_indices
+            .iter()
+            .filter_map(|&orig| self.visibility.to_view(orig))
+            .collect();
+        self.viewport.set_state_by_type(SelectedAtomRenderState {
+            selected_atoms,
+            color: [1.0, 0.0, 0.0, 1.0],
+        });
+    }
+
+    /// Fold any atom clicks the viewport captured since the last frame into the
+    /// app-side selection (toggling each), then reflect the result in the view.
+    /// Bridges the viewport's click events, which arrive in viewport-index space,
+    /// to the selection stored in original-index space.
+    fn process_atom_clicks(&mut self) {
+        let clicks: Vec<usize> = match self.clicked_atoms.lock() {
+            Ok(mut g) if !g.is_empty() => std::mem::take(&mut *g),
+            _ => return,
+        };
+        for view_idx in clicks {
+            let orig = self.visibility.to_orig(view_idx);
+            let now_selected = self.toggle_selected_atom(orig);
+            if now_selected && self.selection.with_hbond_chk {
+                self.add_connected_hydrogens(orig);
+            }
+        }
+        self.sync_selection_to_viewport();
     }
 
     fn atom_name_at(&self, atom_index: usize) -> Option<String> {
@@ -1601,6 +1733,7 @@ impl KuromameApp {
         }
 
         self.selection.selected_atom_indices = selected_indices;
+        self.sync_selection_to_viewport();
 
         if self.selection.selected_atom_indices.is_empty() {
             self.set_status("Selector matched 0 atoms");
@@ -1984,6 +2117,101 @@ impl KuromameApp {
             _ => String::new(),
         };
         self.set_loaded_summary(summary);
+    }
+
+    /// The primary structure's type badge (`GRO`/`PDB`) and file name, for the
+    /// left-panel header. `None` when the active layer has no structure loaded.
+    pub fn structure_badge(&self) -> Option<&'static str> {
+        match self.data.structure_file {
+            Some(StructureFile::Gro(_)) => Some("GRO"),
+            Some(StructureFile::Pdb(_)) => Some("PDB"),
+            None => None,
+        }
+    }
+
+    pub fn structure_file_name(&self) -> Option<String> {
+        self.data
+            .structure_file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    }
+
+    /// Every file loaded into the active layer, as badge rows, so the user can
+    /// see the whole loaded state at a glance. The primary structure comes first
+    /// (also shown as the header hero); topology, index, trajectory, the dot
+    /// surface and any Martini force field follow. Overlay surfaces have their
+    /// own panel and are not repeated here.
+    pub fn loaded_files(&self) -> Vec<LoadedFileRow> {
+        let mut rows = Vec::new();
+        let file_name = |p: &Option<PathBuf>| -> Option<String> {
+            p.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        };
+
+        if let (Some(badge), Some(name)) = (self.structure_badge(), self.structure_file_name()) {
+            rows.push(LoadedFileRow {
+                badge,
+                name,
+                detail: format!("{} atoms", self.atom_count()),
+            });
+        }
+
+        if let Some(name) = file_name(&self.data.top_file_path) {
+            let badge = if name.to_ascii_lowercase().ends_with(".itp") {
+                "ITP"
+            } else {
+                "TOP"
+            };
+            rows.push(LoadedFileRow {
+                badge,
+                name,
+                detail: "topology".to_string(),
+            });
+        }
+
+        if let Some(name) = file_name(&self.data.ndx_file_path) {
+            let groups = self
+                .data
+                .ndx_file
+                .as_ref()
+                .map(|n| n.groups.len())
+                .unwrap_or(0);
+            rows.push(LoadedFileRow {
+                badge: "NDX",
+                name,
+                detail: format!("{groups} groups"),
+            });
+        }
+
+        if let Some(name) = file_name(&self.trajectory_path) {
+            rows.push(LoadedFileRow {
+                badge: "XTC",
+                name,
+                detail: format!("{} frames", self.trajectory.len()),
+            });
+        }
+
+        if !self.surface_dots.is_empty() {
+            rows.push(LoadedFileRow {
+                badge: "SURF",
+                name: "dot surface".to_string(),
+                detail: format!("{} dots", self.surface_dots.len()),
+            });
+        }
+
+        if let Some(ff) = self.martini_ff.as_ref() {
+            rows.push(LoadedFileRow {
+                badge: "FF",
+                name: "Martini".to_string(),
+                detail: format!("{} bead types", ff.bead_type_count()),
+            });
+        }
+
+        rows
     }
 
     fn load_top_and_gro_for_resname_sync(&mut self, top_path: PathBuf, gro_path: PathBuf) {
@@ -2539,6 +2767,8 @@ impl KuromameApp {
                 }
             }
         }
+
+        self.sync_selection_to_viewport();
     }
 
     fn find_atoms_between_dfs(mol: &Molecule, start: usize, end: usize) -> Vec<usize> {
@@ -2674,6 +2904,7 @@ impl KuromameApp {
 
         // Clear selection
         self.selection.selected_atom_indices.clear();
+        self.sync_selection_to_viewport();
         self.set_status("Residue names updated");
     }
 
@@ -2722,6 +2953,9 @@ impl eframe::App for KuromameApp {
 
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
+        // Fold clicks the viewport captured last frame into the selection before
+        // the panels (which read the selection count / enablement) are drawn.
+        self.process_atom_clicks();
 
         // Advance trajectory playback
         if self.traj_ui.is_playing {
@@ -2730,11 +2964,12 @@ impl eframe::App for KuromameApp {
             ctx.request_repaint();
         }
 
-        app_ui::render_menu_bar(self, &ctx);
-        app_ui::render_bottom_status_bar(self, &ctx);
-        app_ui::render_left_panel(self, &ctx);
-        app_ui::render_overlay_panel(self, &ctx);
-        app_ui::render_bottom_dock(self, &ctx);
+        // egui 0.35: panels are shown into the root `ui`, not the context.
+        app_ui::render_menu_bar(self, ui);
+        app_ui::render_bottom_status_bar(self, ui);
+        app_ui::render_left_panel(self, ui);
+        app_ui::render_overlay_panel(self, ui);
+        app_ui::render_bottom_dock(self, ui);
         app_ui::render_edit_dialog(self, &ctx);
 
         // Top-left overlay text: filename · frame.
@@ -2750,7 +2985,7 @@ impl eframe::App for KuromameApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(app_ui::theme::BG))
-            .show(&ctx, |ui| {
+            .show(ui, |ui| {
                 let Some(render_state) = &self.render_state else {
                     ui.heading("WGPU backend is unavailable");
                     ui.label("Start with the wgpu backend enabled in eframe.");
@@ -2815,6 +3050,19 @@ impl eframe::App for KuromameApp {
                         egui::Color32::WHITE,
                     );
                 });
+        }
+
+        // The viewport's click events fire during `viewport.show()` above, i.e.
+        // after `process_atom_clicks` already ran this frame. Schedule another
+        // frame so a just-captured click is folded into the selection promptly
+        // rather than waiting for an unrelated repaint.
+        let clicks_pending = self
+            .clicked_atoms
+            .lock()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false);
+        if clicks_pending {
+            ctx.request_repaint();
         }
     }
 

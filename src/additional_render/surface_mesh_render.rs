@@ -100,7 +100,7 @@ impl AdditionalRender for SurfaceMeshRender {
                     position,
                     Quaternion::new_identity(),
                     self.radius,
-                    layer.color,
+                    (layer.color.0, layer.color.1, layer.color.2, 1.0),
                     0.1,
                 ));
             }

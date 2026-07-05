@@ -22,6 +22,43 @@ pub mod theme {
     pub const AMBER: Color32 = Color32::from_rgb(0xe0, 0xb3, 0x41);
     pub const INPUT_BG: Color32 = Color32::from_rgb(0x01, 0x04, 0x09);
     pub const HOVER_BG: Color32 = Color32::from_rgb(0x16, 0x1b, 0x22);
+    /// Layer-card fill and its resting (inactive) border, from the "1A" design.
+    pub const CARD_BG: Color32 = Color32::from_rgb(0x14, 0x1b, 0x24);
+    pub const CARD_BORDER: Color32 = Color32::from_rgb(0x23, 0x2c, 0x38);
+    /// Count-badge pill background / text.
+    pub const BADGE_BG: Color32 = Color32::from_rgb(0x1c, 0x25, 0x31);
+    pub const BADGE_FG: Color32 = Color32::from_rgb(0xad, 0xba, 0xc7);
+}
+
+/// A small rounded count pill (e.g. the `2` next to a `LAYERS` header).
+fn count_badge(ui: &mut egui::Ui, n: usize) {
+    egui::Frame::new()
+        .fill(theme::BADGE_BG)
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(7, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(n.to_string())
+                    .size(10.5)
+                    .color(theme::BADGE_FG)
+                    .strong(),
+            );
+        });
+}
+
+/// A 12×12 rounded colour swatch used as a layer's identity marker.
+fn color_swatch(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(4), color);
+}
+
+fn rgb_to_color32(c: [f32; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 fn mi(icon: MaterialIcon) -> String {
@@ -36,6 +73,23 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
             .color(theme::MUTED2)
             .strong(),
     );
+}
+
+/// A small outlined type badge pill (e.g. `GRO`, `TOP`, `NDX`), matching the
+/// "Viewer UI" design's file-format chips.
+fn type_badge(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, theme::BORDER2))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .size(10.5)
+                    .color(theme::MUTED)
+                    .strong(),
+            );
+        });
 }
 
 /// A secondary (outlined) action button sized to fill the available width slot.
@@ -83,7 +137,7 @@ pub fn render_edit_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
     }
 }
 
-pub fn render_menu_bar(app: &mut KuromameApp, ctx: &egui::Context) {
+pub fn render_menu_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::top("menu_bar")
         .frame(
             egui::Frame::new()
@@ -91,7 +145,7 @@ pub fn render_menu_bar(app: &mut KuromameApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
                 .inner_margin(egui::Margin::symmetric(14, 8)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 // Wordmark.
                 ui.label(egui::RichText::new("■").color(theme::ACCENT).size(13.0));
@@ -269,21 +323,24 @@ fn help_menu(ui: &mut egui::Ui) {
     });
 }
 
-pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
-    egui::SidePanel::left("left_panel")
+pub fn render_left_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    egui::Panel::left("left_panel")
         .resizable(true)
-        .default_width(264.0)
-        .min_width(200.0)
+        .default_size(264.0)
+        .min_size(200.0)
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
                 .inner_margin(egui::Margin::symmetric(16, 16)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 file_header(app, ui);
                 ui.add_space(14.0);
+                if loaded_files_section(app, ui) {
+                    ui.add_space(14.0);
+                }
                 selection_section(app, ui);
                 ui.add_space(14.0);
                 components_section(app, ui);
@@ -292,33 +349,73 @@ pub fn render_left_panel(app: &mut KuromameApp, ctx: &egui::Context) {
 }
 
 fn file_header(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    // Hero: the active layer's structure file name (falls back to the layer
+    // name when nothing is loaded), then a format badge + atom count row.
+    let title = app
+        .structure_file_name()
+        .unwrap_or_else(|| app.active_layer_name());
     ui.label(
-        egui::RichText::new(format!(
-            "{}  ·  {}",
-            app.active_layer_name(),
-            &app.data.loaded_summary
-        ))
-        .color(theme::TEXT)
-        .size(14.0)
-        .strong(),
+        egui::RichText::new(title)
+            .color(theme::TEXT)
+            .size(14.0)
+            .strong(),
     );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let atoms = app.atom_count();
-        if atoms > 0 {
-            ui.label(
-                egui::RichText::new(format!("{atoms} atoms"))
-                    .color(theme::MUTED2)
-                    .size(12.0),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new("no file loaded")
-                    .color(theme::MUTED2)
-                    .size(12.0),
-            );
+        if let Some(badge) = app.structure_badge() {
+            type_badge(ui, badge);
+            ui.add_space(2.0);
         }
+        let atoms = app.atom_count();
+        let detail = if atoms > 0 {
+            format!("{atoms} atoms")
+        } else {
+            "no file loaded".to_string()
+        };
+        ui.label(
+            egui::RichText::new(detail)
+                .color(theme::MUTED2)
+                .size(12.0),
+        );
     });
+}
+
+/// Lists every file loaded into the active layer besides the primary structure
+/// (which is the header hero) — topology, index, trajectory, dot surface and
+/// Martini force field — each as a badge row, so the whole loaded state is
+/// visible at a glance. Returns whether anything was drawn.
+fn loaded_files_section(app: &mut KuromameApp, ui: &mut egui::Ui) -> bool {
+    let aux: Vec<_> = app
+        .loaded_files()
+        .into_iter()
+        .filter(|r| !matches!(r.badge, "GRO" | "PDB"))
+        .collect();
+    if aux.is_empty() {
+        return false;
+    }
+    section_label(ui, "LOADED FILES");
+    ui.add_space(6.0);
+    for row in aux {
+        ui.horizontal(|ui| {
+            type_badge(ui, row.badge);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(
+                    egui::RichText::new(&row.name)
+                        .color(theme::TEXT)
+                        .size(12.5),
+                );
+                ui.label(
+                    egui::RichText::new(&row.detail)
+                        .color(theme::MUTED2)
+                        .size(11.0),
+                );
+            });
+        });
+        ui.add_space(6.0);
+    }
+    true
 }
 
 fn selection_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
@@ -526,25 +623,28 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
 
 /// Right-side panel: the LAYERS list (switch the active structure, toggle each
 /// layer's sphere overlay, add/remove) plus the dot-surface overlays below it.
-pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
-    egui::SidePanel::right("overlay_panel")
+pub fn render_overlay_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    egui::Panel::right("overlay_panel")
         .resizable(true)
-        .default_width(240.0)
-        .min_width(190.0)
+        .default_size(240.0)
+        .min_size(190.0)
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
                 .inner_margin(egui::Margin::symmetric(16, 16)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             render_layers_section(app, ui);
 
             ui.add_space(16.0);
             ui.separator();
             ui.add_space(12.0);
 
-            section_label(ui, "OVERLAY SURFACES");
+            ui.horizontal(|ui| {
+                section_label(ui, "OVERLAY SURFACES");
+                count_badge(ui, app.overlay_count());
+            });
             ui.add_space(6.0);
 
             if secondary_button(
@@ -629,73 +729,189 @@ pub fn render_overlay_panel(app: &mut KuromameApp, ctx: &egui::Context) {
 /// molecule) and toggles that layer's sphere overlay when it is not active.
 /// Only one layer is the main molecule at a time; the rest render as spheres.
 fn render_layers_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
-    section_label(ui, "LAYERS");
-    ui.add_space(6.0);
-
-    if secondary_button(ui, format!("{}  Add layer…", mi(MaterialIcon::Layers)), true)
-        .on_hover_text("Add a new layer and load a structure into it")
-        .clicked()
-    {
-        app.add_layer();
-    }
-    ui.add_space(8.0);
-
     let count = app.layer_count();
     let active = app.active_layer_index();
     let names = app.layer_names();
     // Precompute so the scroll closure needs no borrow of `app`.
     let atom_counts: Vec<usize> = (0..count).map(|i| app.layer_atom_count(i)).collect();
     let visibles: Vec<bool> = (0..count).map(|i| app.layer_visible(i)).collect();
+    let colors: Vec<egui::Color32> = (0..count).map(|i| rgb_to_color32(app.layer_color(i))).collect();
+    let opacities: Vec<f32> = (0..count).map(|i| app.layer_opacity(i)).collect();
+
+    // Header: LAYERS · count · Add layer.
+    let mut do_add = false;
+    ui.horizontal(|ui| {
+        section_label(ui, "LAYERS");
+        count_badge(ui, count);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            do_add = ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("{} Add layer", mi(MaterialIcon::Add)))
+                            .color(theme::ACCENT)
+                            .size(12.0),
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::NONE),
+                )
+                .on_hover_text("Add a new layer and load a structure into it")
+                .clicked();
+        });
+    });
+    ui.add_space(8.0);
 
     let mut make_active: Option<usize> = None;
     let mut toggle_vis: Option<(usize, bool)> = None;
     let mut remove: Option<usize> = None;
+    let mut set_opacity: Option<(usize, f32)> = None;
 
     egui::ScrollArea::vertical()
         .id_salt("layers_scroll")
-        .max_height(280.0)
+        .max_height(320.0)
         .show(ui, |ui| {
             for (i, name) in names.iter().enumerate() {
                 let is_active = i == active;
-                ui.horizontal(|ui| {
-                    let label = egui::RichText::new(format!("{}. {}", i + 1, tab_short_name(name)))
-                        .color(if is_active { theme::TEXT } else { theme::MUTED })
-                        .size(12.5);
-                    if ui.selectable_label(is_active, label).clicked() && !is_active {
-                        make_active = Some(i);
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{}a", atom_counts[i]))
-                            .color(theme::MUTED2)
-                            .size(11.0),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                count > 1,
-                                egui::Button::new(mi(MaterialIcon::Delete)).frame(false),
-                            )
-                            .on_hover_text("Remove layer")
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                        // The active layer is always drawn as the main molecule,
-                        // so its sphere toggle is disabled.
-                        let mut vis = visibles[i];
-                        if ui
-                            .add_enabled(!is_active, egui::Checkbox::new(&mut vis, ""))
-                            .on_hover_text("Show as spheres while not active")
-                            .changed()
-                        {
-                            toggle_vis = Some((i, vis));
-                        }
+                let border = if is_active {
+                    theme::ACCENT
+                } else {
+                    theme::CARD_BORDER
+                };
+                let card = egui::Frame::new()
+                    .fill(theme::CARD_BG)
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(12, 11))
+                    .outer_margin(egui::Margin {
+                        bottom: 8,
+                        ..egui::Margin::ZERO
                     });
+
+                // Returns (visibility toggle, remove requested, opacity change)
+                // so the whole-card activation click below can ignore inner hits.
+                let out = card.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let mut toggle: Option<bool> = None;
+                    let mut remove_req = false;
+                    let mut set_op: Option<f32> = None;
+
+                    ui.horizontal(|ui| {
+                        // Eye = visibility. The active layer is always drawn as
+                        // the main molecule, so its eye is a disabled indicator.
+                        let icon = if visibles[i] {
+                            MaterialIcon::Visibility
+                        } else {
+                            MaterialIcon::VisibilityOff
+                        };
+                        let eye_col = if visibles[i] { colors[i] } else { theme::MUTED2 };
+                        let eye = ui.add_enabled(
+                            !is_active,
+                            egui::Button::new(egui::RichText::new(mi(icon)).color(eye_col).size(15.0))
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                        );
+                        if eye.on_hover_text("Show as spheres while not active").clicked() {
+                            toggle = Some(!visibles[i]);
+                        }
+
+                        color_swatch(ui, colors[i]);
+                        ui.add_space(3.0);
+
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            let name_col = if visibles[i] { theme::TEXT } else { theme::MUTED2 };
+                            ui.label(
+                                egui::RichText::new(tab_short_name(name))
+                                    .color(name_col)
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{} atoms", atom_counts[i]))
+                                    .color(theme::MUTED2)
+                                    .size(11.0),
+                            );
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if is_active {
+                                ui.label(
+                                    egui::RichText::new("active")
+                                        .color(theme::ACCENT)
+                                        .size(10.5)
+                                        .strong(),
+                                );
+                            } else if ui
+                                .add_enabled(
+                                    count > 1,
+                                    egui::Button::new(
+                                        egui::RichText::new(mi(MaterialIcon::Delete))
+                                            .color(theme::MUTED2)
+                                            .size(15.0),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                                )
+                                .on_hover_text("Remove layer")
+                                .clicked()
+                            {
+                                remove_req = true;
+                            }
+                        });
+                    });
+
+                    // Opacity: fades the main molecule for the active layer, or
+                    // the sphere overlay for the others.
+                    ui.add_space(9.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("OPACITY")
+                                .size(9.5)
+                                .color(theme::MUTED2)
+                                .strong(),
+                        );
+                        let mut op = opacities[i];
+                        ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
+                        let resp =
+                            ui.add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false));
+                        if resp.changed() {
+                            set_op = Some(op);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
+                                .size(11.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+
+                    (toggle, remove_req, set_op)
                 });
+
+                let (toggle, remove_req, set_op) = out.inner;
+                if let Some(v) = toggle {
+                    toggle_vis = Some((i, v));
+                }
+                if remove_req {
+                    remove = Some(i);
+                }
+                if let Some(op) = set_op {
+                    set_opacity = Some((i, op));
+                }
+                // Click anywhere else on a non-active card to make it active.
+                let card_clicked = out.response.interact(egui::Sense::click()).clicked();
+                if card_clicked
+                    && toggle.is_none()
+                    && !remove_req
+                    && set_op.is_none()
+                    && !is_active
+                {
+                    make_active = Some(i);
+                }
             }
         });
 
+    if do_add {
+        app.add_layer();
+    }
     if let Some(i) = make_active {
         app.set_active_layer(i);
     }
@@ -704,6 +920,9 @@ fn render_layers_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
     }
     if let Some(i) = remove {
         app.remove_layer(i);
+    }
+    if let Some((i, op)) = set_opacity {
+        app.set_layer_opacity(i, op);
     }
 }
 
@@ -721,7 +940,7 @@ fn tab_short_name(name: &str) -> String {
 }
 
 /// Bottom dock: render-style segmented control + trajectory transport.
-pub fn render_bottom_dock(app: &mut KuromameApp, ctx: &egui::Context) {
+pub fn render_bottom_dock(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::bottom("bottom_dock")
         .frame(
             egui::Frame::new()
@@ -729,7 +948,7 @@ pub fn render_bottom_dock(app: &mut KuromameApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
                 .inner_margin(egui::Margin::symmetric(16, 10)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 section_label(ui, "STYLE");
                 style_segment(app, ui);
@@ -875,7 +1094,7 @@ fn trajectory_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
     });
 }
 
-pub fn render_bottom_status_bar(app: &mut KuromameApp, ctx: &egui::Context) {
+pub fn render_bottom_status_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::bottom("status_bar")
         .frame(
             egui::Frame::new()
@@ -883,7 +1102,7 @@ pub fn render_bottom_status_bar(app: &mut KuromameApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, theme::BORDER))
                 .inner_margin(egui::Margin::symmetric(16, 6)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut app.selection.with_hbond_chk, "Select with hbond");
                 ui.separator();

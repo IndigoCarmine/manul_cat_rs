@@ -12,7 +12,7 @@
 //!
 //! A structure/topology tells us *which* bead type each particle is (see the
 //! app's bead-type resolution); this registry turns that type into a
-//! `(radius, colour)` for [`crate::martini_bead_render`].
+//! `(radius, colour)`, applied as per-atom overrides on the main molecule.
 
 use std::collections::HashMap;
 use std::path::Path;
