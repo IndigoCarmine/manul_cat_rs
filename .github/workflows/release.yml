@@ -61,6 +61,28 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+      # --- Windows installer (Inno Setup) ---
+      - name: Derive version from tag
+        if: matrix.os == 'windows-latest'
+        id: version
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Windows installer
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Inno Setup is preinstalled on GitHub windows-latest runners.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" installer\manul.iss
+
+      - name: Upload installer artifact
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: manul-windows-installer
+          path: dist/*.exe
+
   release:
     name: Create Release
     needs: build
@@ -80,4 +102,5 @@ jobs:
             manul_cat_rs-linux-amd64
             manul_cat_rs-windows-amd64.exe
             manul_cat_rs-macos-aarch64
+            manul-setup-*-windows-x64.exe
           generate_release_notes: true
