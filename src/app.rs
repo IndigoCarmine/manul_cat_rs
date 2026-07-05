@@ -2691,7 +2691,16 @@ impl KuromameApp {
                 .collect()
         });
 
-        if dropped_paths.is_empty() {
+        self.load_paths(dropped_paths);
+    }
+
+    /// Load a batch of files, routing each by extension exactly as a drag-and-drop
+    /// does: a `.top`+`.gro` pair is cross-loaded for residue-name sync, otherwise
+    /// the single most relevant file is loaded. Shared by drag-and-drop and the
+    /// command-line entry point (files passed as arguments / opened via a file
+    /// association). A no-op on an empty list.
+    pub fn load_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
             return;
         }
 
@@ -2701,7 +2710,7 @@ impl KuromameApp {
         let mut xtc_path: Option<PathBuf> = None;
         let mut other_path: Option<PathBuf> = None;
 
-        for path in &dropped_paths {
+        for path in &paths {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 match ext.to_ascii_lowercase().as_str() {
                     "top" | "itp" => top_path = Some(path.clone()),
