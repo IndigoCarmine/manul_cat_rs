@@ -1,6 +1,6 @@
 [package]
 name = "manul_cat_rs"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 
 [dependencies]
@@ -18,3 +18,13 @@ image = "0.25"
 
 [build-dependencies]
 winresource = "0.1"
+
+[package.metadata.appimage]
+icon = "resources/Manuru.ico"
+desktop_entry = "other/myapp.desktop"
+
+
+[patch.crates-io]
+winit = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
+egui-winit = { git = "https://github.com/IndigoCarmine/egui-winit", branch = "main" }
+
