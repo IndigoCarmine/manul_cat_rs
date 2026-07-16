@@ -5,27 +5,30 @@ use moleucle_3dview_rs::{
 
 #[derive(Clone)]
 pub struct NdxSelectionRender {
-    color: (f32, f32, f32),
     radius: f32,
 }
 
-/// State type for NDX-selected atom indices stored in SharedRenderStates.
+/// One NDX group's atoms (viewport indices) and the colour they are drawn in.
+/// The app assigns every atom to at most one group, so overlapping groups never
+/// stack two spheres on the same position.
+#[derive(Clone)]
+pub struct NdxSelectionGroup {
+    pub atom_indices: Vec<usize>,
+    pub color: (f32, f32, f32),
+}
+
+/// State type for the NDX groups currently drawn, stored in SharedRenderStates.
 #[derive(Clone, Default)]
 pub struct NdxSelectionState {
-    pub atom_indices: Vec<usize>,
+    pub groups: Vec<NdxSelectionGroup>,
     pub visible: bool,
 }
 
 impl NdxSelectionRender {
     pub fn new() -> Self {
         Self {
-            color: (1.0, 0.6, 0.0),
-            radius: vdw_radius("C") * 0.24,
+            radius: vdw_radius("C") * 0.5,
         }
-    }
-
-    pub fn set_color(&mut self, color: (f32, f32, f32)) {
-        self.color = color;
     }
 
     pub fn set_radius(&mut self, radius: f32) {
@@ -54,22 +57,24 @@ impl AdditionalRender for NdxSelectionRender {
             return;
         };
 
-        if !state.visible || state.atom_indices.is_empty() {
+        if !state.visible {
             return;
         }
 
-        for &atom_index in &state.atom_indices {
-            let Some(atom) = molecule.atoms.get(atom_index) else {
-                continue;
-            };
+        for group in &state.groups {
+            for &atom_index in &group.atom_indices {
+                let Some(atom) = molecule.atoms.get(atom_index) else {
+                    continue;
+                };
 
-            self.add_sphere(
-                scene,
-                frame_state,
-                atom.position,
-                self.radius,
-                (self.color.0, self.color.1, self.color.2, 1.0),
-            );
+                self.add_sphere(
+                    scene,
+                    frame_state,
+                    atom.position,
+                    self.radius,
+                    (group.color.0, group.color.1, group.color.2, 1.0),
+                );
+            }
         }
     }
 }

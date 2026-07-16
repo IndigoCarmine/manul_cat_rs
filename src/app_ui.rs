@@ -573,50 +573,79 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
         );
     }
 
-    // NDX group block (only when an NDX file with groups is loaded).
+    // NDX group block (only when an NDX file with groups is loaded). Every group
+    // can be shown at once, each in its own editable colour; the swatch sets the
+    // colour and the row toggles that group on its own, while "Show NDX groups"
+    // hides the lot without disturbing the per-group state.
     if app.ndx_group_count() > 0 {
         ui.add_space(12.0);
-        section_label(ui, "NDX GROUP");
+        section_label(ui, "NDX GROUPS");
         ui.add_space(6.0);
 
         let mut ndx_visible = app.ndx_visible();
-        if ui.checkbox(&mut ndx_visible, "Show NDX group").changed() {
+        if ui.checkbox(&mut ndx_visible, "Show NDX groups").changed() {
             app.set_ndx_visible(ndx_visible);
         }
+        ui.add_space(4.0);
 
-        let options = app.ndx_group_options();
-        let mut selected_index = app.ndx_selected_group_index().unwrap_or(0);
-        if selected_index >= options.len() {
-            selected_index = 0;
-        }
-        egui::ComboBox::from_id_salt("ndx_group_selector")
-            .width(ui.available_width())
-            .selected_text(
-                options
-                    .get(selected_index)
-                    .cloned()
-                    .unwrap_or_else(|| "(none)".to_string()),
-            )
-            .show_ui(ui, |ui| {
+        ui.horizontal(|ui| {
+            if secondary_button(ui, "Show all".to_string(), true).clicked() {
+                app.set_all_ndx_groups_enabled(true);
+            }
+            if secondary_button(ui, "Hide all".to_string(), true).clicked() {
+                app.set_all_ndx_groups_enabled(false);
+            }
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("ndx_group_scroll")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                let options = app.ndx_group_options();
+                let mut toggles: Vec<(usize, bool)> = Vec::new();
+                let mut recolors: Vec<(usize, [f32; 3])> = Vec::new();
                 for (idx, label) in options.iter().enumerate() {
-                    if ui.selectable_label(idx == selected_index, label).clicked() {
-                        selected_index = idx;
-                    }
+                    let enabled = app.ndx_group_enabled(idx);
+                    ui.horizontal(|ui| {
+                        let mut color = app.ndx_group_color(idx);
+                        if ui.color_edit_button_rgb(&mut color).changed() {
+                            recolors.push((idx, color));
+                        }
+                        let icon = if enabled {
+                            MaterialIcon::Visibility
+                        } else {
+                            MaterialIcon::VisibilityOff
+                        };
+                        let text_col = if enabled { theme::TEXT } else { theme::MUTED2 };
+                        let text = egui::RichText::new(format!("{}  {}", mi(icon), label))
+                            .color(text_col)
+                            .size(13.0);
+                        let resp = ui.add_sized(
+                            egui::vec2(ui.available_width(), 28.0),
+                            egui::Button::new(text)
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(egui::CornerRadius::same(7)),
+                        );
+                        if resp.clicked() {
+                            toggles.push((idx, !enabled));
+                        }
+                    });
+                }
+                for (idx, color) in recolors {
+                    app.set_ndx_group_color(idx, color);
+                }
+                for (idx, enabled) in toggles {
+                    app.set_ndx_group_enabled(idx, enabled);
                 }
             });
-        if app.ndx_selected_group_index() != Some(selected_index) {
-            app.set_ndx_selected_group_index(selected_index);
-        }
 
-        let group_name = app.ndx_selected_group_name().unwrap_or("-");
+        ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(format!(
-                "{} · {} atoms",
-                group_name,
-                app.ndx_selected_atom_count()
-            ))
-            .color(theme::MUTED2)
-            .size(12.0),
+            egui::RichText::new(format!("{} atoms rendered", app.ndx_selected_atom_count()))
+                .color(theme::MUTED2)
+                .size(12.0),
         );
     }
 }

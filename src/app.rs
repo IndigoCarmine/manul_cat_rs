@@ -4,7 +4,7 @@ use crate::layer_overlay_render::{
 use crate::inter_molecular_interaction_render::{
     InterMolecularInteractionRender, InteractionPairsState,
 };
-use crate::ndx_selection_render::{NdxSelectionRender, NdxSelectionState};
+use crate::ndx_selection_render::{NdxSelectionGroup, NdxSelectionRender, NdxSelectionState};
 use crate::parsing::{
     AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
     XtcFile, XtcFrame,
@@ -21,7 +21,7 @@ use moleucle_3dview_rs::{
     ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -90,13 +90,24 @@ struct SelectionState {
     selected_atom_indices: Vec<usize>,
 }
 
+/// Show/colour state for one NDX group. Kept in a vec parallel to the loaded
+/// [`NdxFile`]'s groups and rebuilt whenever an NDX file is imported, so index
+/// `i` here always describes group `i` there.
+#[derive(Clone)]
+struct NdxGroupUi {
+    /// Whether this group contributes atoms to the NDX highlight. Independent of
+    /// the block's master `ndx_visible` toggle, which hides all groups at once.
+    enabled: bool,
+    color: [f32; 3],
+}
+
 struct UiState {
     status_msg: String,
     show_edit_dialog: bool,
     new_res_name: String,
     hovered_atom_info: String,
     selector_input: String,
-    ndx_selected_group_index: Option<usize>,
+    ndx_groups: Vec<NdxGroupUi>,
     ndx_visible: bool,
     ndx_selected_atom_count: usize,
 }
@@ -189,6 +200,21 @@ const OVERLAY_SURFACE_PALETTE: [[f32; 3]; 6] = [
     [0.95, 0.55, 0.80], // pink
 ];
 
+/// Colours handed to NDX groups as a file is imported, so several groups drawn
+/// at once stay tellable apart. Starts with the orange the NDX highlight has
+/// always used, so a freshly imported file looks the way it always has. The user
+/// can override any group's colour from the NDX GROUPS panel.
+const NDX_GROUP_PALETTE: [[f32; 3]; 8] = [
+    [1.00, 0.60, 0.00], // orange
+    [0.30, 0.64, 1.00], // blue
+    [0.45, 0.85, 0.45], // green
+    [0.95, 0.35, 0.35], // red
+    [0.80, 0.45, 0.95], // purple
+    [0.30, 0.85, 0.85], // cyan
+    [0.95, 0.55, 0.80], // pink
+    [0.88, 0.70, 0.25], // amber
+];
+
 /// Identity colours cycled through as document layers are created, so each layer
 /// has a distinct swatch/eye tint in the LAYERS panel.
 const LAYER_PALETTE: [[f32; 3]; 6] = [
@@ -248,7 +274,7 @@ struct Layer {
     martini_visible: bool,
     // Per-structure UI state (mirrors the working copies in `UiState`).
     selector_input: String,
-    ndx_selected_group_index: Option<usize>,
+    ndx_groups: Vec<NdxGroupUi>,
     ndx_visible: bool,
     ndx_selected_atom_count: usize,
 }
@@ -285,7 +311,7 @@ impl Layer {
             bead_types: Vec::new(),
             martini_visible: true,
             selector_input: String::new(),
-            ndx_selected_group_index: None,
+            ndx_groups: Vec::new(),
             ndx_visible: true,
             ndx_selected_atom_count: 0,
         }
@@ -556,7 +582,7 @@ impl KuromameApp {
                 new_res_name: String::new(),
                 hovered_atom_info: "Hover an atom for details".to_string(),
                 selector_input: String::new(),
-                ndx_selected_group_index: None,
+                ndx_groups: Vec::new(),
                 ndx_visible: true,
                 ndx_selected_atom_count: 0,
             },
@@ -1041,7 +1067,7 @@ impl KuromameApp {
         self.layers[a].bead_types = std::mem::take(&mut self.bead_types);
         self.layers[a].martini_visible = self.martini_visible;
         self.layers[a].selector_input = std::mem::take(&mut self.ui.selector_input);
-        self.layers[a].ndx_selected_group_index = self.ui.ndx_selected_group_index;
+        self.layers[a].ndx_groups = std::mem::take(&mut self.ui.ndx_groups);
         self.layers[a].ndx_visible = self.ui.ndx_visible;
         self.layers[a].ndx_selected_atom_count = self.ui.ndx_selected_atom_count;
     }
@@ -1066,7 +1092,7 @@ impl KuromameApp {
         self.bead_types = std::mem::take(&mut self.layers[idx].bead_types);
         self.martini_visible = self.layers[idx].martini_visible;
         self.ui.selector_input = std::mem::take(&mut self.layers[idx].selector_input);
-        self.ui.ndx_selected_group_index = self.layers[idx].ndx_selected_group_index;
+        self.ui.ndx_groups = std::mem::take(&mut self.layers[idx].ndx_groups);
         self.ui.ndx_visible = self.layers[idx].ndx_visible;
         self.ui.ndx_selected_atom_count = self.layers[idx].ndx_selected_atom_count;
     }
@@ -1384,37 +1410,64 @@ impl KuromameApp {
         atom_indices
     }
 
-    fn current_ndx_indices(&self) -> Vec<usize> {
-        let Some(ndx) = self.data.ndx_file.as_ref() else {
-            return Vec::new();
-        };
-        let Some(group_index) = self.ui.ndx_selected_group_index else {
-            return Vec::new();
-        };
-        let Some(group) = ndx.groups.get(group_index) else {
-            return Vec::new();
-        };
-
-        let atom_count = self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0);
-        Self::normalized_ndx_indices(&group.entries, atom_count)
+    /// Leave each atom in only the *last* group that lists it, so overlapping
+    /// NDX groups draw one sphere per atom instead of stacking several on the
+    /// same position (which would z-fight).
+    ///
+    /// Groups routinely overlap — GROMACS ships `System` alongside `Protein`,
+    /// `SOL` and friends — and later groups are the narrower ones, so letting
+    /// them win keeps `Protein` showing through `System` rather than buried
+    /// under it. `groups` is in NDX file order.
+    fn resolve_ndx_overlaps(groups: &mut [Vec<usize>]) {
+        let mut claimed: HashSet<usize> = HashSet::new();
+        for atoms in groups.iter_mut().rev() {
+            atoms.retain(|atom| claimed.insert(*atom));
+        }
     }
 
+    /// Rebuild the NDX highlight from every enabled group, mapping each one's
+    /// entries into viewport space, dropping the atoms the residue filter
+    /// currently hides, and resolving overlaps between the groups.
     fn refresh_ndx_selection_state(&mut self) {
-        let orig_indices = if self.ui.ndx_visible {
-            self.current_ndx_indices()
-        } else {
-            Vec::new()
-        };
+        // The enabled groups' NDX file indices and their atoms in viewport
+        // space, kept parallel and in file order.
+        let mut group_indices: Vec<usize> = Vec::new();
+        let mut atoms_per_group: Vec<Vec<usize>> = Vec::new();
+        if self.ui.ndx_visible
+            && let Some(ndx) = self.data.ndx_file.as_ref()
+        {
+            let atom_count = self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0);
+            for (idx, group) in ndx.groups.iter().enumerate() {
+                if !self.ui.ndx_groups.get(idx).is_some_and(|g| g.enabled) {
+                    continue;
+                }
+                group_indices.push(idx);
+                atoms_per_group.push(
+                    Self::normalized_ndx_indices(&group.entries, atom_count)
+                        .into_iter()
+                        .filter_map(|orig| self.visibility.to_view(orig))
+                        .collect(),
+                );
+            }
+        }
 
-        // Map into viewport space and drop atoms that are currently hidden.
-        let atom_indices: Vec<usize> = orig_indices
-            .iter()
-            .filter_map(|&orig| self.visibility.to_view(orig))
+        Self::resolve_ndx_overlaps(&mut atoms_per_group);
+
+        let groups: Vec<NdxSelectionGroup> = group_indices
+            .into_iter()
+            .zip(atoms_per_group)
+            .map(|(idx, atom_indices)| {
+                let [r, g, b] = self.ndx_group_color(idx);
+                NdxSelectionGroup {
+                    atom_indices,
+                    color: (r, g, b),
+                }
+            })
             .collect();
 
-        self.ui.ndx_selected_atom_count = atom_indices.len();
+        self.ui.ndx_selected_atom_count = groups.iter().map(|g| g.atom_indices.len()).sum();
         self.viewport.set_state_by_type(NdxSelectionState {
-            atom_indices,
+            groups,
             visible: self.ui.ndx_visible,
         });
     }
@@ -1496,9 +1549,18 @@ impl KuromameApp {
         };
 
         let group_count = ndx.groups.len();
+        // Give every group a palette colour up front so the list shows a stable
+        // swatch per group, but only draw the first one. A GROMACS file leads
+        // with `System`, so enabling everything on import would paint the whole
+        // structure at once; the user opts the rest in from the panel.
+        self.ui.ndx_groups = (0..group_count)
+            .map(|idx| NdxGroupUi {
+                enabled: idx == 0,
+                color: NDX_GROUP_PALETTE[idx % NDX_GROUP_PALETTE.len()],
+            })
+            .collect();
         self.data.ndx_file = Some(ndx);
         self.data.ndx_file_path = Some(path);
-        self.ui.ndx_selected_group_index = if group_count > 0 { Some(0) } else { None };
         self.ui.ndx_visible = true;
         self.refresh_ndx_selection_state();
 
@@ -1519,33 +1581,70 @@ impl KuromameApp {
             .collect()
     }
 
-    pub fn ndx_selected_group_index(&self) -> Option<usize> {
-        self.ui.ndx_selected_group_index
+    pub fn ndx_group_enabled(&self, group_index: usize) -> bool {
+        self.ui
+            .ndx_groups
+            .get(group_index)
+            .is_some_and(|group| group.enabled)
     }
 
-    pub fn set_ndx_selected_group_index(&mut self, group_index: usize) {
-        let group_name = {
-            let Some(ndx) = self.data.ndx_file.as_ref() else {
-                return;
-            };
-            let Some(group) = ndx.groups.get(group_index) else {
-                return;
-            };
-            group.name.clone()
+    pub fn set_ndx_group_enabled(&mut self, group_index: usize, enabled: bool) {
+        let Some(group) = self.ui.ndx_groups.get_mut(group_index) else {
+            return;
         };
-
-        self.ui.ndx_selected_group_index = Some(group_index);
+        if group.enabled == enabled {
+            return;
+        }
+        group.enabled = enabled;
         self.refresh_ndx_selection_state();
+
+        let name = self
+            .data
+            .ndx_file
+            .as_ref()
+            .and_then(|ndx| ndx.groups.get(group_index))
+            .map(|group| group.name.as_str())
+            .unwrap_or("group");
         self.set_status(format!(
-            "NDX group selected: {} ({} atoms rendered)",
-            group_name, self.ui.ndx_selected_atom_count
+            "NDX group {} {} ({} atoms rendered)",
+            name,
+            if enabled { "shown" } else { "hidden" },
+            self.ui.ndx_selected_atom_count
         ));
     }
 
-    pub fn ndx_selected_group_name(&self) -> Option<&str> {
-        let ndx = self.data.ndx_file.as_ref()?;
-        let idx = self.ui.ndx_selected_group_index?;
-        Some(ndx.groups.get(idx)?.name.as_str())
+    pub fn set_all_ndx_groups_enabled(&mut self, enabled: bool) {
+        if self.ui.ndx_groups.is_empty() {
+            return;
+        }
+        for group in &mut self.ui.ndx_groups {
+            group.enabled = enabled;
+        }
+        self.refresh_ndx_selection_state();
+        self.set_status(format!(
+            "All NDX groups {} ({} atoms rendered)",
+            if enabled { "shown" } else { "hidden" },
+            self.ui.ndx_selected_atom_count
+        ));
+    }
+
+    pub fn ndx_group_color(&self, group_index: usize) -> [f32; 3] {
+        self.ui
+            .ndx_groups
+            .get(group_index)
+            .map(|group| group.color)
+            .unwrap_or(NDX_GROUP_PALETTE[0])
+    }
+
+    pub fn set_ndx_group_color(&mut self, group_index: usize, color: [f32; 3]) {
+        let Some(group) = self.ui.ndx_groups.get_mut(group_index) else {
+            return;
+        };
+        if group.color == color {
+            return;
+        }
+        group.color = color;
+        self.refresh_ndx_selection_state();
     }
 
     pub fn ndx_group_count(&self) -> usize {
@@ -3079,5 +3178,54 @@ impl eframe::App for KuromameApp {
         if let Some(render_state) = &self.render_state {
             self.viewport.free_egui_texture(render_state);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_ndx_groups_keep_each_atom_in_the_last_group() {
+        // A broad group (`System`-like) listed before two narrower ones, all
+        // three overlapping.
+        let mut groups = vec![
+            vec![0, 1, 2, 3, 4], // System
+            vec![1, 2],          // Protein
+            vec![3],             // Ligand
+        ];
+        KuromameApp::resolve_ndx_overlaps(&mut groups);
+
+        assert_eq!(
+            groups[0],
+            vec![0, 4],
+            "System keeps only what nothing else claims"
+        );
+        assert_eq!(
+            groups[1],
+            vec![1, 2],
+            "Protein wins over the earlier System"
+        );
+        assert_eq!(groups[2], vec![3], "Ligand wins over the earlier System");
+    }
+
+    #[test]
+    fn resolve_ndx_overlaps_draws_every_atom_exactly_once() {
+        let mut groups = vec![vec![5, 6, 7], vec![6, 7, 8], vec![7, 8, 9]];
+        KuromameApp::resolve_ndx_overlaps(&mut groups);
+
+        let drawn: Vec<usize> = groups.iter().flatten().copied().collect();
+        let mut unique = drawn.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(drawn.len(), unique.len(), "no atom is drawn by two groups");
+        assert_eq!(unique, vec![5, 6, 7, 8, 9], "no atom is dropped either");
+    }
+
+    #[test]
+    fn resolve_ndx_overlaps_leaves_disjoint_groups_alone() {
+        let mut groups = vec![vec![0, 1], vec![2, 3]];
+        KuromameApp::resolve_ndx_overlaps(&mut groups);
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
     }
 }
