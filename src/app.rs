@@ -23,7 +23,39 @@ use moleucle_3dview_rs::{
 use rfd::FileDialog;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+
+/// Which loader consumes the path(s) a background picker thread returns.
+///
+/// Native file dialogs block the thread they run on, so we run them off the UI
+/// thread and tag the result with the loader that should handle it once
+/// `update`/`ui` polls it back. See [`KuromameApp::spawn_pick`].
+enum PickKind {
+    /// Structure into the active layer via [`KuromameApp::load_file`].
+    Structure,
+    /// TOP/ITP topology only.
+    Top,
+    /// GRO structure only.
+    Gro,
+    /// NDX index groups.
+    Ndx,
+    /// XTC trajectory.
+    Xtc,
+    /// Overlay dot-surface PDB.
+    OverlaySurface,
+    /// Structure into a *new* layer, dispatched by extension.
+    StructureLayer,
+    /// A TOP + GRO pair (paths ordered `[top, gro]`) for resname sync.
+    TopGroPair,
+}
+
+/// Result handed back from a background file-picker thread. `paths` is empty
+/// when the user cancelled the dialog.
+struct PickedFiles {
+    kind: PickKind,
+    paths: Vec<PathBuf>,
+}
 
 #[path = "app_ui.rs"]
 mod app_ui;
@@ -439,6 +471,11 @@ pub struct KuromameApp {
     /// visible effect because every filtered molecule starts at generation 0 and
     /// lives at the same viewer address.
     view_revision: u64,
+    /// Receiver for an in-flight file dialog running on a background thread, so
+    /// the UI keeps rendering while the native picker is open. `update`/`ui`
+    /// polls this and dispatches the chosen path(s) to the matching loader.
+    /// `None` when no dialog is open. At most one picker runs at a time.
+    pending_pick: Option<Receiver<PickedFiles>>,
 }
 
 impl KuromameApp {
@@ -611,6 +648,70 @@ impl KuromameApp {
             bead_types: Vec::new(),
             martini_visible: true,
             view_revision: 0,
+            pending_pick: None,
+        }
+    }
+
+    /// Run a native file dialog on a background thread and remember its receiver
+    /// so the UI stays responsive while the picker is open. The `dialog` closure
+    /// runs the (blocking) [`FileDialog`] and returns the chosen paths (empty on
+    /// cancel); [`Self::poll_pending_pick`] dispatches the result to the loader
+    /// named by `kind`.
+    fn spawn_pick<F>(&mut self, kind: PickKind, dialog: F)
+    where
+        F: FnOnce() -> Vec<PathBuf> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let paths = dialog();
+            // Ignore the send error: it only means the app dropped the receiver
+            // (e.g. a newer dialog replaced this one) and no longer wants it.
+            let _ = tx.send(PickedFiles { kind, paths });
+        });
+        self.pending_pick = Some(rx);
+    }
+
+    /// Poll the in-flight file picker, if any, and dispatch a finished result to
+    /// the matching loader. Non-blocking; call once per frame.
+    fn poll_pending_pick(&mut self) {
+        let Some(rx) = self.pending_pick.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(picked) => {
+                self.pending_pick = None;
+                self.dispatch_pick(picked);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.pending_pick = None,
+        }
+    }
+
+    /// Route a picked path (or TOP/GRO pair) to the loader named by its kind.
+    fn dispatch_pick(&mut self, picked: PickedFiles) {
+        let PickedFiles { kind, mut paths } = picked;
+        if let PickKind::TopGroPair = kind {
+            if paths.len() == 2 {
+                let gro = paths.pop().unwrap();
+                let top = paths.pop().unwrap();
+                self.load_top_and_gro_for_resname_sync(top, gro);
+            } else {
+                self.set_status("TOP/GRO pair selection cancelled");
+            }
+            return;
+        }
+        let Some(path) = paths.into_iter().next() else {
+            return; // dialog cancelled
+        };
+        match kind {
+            PickKind::Structure => self.load_file(path),
+            PickKind::Top => self.load_top_file_only(path),
+            PickKind::Gro => self.load_gro_file_only(path),
+            PickKind::Ndx => self.load_ndx_file(path),
+            PickKind::Xtc => self.load_xtc_file(path),
+            PickKind::OverlaySurface => self.load_overlay_surface_file(path),
+            PickKind::StructureLayer => self.load_structure_path(path),
+            PickKind::TopGroPair => unreachable!("handled above"),
         }
     }
 
@@ -935,13 +1036,14 @@ impl KuromameApp {
 
     /// Open a file dialog to add an overlay surface from a PDB with a dot surface.
     pub fn open_overlay_surface_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("Surface PDB", &["pdb", "ent"])
-            .set_title("Add overlay surface (PDB with DOT surface)")
-            .pick_file()
-        {
-            self.load_overlay_surface_file(path);
-        }
+        self.spawn_pick(PickKind::OverlaySurface, || {
+            FileDialog::new()
+                .add_filter("Surface PDB", &["pdb", "ent"])
+                .set_title("Add overlay surface (PDB with DOT surface)")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     fn load_overlay_surface_file(&mut self, path: PathBuf) {
@@ -1244,14 +1346,15 @@ impl KuromameApp {
     /// Open a structure/topology file dialog and load the pick into the active
     /// (typically just-created) layer via the existing loaders.
     fn open_structure_into_active_layer(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("Structures", &["gro", "pdb", "ent", "cif", "mol2"])
-            .add_filter("Topology", &["top", "itp"])
-            .set_title("Load structure into new layer")
-            .pick_file()
-        {
-            self.load_structure_path(path);
-        }
+        self.spawn_pick(PickKind::StructureLayer, || {
+            FileDialog::new()
+                .add_filter("Structures", &["gro", "pdb", "ent", "cif", "mol2"])
+                .add_filter("Topology", &["top", "itp"])
+                .set_title("Load structure into new layer")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     /// Dispatch a path to the right loader by extension (all operate on the
@@ -1473,13 +1576,14 @@ impl KuromameApp {
     }
 
     pub fn open_ndx_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("NDX Files", &["ndx"])
-            .set_title("Import NDX file")
-            .pick_file()
-        {
-            self.load_ndx_file(path);
-        }
+        self.spawn_pick(PickKind::Ndx, || {
+            FileDialog::new()
+                .add_filter("NDX Files", &["ndx"])
+                .set_title("Import NDX file")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     pub fn reload_loaded_files(&mut self) {
@@ -2102,51 +2206,53 @@ impl KuromameApp {
     }
 
     pub fn open_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("PDB Files", &["pdb", "ent", "cif"])
-            .add_filter("MOL2 Files", &["mol2"])
-            .pick_file()
-        {
-            self.load_file(path);
-        }
+        self.spawn_pick(PickKind::Structure, || {
+            FileDialog::new()
+                .add_filter("PDB Files", &["pdb", "ent", "cif"])
+                .add_filter("MOL2 Files", &["mol2"])
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     pub fn open_top_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("TOP/ITP Files", &["top", "itp"])
-            .set_title("Select TOP file")
-            .pick_file()
-        {
-            self.load_top_file_only(path);
-        }
+        self.spawn_pick(PickKind::Top, || {
+            FileDialog::new()
+                .add_filter("TOP/ITP Files", &["top", "itp"])
+                .set_title("Select TOP file")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     pub fn open_gro_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("GRO Files", &["gro"])
-            .set_title("Select GRO file")
-            .pick_file()
-        {
-            self.load_gro_file_only(path);
-        }
+        self.spawn_pick(PickKind::Gro, || {
+            FileDialog::new()
+                .add_filter("GRO Files", &["gro"])
+                .set_title("Select GRO file")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     pub fn open_top_and_gro_for_resname_sync(&mut self) {
-        let top_path = FileDialog::new()
-            .add_filter("TOP Files", &["top"])
-            .set_title("Select TOP file")
-            .pick_file();
-        let gro_path = FileDialog::new()
-            .add_filter("GRO Files", &["gro"])
-            .set_title("Select GRO file")
-            .pick_file();
-
-        match (top_path, gro_path) {
-            (Some(top), Some(gro)) => self.load_top_and_gro_for_resname_sync(top, gro),
-            _ => {
-                self.set_status("TOP/GRO pair selection cancelled");
+        self.spawn_pick(PickKind::TopGroPair, || {
+            let top_path = FileDialog::new()
+                .add_filter("TOP Files", &["top"])
+                .set_title("Select TOP file")
+                .pick_file();
+            let gro_path = FileDialog::new()
+                .add_filter("GRO Files", &["gro"])
+                .set_title("Select GRO file")
+                .pick_file();
+            match (top_path, gro_path) {
+                (Some(top), Some(gro)) => vec![top, gro],
+                _ => Vec::new(),
             }
-        }
+        });
     }
 
     fn generate_and_set_molecule_from_stored_files(&mut self) -> bool {
@@ -2512,13 +2618,14 @@ impl KuromameApp {
     }
 
     pub fn open_xtc_file(&mut self) {
-        if let Some(path) = FileDialog::new()
-            .add_filter("XTC Trajectory", &["xtc"])
-            .set_title("Select XTC trajectory file")
-            .pick_file()
-        {
-            self.load_xtc_file(path);
-        }
+        self.spawn_pick(PickKind::Xtc, || {
+            FileDialog::new()
+                .add_filter("XTC Trajectory", &["xtc"])
+                .set_title("Select XTC trajectory file")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
     }
 
     fn load_xtc_file(&mut self, path: PathBuf) {
@@ -3058,6 +3165,14 @@ impl eframe::App for KuromameApp {
             .map(|view| self.visibility.to_orig(view))
             .and_then(|atom| self.hovered_atom_info(atom))
             .unwrap_or_else(|| "Hover an atom for details".to_string());
+
+        // Deliver any file chosen by a background picker thread, then keep
+        // repainting while a dialog is open so the result is dispatched promptly
+        // (egui otherwise idles with no pending input events).
+        self.poll_pending_pick();
+        if self.pending_pick.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
