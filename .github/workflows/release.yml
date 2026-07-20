@@ -220,8 +220,17 @@ jobs:
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
 
+          # appimagetool's bundled downloader can't follow GitHub's 302 redirect
+          # to the release CDN, so it fails to fetch the type2 runtime itself.
+          # Download it ourselves with curl (-L follows redirects) and pass it in
+          # via --runtime-file.
+          curl -fsSL -o runtime-x86_64 \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+
           # --appimage-extract-and-run avoids needing FUSE, which the runner lacks.
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "${APPDIR}" \
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            --runtime-file runtime-x86_64 \
+            "${APPDIR}" \
             "${APP_NAME}-${VERSION}-linux-x86_64.AppImage"
 
       - name: Stage artifacts
