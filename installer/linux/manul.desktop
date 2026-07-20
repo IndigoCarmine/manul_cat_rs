@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Manul
+GenericName=Molecular Viewer
+Comment=A molecular viewer for GROMACS
+Exec=manul_cat_rs %F
+Icon=manul
+Terminal=false
+Categories=Science;Chemistry;
+MimeType=chemical/x-gromacs-gro;chemical/x-pdb;chemical/x-mol2;
+StartupNotify=true

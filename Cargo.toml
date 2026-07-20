@@ -2,6 +2,12 @@
 name = "manul_cat_rs"
 version = "0.7.4"
 edition = "2024"
+# Raised from edition 2024's 1.85 by the egui-winit fork in [patch.crates-io].
+rust-version = "1.92"
+description = "Manul - a cross-platform molecular viewer for GROMACS"
+authors = ["Yuhei Yamada (Indigo Carmine)"]
+repository = "https://github.com/IndigoCarmine/manul_cat_rs"
+readme = "README.md"
 
 [dependencies]
 moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git" }
@@ -19,12 +25,45 @@ image = "0.25"
 [build-dependencies]
 winresource = "0.1"
 
-[package.metadata.appimage]
-icon = "resources/Manuru.ico"
-desktop_entry = "other/myapp.desktop"
+# Release binaries: smaller and faster, at the cost of longer link times.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# --- cargo-bundle: drives the macOS .app built by .github/workflows/release.yml ---
+# `cargo bundle` generates Info.plist from these keys, so there is no plist to
+# hand-maintain. Build the bundle locally with `cargo bundle --release`.
+[package.metadata.bundle]
+name = "Manul"
+identifier = "com.indigocarmine.manul"
+icon = ["resources/icon.icns"]
+category = "Education"
+short_description = "A molecular viewer for GROMACS"
+long_description = """
+Manul is a cross-platform molecular viewer for GROMACS trajectories and
+structures, built with egui and eframe.
+"""
+
+# --- cargo-deb: used by .github/workflows/release.yml to build the Linux .deb ---
+[package.metadata.deb]
+maintainer = "Yuhei Yamada (Indigo Carmine) <tamanisikaminai@gmail.com>"
+copyright = "2026, Yuhei Yamada (Indigo Carmine)"
+extended-description = "A cross-platform molecular viewer for GROMACS built with egui and eframe."
+section = "science"
+priority = "optional"
+# eframe dlopens its GL/X11/Wayland libraries rather than linking them, so `$auto`
+# only ever detects libc. Without listing them the package installs cleanly and
+# then fails to start on a minimal system.
+depends = "$auto, libxkbcommon0, libwayland-client0, libegl1, libgl1, libx11-6, libxcursor1, libxi6, libxrandr2, libgtk-3-0"
+assets = [
+    ["target/release/manul_cat_rs", "usr/bin/", "755"],
+    ["installer/linux/manul.desktop", "usr/share/applications/", "644"],
+    ["resources/icon.png", "usr/share/icons/hicolor/256x256/apps/manul.png", "644"],
+]
 
 
 [patch.crates-io]
 winit = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
 egui-winit = { git = "https://github.com/IndigoCarmine/egui-winit", branch = "main" }
-
