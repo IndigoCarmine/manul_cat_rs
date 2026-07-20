@@ -63,7 +63,8 @@
 
 ## ライセンス
 
-MIT License
+GNU Affero General Public License v3.0 以降 (AGPL-3.0-or-later)。
+全文は [LICENSE](LICENSE) を参照してください。
 
 ---
 

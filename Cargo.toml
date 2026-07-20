@@ -8,6 +8,7 @@ description = "Manul - a cross-platform molecular viewer for GROMACS"
 authors = ["Yuhei Yamada (Indigo Carmine)"]
 repository = "https://github.com/IndigoCarmine/manul_cat_rs"
 readme = "README.md"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git" }
@@ -50,6 +51,7 @@ structures, built with egui and eframe.
 [package.metadata.deb]
 maintainer = "Yuhei Yamada (Indigo Carmine) <tamanisikaminai@gmail.com>"
 copyright = "2026, Yuhei Yamada (Indigo Carmine)"
+license-file = ["LICENSE", "0"]
 extended-description = "A cross-platform molecular viewer for GROMACS built with egui and eframe."
 section = "science"
 priority = "optional"
