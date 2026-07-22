@@ -904,22 +904,25 @@ impl KuromameApp {
         self.viewport.set_atom_colors(Some(colors));
     }
 
-    /// Parse `path` as a Martini force field and, if it defines bead types,
-    /// register it and refresh bead styling for any loaded structure. Returns the
+    /// Parse `path` as a Martini force field and register it when it really is
+    /// one, refreshing bead styling for any loaded structure. Returns the
     /// bead-type count when a force field was found.
+    ///
+    /// The force field belongs to the topology, so a topology that is *not*
+    /// Martini drops any previously registered one rather than leaving the old
+    /// beads applied to the new structure.
     fn try_load_martini_ff(&mut self, path: &std::path::Path) -> Option<usize> {
         // Parse from the include-expanded content so a Martini force field that a
         // system `.top` pulls in via `#include` is still found.
-        let expanded = TopFile::expand_includes(path).ok()?;
-        let ff = MartiniForceField::parse(&expanded);
-        if !ff.is_forcefield() {
-            return None;
-        }
-        let count = ff.bead_type_count();
-        self.martini_ff = Some(ff);
+        let ff = TopFile::expand_includes(path)
+            .ok()
+            .map(|expanded| MartiniForceField::parse(&expanded))
+            .filter(|ff| ff.is_forcefield());
+        let count = ff.as_ref().map(|ff| ff.bead_type_count());
+        self.martini_ff = ff;
         self.recompute_bead_types();
         self.refresh_martini_bead_state();
-        Some(count)
+        count
     }
 
     /// Whether a Martini force field is loaded (enables the bead-view toggle).
