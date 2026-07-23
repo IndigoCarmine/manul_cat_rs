@@ -23,6 +23,12 @@ impl SimulationCellRenderState {
     pub fn new(size: (f32, f32, f32)) -> Self {
         Self { size }
     }
+
+    /// Box edge lengths `(x, y, z)` in nm. `(0, 0, 0)` when no box is loaded.
+    /// Read by the XYZ axis overlay so its arrows can match the cell.
+    pub fn size(&self) -> (f32, f32, f32) {
+        self.size
+    }
 }
 
 impl AdditionalRender for SimulationCellRender {

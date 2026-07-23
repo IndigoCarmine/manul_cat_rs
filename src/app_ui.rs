@@ -995,6 +995,16 @@ pub fn render_bottom_dock(app: &mut KuromameApp, ui: &mut egui::Ui) {
                 }
 
                 ui.add_space(10.0);
+                let mut axes = app.axis_visible();
+                if ui
+                    .checkbox(&mut axes, "Axes")
+                    .on_hover_text("Show the XYZ orientation triad at the box origin (X red, Y green, Z blue)")
+                    .changed()
+                {
+                    app.set_axis_visible(axes);
+                }
+
+                ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(10.0);
 

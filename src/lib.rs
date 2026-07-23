@@ -12,6 +12,9 @@ pub mod ndx_selection_render;
 #[path = "additional_render/simulation_cell_render.rs"]
 pub mod simulation_cell_render;
 
+#[path = "additional_render/axis_render.rs"]
+pub mod axis_render;
+
 #[path = "additional_render/surface_mesh_render.rs"]
 pub mod surface_mesh_render;
 

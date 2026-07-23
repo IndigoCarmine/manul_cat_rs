@@ -9,6 +9,7 @@ use crate::parsing::{
     AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
     XtcFile, XtcFrame,
 };
+use crate::axis_render::{AxisRender, AxisRenderState};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::surface_mesh_render::{SurfaceLayer, SurfaceMeshRender, SurfaceMeshState};
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
@@ -111,8 +112,8 @@ impl LoadProgress {
 
 /// A `Read` wrapper that adds each chunk it reads to a [`LoadProgress`], giving
 /// byte-level progress for free — parsers read through it unchanged. Returns an
-/// `Interrupted` error when cancellation is requested so the in-progress parse
-/// unwinds instead of finishing work the user asked to abandon.
+/// error when cancellation is requested so the in-progress parse unwinds instead
+/// of finishing work the user asked to abandon.
 struct ProgressReader<R> {
     inner: R,
     progress: Arc<LoadProgress>,
@@ -121,8 +122,15 @@ struct ProgressReader<R> {
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.progress.is_cancelled() {
+            // Must NOT be `ErrorKind::Interrupted`: every std read helper the
+            // parsers use (read_to_string/read_to_end/read_exact/read_until and
+            // the `Lines` iterator) treats Interrupted as "retry" and loops back
+            // to call `read` again. Since `cancel` stays set, that would spin the
+            // worker forever instead of unwinding. Any other kind is propagated,
+            // so the parse returns `Err` and spawn_load's `is_cancelled()` path
+            // collapses it to the cancel sentinel.
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::Other,
                 "load cancelled",
             ));
         }
@@ -581,6 +589,16 @@ pub struct KuromameApp {
     /// Whether Martini bead spheres are drawn (only has an effect once a Martini
     /// force field is loaded and beads resolve to known types).
     martini_visible: bool,
+    /// Whether the XYZ orientation triad is drawn at the world origin. A global
+    /// view preference (not per-layer); mirrored into the viewport's
+    /// [`AxisRenderState`] whenever it changes.
+    axis_visible: bool,
+    /// `false` once `bead_types` matches the current molecule/topology. Lets
+    /// `recompute_bead_types` skip its O(atoms) rebuild (which re-expands the whole
+    /// topology) on visibility-only viewport rebuilds — bead types depend on the
+    /// molecule and topology, not on which residues are hidden. Set whenever atom
+    /// identity or the topology changes.
+    bead_types_dirty: bool,
     /// Monotonic counter bumped on every viewport rebuild. Used to give each
     /// filtered molecule a distinct generation so the renderer's geometry cache
     /// (keyed on `(molecule_ptr, generation, …)`) actually rebuilds when the
@@ -697,6 +715,10 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
         viewport.add_additional_render_box(Box::new(SurfaceMeshRender::new()));
         viewport.add_additional_render_box(Box::new(LayerOverlayRender::new()));
+        viewport.add_additional_render_box(Box::new(AxisRender::new()));
+        // Show the XYZ orientation triad by default so the coordinate frame is
+        // always visible; the user can hide it from the view options.
+        viewport.set_state_by_type(AxisRenderState { visible: true });
 
         let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let hovered_atom_for_handler = Arc::clone(&hovered_atom);
@@ -769,7 +791,9 @@ impl KuromameApp {
             active_layer: 0,
             martini_ff: None,
             bead_types: Vec::new(),
+            bead_types_dirty: true,
             martini_visible: true,
+            axis_visible: true,
             view_revision: 0,
             pending_pick: None,
             pending_load: None,
@@ -1056,7 +1080,7 @@ impl KuromameApp {
             .map_err(|e| format!("Failed to load XTC: {e}"))?;
         // Buffer the (unbuffered) file+progress reader: the XTC decoder issues
         // many small reads. Cancellation still works — the ProgressReader under
-        // the buffer returns `Interrupted`, which surfaces as the I/O error.
+        // the buffer returns a (non-retriable) I/O error, which unwinds the parse.
         let xtc = XtcFile::load_from_reader(BufReader::new(reader))
             .map_err(|e| format!("Failed to load XTC: {e}"))?;
         Ok(LoadPayload::Xtc(xtc))
@@ -1282,6 +1306,13 @@ impl KuromameApp {
     /// order). Prefers the topology's per-atom `atom_type`; falls back to the
     /// atom name when there is no matching topology (e.g. a bare CG `.gro`).
     fn recompute_bead_types(&mut self) {
+        // Bead types depend only on the molecule and topology, not on the residue
+        // visibility filter, so a visibility-only rebuild leaves them unchanged.
+        // Skip the O(atoms) re-expansion of the whole topology in that common case.
+        if !self.bead_types_dirty {
+            return;
+        }
+        self.bead_types_dirty = false;
         let Some(mol) = self.molecule.as_ref() else {
             self.bead_types.clear();
             return;
@@ -1372,6 +1403,9 @@ impl KuromameApp {
     fn apply_martini_ff(&mut self, ff: Option<MartiniForceField>) -> Option<usize> {
         let count = ff.as_ref().map(|ff| ff.bead_type_count());
         self.martini_ff = ff;
+        // The topology this force field came with was just (re)loaded, so the
+        // per-atom bead types need re-deriving.
+        self.bead_types_dirty = true;
         self.recompute_bead_types();
         self.refresh_martini_bead_state();
         count
@@ -1390,6 +1424,20 @@ impl KuromameApp {
         if self.martini_visible != visible {
             self.martini_visible = visible;
             self.refresh_martini_bead_state();
+        }
+    }
+
+    /// Whether the XYZ orientation triad is drawn.
+    pub fn axis_visible(&self) -> bool {
+        self.axis_visible
+    }
+
+    /// Show or hide the XYZ orientation triad. Pushes the new visibility to the
+    /// viewport's [`AxisRenderState`]; the axis render reads it on the next frame.
+    pub fn set_axis_visible(&mut self, visible: bool) {
+        if self.axis_visible != visible {
+            self.axis_visible = visible;
+            self.viewport.set_state_by_type(AxisRenderState { visible });
         }
     }
 
@@ -1657,6 +1705,8 @@ impl KuromameApp {
         self.surface_visible = self.layers[idx].surface_visible;
         self.martini_ff = self.layers[idx].martini_ff.take();
         self.bead_types = std::mem::take(&mut self.layers[idx].bead_types);
+        // The restored bead types already match this layer's molecule.
+        self.bead_types_dirty = false;
         self.martini_visible = self.layers[idx].martini_visible;
         self.ui.selector_input = std::mem::take(&mut self.layers[idx].selector_input);
         self.ui.ndx_groups = std::mem::take(&mut self.layers[idx].ndx_groups);
@@ -3119,6 +3169,8 @@ impl KuromameApp {
             ));
         }
         self.molecule = Some(molecule);
+        // A new molecule (different atoms) invalidates the cached bead types.
+        self.bead_types_dirty = true;
         // Syncing to the viewport is handled by post_load_cleanup() — callers are responsible.
     }
 
@@ -3314,6 +3366,8 @@ impl KuromameApp {
                 atom.position = pos;
             }
             self.molecule = Some(mol);
+            // The base molecule was swapped in; its bead types may differ.
+            self.bead_types_dirty = true;
             self.refresh_res_names();
             self.sync_viewer_molecule();
         }
@@ -3712,7 +3766,15 @@ impl eframe::App for KuromameApp {
         if self.traj_ui.is_playing {
             let t = ctx.input(|i| i.time);
             self.advance_trajectory_if_playing(t);
-            ctx.request_repaint();
+            // Wake again only when the next (sub-)frame is actually due instead of
+            // busy-repainting at the monitor's refresh rate: playback advances at
+            // `playback_fps` × `interp_steps`, so most max-rate repaints would just
+            // redraw an unchanged (non-dirty) scene and burn CPU/GPU. Schedule the
+            // next repaint for when `advance_trajectory_if_playing` will next act.
+            let steps = self.traj_ui.interp_steps.max(1);
+            let interval = 1.0 / (self.traj_ui.playback_fps.max(0.1) as f64 * steps as f64);
+            let due_in = (self.traj_ui.last_advance_time + interval - t).max(0.0);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(due_in));
         }
 
         // egui 0.35: panels are shown into the root `ui`, not the context.
@@ -3961,8 +4023,10 @@ mod tests {
 
     #[test]
     fn progress_reader_errors_when_cancelled() {
-        // A set cancel flag makes the very next read fail with `Interrupted`, so
-        // an in-flight parse unwinds instead of finishing abandoned work.
+        // A set cancel flag makes the very next read fail with a non-retriable
+        // error, so an in-flight parse unwinds instead of finishing abandoned
+        // work. The kind must NOT be `Interrupted`: std's read helpers treat that
+        // as "retry" and, since `cancel` stays set, would spin the worker forever.
         let progress = Arc::new(LoadProgress::default());
         progress.cancel.store(true, Ordering::Relaxed);
         let mut reader = ProgressReader {
@@ -3971,7 +4035,12 @@ mod tests {
         };
         let mut buf = [0u8; 3];
         let err = reader.read(&mut buf).expect_err("cancelled read errors");
-        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "must not be Interrupted or std read helpers would retry forever"
+        );
         assert_eq!(
             progress.done.load(Ordering::Relaxed),
             0,
