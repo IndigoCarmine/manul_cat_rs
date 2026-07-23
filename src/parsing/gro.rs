@@ -13,6 +13,13 @@ use std::io::{self, BufRead, BufReader};
 #[allow(dead_code)]
 pub const GROMACS_LENGTH_UNIT: &str = "nm";
 
+// The atom count on line 2 is untrusted file data: a corrupt or mismatched file
+// can declare billions of atoms. It is only a hint for the initial allocation,
+// so cap it and let the Vec grow naturally instead - an unclamped
+// `with_capacity` aborts the process (`memory allocation of N bytes failed`)
+// before a single atom is read, which no `io::Result` caller can recover from.
+const MAX_PREALLOC_ATOMS: usize = 1 << 20;
+
 // --- GRO Structures ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,7 +118,7 @@ impl GroFile {
         let atom_count_line = iter.next().unwrap_or("").to_string();
         let declared_atom_count = atom_count_line.trim().parse::<usize>().unwrap_or(0);
 
-        let mut atoms = Vec::with_capacity(declared_atom_count);
+        let mut atoms = Vec::with_capacity(declared_atom_count.min(MAX_PREALLOC_ATOMS));
         let mut box_line = (0.0, 0.0, 0.0);
 
         for line in iter {
@@ -154,43 +161,85 @@ impl GroFile {
         }
     }
 
-    fn vec3_to_box_line(vec: Vec<f32>) -> (f32, f32, f32) {
-        (vec[0], vec[1], vec[2])
+    // Total by construction: a box line with fewer than three parseable numbers
+    // (empty, truncated or absent file) must degrade to 0.0 rather than panic,
+    // because this runs inside the live file-open path where a panic kills the
+    // process instead of returning an error the UI could report.
+    fn vec3_to_box_line(vec: &[f32]) -> (f32, f32, f32) {
+        (
+            vec.first().copied().unwrap_or(0.0),
+            vec.get(1).copied().unwrap_or(0.0),
+            vec.get(2).copied().unwrap_or(0.0),
+        )
     }
 
     pub fn load_from_reader<R: BufRead>(reader: R) -> io::Result<Self> {
         let mut iter = reader.lines();
         let title = iter.next().transpose()?.unwrap_or_default();
         let atom_count_line = iter.next().transpose()?.unwrap_or_default();
-        let declared_atom_count = atom_count_line.trim().parse::<usize>().unwrap_or(0);
+        // `None` when the count line is missing or unparseable; in that case we
+        // fall back to the old heuristic of reading atoms until one line fails.
+        let declared_atom_count = atom_count_line.trim().parse::<usize>().ok();
 
-        let mut atoms = Vec::with_capacity(declared_atom_count);
+        let mut atoms =
+            Vec::with_capacity(declared_atom_count.unwrap_or(0).min(MAX_PREALLOC_ATOMS));
         let mut box_line = String::new();
 
         for line in iter {
             let line = line?;
-            if box_line.is_empty() && !line.trim().is_empty() {
+            // Blank lines carry no data. Skipping them keeps a trailing newline
+            // (or CRLF padding) from being mistaken for the box line, which used
+            // to overwrite the real one with an empty string.
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            // Stop taking atoms once the declared count is reached so the box
+            // line - and any following frame in a multi-frame .gro - is never
+            // swallowed as an atom.
+            let expecting_atom = declared_atom_count.is_none_or(|n| atoms.len() < n);
+            if box_line.is_empty() && expecting_atom {
                 if let Some(atom) = GroAtomRecord::from_line(&line) {
                     atoms.push(atom);
-                } else {
-                    box_line = line;
+                    continue;
                 }
-            } else if !box_line.is_empty() {
+            }
+
+            // First non-atom line is the box line; everything after it (extra
+            // frames, trailing junk) is ignored rather than clobbering it.
+            if box_line.is_empty() {
                 box_line = line;
             }
         }
+
+        // A file that declares more atoms than it actually contains (truncated
+        // dump, short record, comment inside the atom block) used to load
+        // silently short, which later detonates when a TOP's bond indices are
+        // applied to the missing tail. Reject it here so the caller can report it.
+        if let Some(declared) = declared_atom_count {
+            if atoms.len() != declared {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GRO declares {} atoms but only {} could be parsed (truncated or malformed file)",
+                        declared,
+                        atoms.len()
+                    ),
+                ));
+            }
+        }
+
+        let box_values = box_line
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f32>().ok())
+            .take(3)
+            .collect::<Vec<f32>>();
 
         Ok(Self {
             title,
             atom_count_line,
             atoms,
-            box_line: Self::vec3_to_box_line(
-                box_line
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<f32>().ok())
-                    .take(3)
-                    .collect::<Vec<f32>>(),
-            ),
+            box_line: Self::vec3_to_box_line(&box_values),
         })
     }
 
@@ -354,19 +403,22 @@ impl GroFile {
 
         let bonds = if let Some(pairs) = override_bonds {
             // Convert 1-based pairs into viewer Bond structs with 0-based indices.
+            // The pairs come from a TOP that may describe a larger system than
+            // this GRO, so each index must be checked against the atom list:
+            // the renderer indexes `mol.atoms[bond.atom_a]` unchecked every
+            // frame, so an out-of-range bond panics on the next repaint.
             pairs
                 .iter()
                 .filter_map(|(a, b)| {
-                    if *a == 0 || *b == 0 {
-                        None
-                    } else {
-                        // convert to 0-based
-                        Some(Bond {
-                            atom_a: a - 1,
-                            atom_b: b - 1,
-                            order: 1,
-                        })
-                    }
+                    // checked_sub also rejects index 0, which is not a valid
+                    // 1-based atom number.
+                    let atom_a = a.checked_sub(1)?;
+                    let atom_b = b.checked_sub(1)?;
+                    (atom_a < atoms.len() && atom_b < atoms.len()).then_some(Bond {
+                        atom_a,
+                        atom_b,
+                        order: 1,
+                    })
                 })
                 .collect()
         } else {
@@ -380,5 +432,87 @@ impl GroFile {
 impl To3dViewMolecule for GroFile {
     fn to_molecule(&self) -> Molecule {
         self.to_molecule_with_metadata(true, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Two well-formed atom records plus a box line.
+    const ATOM_A: &str = "    1SOL     OW    1   0.230   0.628   0.113";
+    const ATOM_B: &str = "    1SOL    HW1    2   0.137   0.626   0.150";
+    const BOX: &str = "   1.82060   1.82060   1.82060";
+
+    fn read(content: &str) -> io::Result<GroFile> {
+        GroFile::load_from_reader(io::Cursor::new(content.as_bytes()))
+    }
+
+    #[test]
+    fn well_formed_file_still_loads() {
+        let gro = read(&format!("title\n    2\n{ATOM_A}\n{ATOM_B}\n{BOX}\n")).unwrap();
+        assert_eq!(gro.atoms.len(), 2);
+        assert_eq!(gro.box_line, (1.8206, 1.8206, 1.8206));
+    }
+
+    #[test]
+    fn empty_and_boxless_files_do_not_panic() {
+        // Previously panicked in vec3_to_box_line ("len is 0 but the index is 0").
+        assert_eq!(read("").unwrap().box_line, (0.0, 0.0, 0.0));
+        assert_eq!(read("title\n").unwrap().box_line, (0.0, 0.0, 0.0));
+        // Box line with fewer than three numbers.
+        let gro = read(&format!("title\n    1\n{ATOM_A}\n  1.5 1.5\n")).unwrap();
+        assert_eq!(gro.box_line, (1.5, 1.5, 0.0));
+    }
+
+    #[test]
+    fn trailing_blank_line_does_not_clobber_the_box_line() {
+        let gro = read(&format!("title\n    2\n{ATOM_A}\n{ATOM_B}\n{BOX}\n\n")).unwrap();
+        assert_eq!(gro.box_line, (1.8206, 1.8206, 1.8206));
+        // Same via CRLF, whose trailing "\r" trims to empty.
+        let gro = read(&format!(
+            "title\r\n    2\r\n{ATOM_A}\r\n{ATOM_B}\r\n{BOX}\r\n\r\n"
+        ))
+        .unwrap();
+        assert_eq!(gro.box_line, (1.8206, 1.8206, 1.8206));
+    }
+
+    #[test]
+    fn truncated_file_is_rejected_instead_of_loading_short() {
+        // Declares 2 atoms, second record is cut mid-record.
+        let err = read("title\n    2\n    1SOL     OW    1   0.230   0.628   0.113\n    1SOL    HW1    2   0.13\n")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Declared count larger than the atoms actually present.
+        assert!(read(&format!("title\n   99\n{ATOM_A}\n{BOX}\n")).is_err());
+    }
+
+    #[test]
+    fn bogus_declared_count_does_not_abort_on_allocation() {
+        // ~40 TB request before the clamp; must now fail as a normal error.
+        assert!(read(&format!("title\n  999999999999\n{ATOM_A}\n{BOX}\n")).is_err());
+    }
+
+    #[test]
+    fn extra_frame_does_not_bleed_into_the_first() {
+        let content = format!(
+            "title\n    2\n{ATOM_A}\n{ATOM_B}\n{BOX}\ntitle\n    2\n{ATOM_A}\n{ATOM_B}\n{BOX}\n"
+        );
+        let gro = read(&content).unwrap();
+        assert_eq!(gro.atoms.len(), 2);
+        assert_eq!(gro.box_line, (1.8206, 1.8206, 1.8206));
+    }
+
+    #[test]
+    fn out_of_range_override_bonds_are_dropped() {
+        let gro = read(&format!("title\n    2\n{ATOM_A}\n{ATOM_B}\n{BOX}\n")).unwrap();
+        // A TOP describing a bigger system: only (1,2) is representable here.
+        let mol = gro.to_molecule_with_metadata(true, Some(&[(1, 2), (2, 5000), (0, 1)]));
+        assert_eq!(mol.bonds.len(), 1);
+        assert!(
+            mol.bonds
+                .iter()
+                .all(|b| b.atom_a < mol.atoms.len() && b.atom_b < mol.atoms.len())
+        );
     }
 }

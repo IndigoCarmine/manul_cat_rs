@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 pub const GROMACS_LENGTH_UNIT: &str = "nm";
 
+// `[ molecules ]` counts are read verbatim from the file, so the expanded atom
+// and bond totals are attacker-controlled. These caps sit far above any system
+// a desktop viewer can usefully render; their only job is to turn an absurd
+// count into a reported error instead of a multi-gigabyte allocation that
+// aborts the process (or a billions-iteration loop that hangs it).
+const MAX_EXPANDED_ATOMS: usize = 20_000_000;
+const MAX_EXPANDED_BONDS: usize = 40_000_000;
+
 #[derive(Debug, Clone)]
 pub struct TopAtomRecord {
     pub nr: usize,
@@ -392,24 +400,14 @@ impl TopFile {
     ) -> Result<(moleucle_3dview_rs::molecule::Molecule, Vec<(usize, usize)>), String> {
         let (templates, instances) = self.parse_layout();
 
-        let mut nbond = 0;
-        for instances in &instances {
-            let template = templates
-                .iter()
-                .find(|t| t.name == instances.name)
-                .ok_or_else(|| {
-                    format!(
-                        "No molecule template found for instance '{}'",
-                        instances.name
-                    )
-                })?;
-            nbond += template.bonds.len() * instances.nmols;
-        }
-
-        let mut bonds = Vec::with_capacity(nbond);
-        let mut offset = 0;
-        for i in 0..instances.len() {
-            let instance = &instances[i];
+        // Size the expansion with checked arithmetic and reject anything past the
+        // caps BEFORE allocating or entering the push loop below: `nmols` is
+        // untrusted, so `bonds.len() * nmols` can overflow (a debug panic, a
+        // release wrap into a bogus capacity) and the `for _ in 0..nmols` loops
+        // can allocate/iterate until the process dies.
+        let mut natoms_total: usize = 0;
+        let mut nbond: usize = 0;
+        for instance in &instances {
             let template = templates
                 .iter()
                 .find(|t| t.name == instance.name)
@@ -419,11 +417,64 @@ impl TopFile {
                         instance.name
                     )
                 })?;
+            natoms_total = template
+                .atoms
+                .len()
+                .checked_mul(instance.nmols)
+                .and_then(|a| natoms_total.checked_add(a))
+                .filter(|n| *n <= MAX_EXPANDED_ATOMS)
+                .ok_or_else(|| {
+                    format!(
+                        "topology expands to more than {MAX_EXPANDED_ATOMS} atoms \
+                         (check the [ molecules ] counts)"
+                    )
+                })?;
+            nbond = template
+                .bonds
+                .len()
+                .checked_mul(instance.nmols)
+                .and_then(|b| nbond.checked_add(b))
+                .filter(|n| *n <= MAX_EXPANDED_BONDS)
+                .ok_or_else(|| {
+                    format!(
+                        "topology expands to more than {MAX_EXPANDED_BONDS} bonds \
+                         (check the [ molecules ] counts)"
+                    )
+                })?;
+        }
+
+        let mut bonds = Vec::with_capacity(nbond);
+        let mut offset = 0;
+        for instance in &instances {
+            let template = templates
+                .iter()
+                .find(|t| t.name == instance.name)
+                .ok_or_else(|| {
+                    format!(
+                        "No molecule template found for instance '{}'",
+                        instance.name
+                    )
+                })?;
+            // An empty moleculetype (no atoms, no bonds) passes both caps above
+            // because len()*nmols == 0, so a huge `nmols` would spin this loop up
+            // to usize::MAX times doing nothing (offset += 0, nothing pushed) and
+            // hang the app. The body is a no-op when both are empty, so skipping
+            // is behaviour-preserving and bounds the loop (mirrors the guard in
+            // expanded_atom_types).
+            if template.atoms.is_empty() && template.bonds.is_empty() {
+                continue;
+            }
             for _ in 0..instance.nmols {
                 for bond in &template.bonds {
+                    // `bond.ai`/`bond.aj` are parsed verbatim from the file and can
+                    // be up to usize::MAX; the caps above bound the atom/bond count
+                    // but not these values. Saturate instead of `+` so a near-MAX
+                    // index cannot overflow (a debug-build panic) — a saturated
+                    // index is out of range and gets dropped by the downstream
+                    // atoms.len() bounds-filter in to_molecule_with_metadata.
                     bonds.push(TopBondRecord {
-                        ai: bond.ai + offset,
-                        aj: bond.aj + offset,
+                        ai: bond.ai.saturating_add(offset),
+                        aj: bond.aj.saturating_add(offset),
                         funct: bond.funct,
                         r: bond.r,
                         k: bond.k,
@@ -478,7 +529,17 @@ impl TopFile {
             let Some(template) = templates.iter().find(|t| t.name == instance.name) else {
                 continue;
             };
+            // Skip empty templates so a huge `nmols` cannot spin the inner loop
+            // billions of times with nothing to append, and stop once the cap is
+            // reached so an absurd count cannot grow `out` until the allocator
+            // aborts. `nmols` is untrusted (read verbatim from `[ molecules ]`).
+            if template.atoms.is_empty() {
+                continue;
+            }
             for _ in 0..instance.nmols {
+                if out.len().saturating_add(template.atoms.len()) > MAX_EXPANDED_ATOMS {
+                    return out;
+                }
                 out.extend(template.atoms.iter().map(|a| a.atom_type.clone()));
             }
         }
@@ -721,5 +782,100 @@ impl TopPreprocessor {
 
     fn is_active(condition_stack: &[ConditionalFrame]) -> bool {
         condition_stack.iter().all(|frame| frame.active)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsing::GroFile;
+
+    /// One water-like moleculetype (2 atoms, 1 bond) instantiated `nmols` times.
+    fn tiny_top(nmols: &str) -> TopFile {
+        TopFile::load(&format!(
+            "[ moleculetype ]\nSOL 3\n\n\
+             [ atoms ]\n\
+             1 OW 1 SOL OW 1 0.0 16.0\n\
+             2 HW 1 SOL HW1 1 0.0 1.0\n\n\
+             [ bonds ]\n1 2 1\n\n\
+             [ molecules ]\nSOL {nmols}\n"
+        ))
+    }
+
+    #[test]
+    fn absurd_molecule_count_is_rejected_not_expanded() {
+        // A [ molecules ] count this large used to reach Vec::with_capacity and a
+        // push loop that allocated until the process aborted. It must now be a
+        // reported error instead.
+        let top = tiny_top("999999999999");
+        let err = top
+            .generate_molecule_with_gro(&GroFile::default())
+            .expect_err("an absurd molecule count must be rejected");
+        assert!(
+            err.contains("atoms") || err.contains("bonds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn overflowing_molecule_count_does_not_panic() {
+        // bonds.len() * usize::MAX overflows; checked arithmetic must turn that
+        // into an error rather than a debug-build panic.
+        let top = tiny_top(&usize::MAX.to_string());
+        assert!(
+            top.generate_molecule_with_gro(&GroFile::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn near_max_bond_index_does_not_overflow_on_second_copy() {
+        // A bond index at usize::MAX plus a non-zero offset (any molecule copy
+        // after the first) used to hit `bond.ai + offset` and panic with
+        // 'attempt to add with overflow' in a debug build. Saturating the add
+        // must turn that into a dropped out-of-range bond, not a crash.
+        let top = TopFile::load(&format!(
+            "[ moleculetype ]\nSOL 3\n\n\
+             [ atoms ]\n\
+             1 OW 1 SOL OW 1 0.0 16.0\n\n\
+             [ bonds ]\n{} 1 1\n\n\
+             [ molecules ]\nSOL 2\n",
+            usize::MAX
+        ));
+        // Must not panic; a mismatched GRO simply yields a molecule with the
+        // out-of-range bond filtered out downstream.
+        assert!(
+            top.generate_molecule_with_gro(&GroFile::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_moleculetype_with_huge_count_does_not_hang() {
+        // An empty moleculetype (a name line but no atoms and no bonds) makes
+        // both expansion caps pass (0 * nmols == 0), so the push loop used to
+        // iterate up to usize::MAX times with a no-op body and hang the app. The
+        // guard must skip the empty template and return promptly.
+        let top = TopFile::load(
+            "[ moleculetype ]\nEMPTY 1\n\n[ molecules ]\nEMPTY 999999999999999\n",
+        );
+        // Must finish (no hang) and not panic; an empty template contributes no
+        // atoms/bonds, so this simply builds an empty-ish molecule.
+        assert!(
+            top.generate_molecule_with_gro(&GroFile::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn well_formed_topology_still_expands() {
+        // Two copies of a two-atom molecule expand to four atom types, and the
+        // molecule builds without error — the guard leaves normal files untouched.
+        let top = tiny_top("2");
+        assert!(
+            top.generate_molecule_with_gro(&GroFile::default())
+                .is_ok()
+        );
+        assert_eq!(top.expanded_atom_types().len(), 4);
     }
 }

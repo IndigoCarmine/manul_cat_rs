@@ -1140,6 +1140,29 @@ pub fn render_bottom_status_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
                         .color(theme::MUTED)
                         .size(12.0),
                 );
+                // While a file is loading off-thread, show a progress bar (byte
+                // fraction when known, an animated indeterminate bar otherwise —
+                // e.g. a topology whose size we cannot total across #includes), a
+                // short stage label, and a Cancel button.
+                if app.load_in_progress() {
+                    ui.separator();
+                    let bar = match app.load_fraction() {
+                        Some(frac) => egui::ProgressBar::new(frac).desired_width(140.0),
+                        None => egui::ProgressBar::new(0.0)
+                            .animate(true)
+                            .desired_width(140.0),
+                    };
+                    ui.add(bar);
+                    let stage = app.load_stage();
+                    if !stage.is_empty() {
+                        ui.label(
+                            egui::RichText::new(stage).color(theme::MUTED2).size(11.0),
+                        );
+                    }
+                    if ui.button("Cancel").clicked() {
+                        app.request_load_cancel();
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(&app.ui.status_msg)

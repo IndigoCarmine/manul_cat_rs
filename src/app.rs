@@ -22,7 +22,10 @@ use moleucle_3dview_rs::{
 };
 use rfd::FileDialog;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +34,10 @@ use std::sync::{Arc, Mutex};
 /// Native file dialogs block the thread they run on, so we run them off the UI
 /// thread and tag the result with the loader that should handle it once
 /// `update`/`ui` polls it back. See [`KuromameApp::spawn_pick`].
+///
+/// `Copy` so the tag can be handed to a background load worker (and echoed back
+/// on the finished result) without ceremony — it is a fieldless enum.
+#[derive(Clone, Copy)]
 enum PickKind {
     /// Structure into the active layer via [`KuromameApp::load_file`].
     Structure,
@@ -56,6 +63,116 @@ struct PickedFiles {
     kind: PickKind,
     paths: Vec<PathBuf>,
 }
+
+// --- Async file loading -----------------------------------------------------
+//
+// Picking a path is already off-thread (see `spawn_pick`); the *read + parse*
+// that follows is the part that actually stalls the UI for a big/slow file, so
+// it runs on a second worker thread too. The worker produces a pure-data
+// [`LoadPayload`] (no viewport / no `self`), the UI thread applies it. Progress
+// is shared through a [`LoadProgress`] the worker writes and the status bar
+// reads each frame.
+
+/// Shared progress handle: written by the load worker, read by the UI each
+/// frame. `total == 0` means the size is unknown (e.g. a topology whose
+/// `#include`s span several files) so the UI shows an indeterminate (animated)
+/// bar rather than a misleading fraction.
+#[derive(Default)]
+struct LoadProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+    stage: Mutex<String>,
+    cancel: AtomicBool,
+}
+
+impl LoadProgress {
+    fn set_stage(&self, s: impl Into<String>) {
+        if let Ok(mut g) = self.stage.lock() {
+            *g = s.into();
+        }
+    }
+
+    fn stage_text(&self) -> String {
+        self.stage.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn fraction(&self) -> Option<f32> {
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        Some((self.done.load(Ordering::Relaxed) as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// A `Read` wrapper that adds each chunk it reads to a [`LoadProgress`], giving
+/// byte-level progress for free — parsers read through it unchanged. Returns an
+/// `Interrupted` error when cancellation is requested so the in-progress parse
+/// unwinds instead of finishing work the user asked to abandon.
+struct ProgressReader<R> {
+    inner: R,
+    progress: Arc<LoadProgress>,
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.progress.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "load cancelled",
+            ));
+        }
+        let n = self.inner.read(buf)?;
+        self.progress.done.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Pure parsed data produced by a load worker — carries no viewport types and no
+/// `self`, so it is `Send` and can cross the thread boundary. The UI thread turns
+/// it into molecule/viewport state in [`KuromameApp::apply_finished_load`].
+enum LoadPayload {
+    Pdb(PdbFile),
+    Mol2(Mol2File),
+    Gro(GroFile),
+    Top(TopFile, Option<MartiniForceField>),
+    TopGro {
+        top: TopFile,
+        martini: Option<MartiniForceField>,
+        gro: GroFile,
+    },
+    Ndx(NdxFile),
+    Xtc(XtcFile),
+    Overlay(Vec<Vec3>), // surface dots
+}
+
+/// A finished background load handed back to the UI thread. `paths` echoes the
+/// request so the applier can store the source paths; `result` is the parsed
+/// payload or an error message (the sentinel `"__cancelled__"` when cancelled).
+struct FinishedLoad {
+    /// Which pick produced this load. The applier actually routes on the parsed
+    /// [`LoadPayload`] variant (it already names the target), so `kind` is kept
+    /// only as a self-describing echo of the request.
+    #[allow(dead_code)]
+    kind: PickKind,
+    paths: Vec<PathBuf>,
+    result: Result<LoadPayload, String>,
+}
+
+/// State for an in-flight background load: the channel the worker sends its
+/// [`FinishedLoad`] on, and the shared progress the status bar polls.
+struct PendingLoad {
+    rx: Receiver<FinishedLoad>,
+    progress: Arc<LoadProgress>,
+}
+
+/// Error sentinel a worker sends when the load was cancelled, so the applier can
+/// stay silent (beyond a short status) instead of surfacing an I/O error.
+const CANCELLED_SENTINEL: &str = "__cancelled__";
 
 #[path = "app_ui.rs"]
 mod app_ui;
@@ -476,6 +593,12 @@ pub struct KuromameApp {
     /// polls this and dispatches the chosen path(s) to the matching loader.
     /// `None` when no dialog is open. At most one picker runs at a time.
     pending_pick: Option<Receiver<PickedFiles>>,
+    /// In-flight background file *load* (read + parse), if any. Analogous to
+    /// `pending_pick` but for the second async stage: once paths are known the
+    /// read+parse runs on a worker so a big/slow file no longer freezes the UI.
+    /// `update`/`ui` polls it and applies the finished payload on the UI thread.
+    /// `None` when nothing is loading; at most one load runs at a time.
+    pending_load: Option<PendingLoad>,
 }
 
 impl KuromameApp {
@@ -649,6 +772,7 @@ impl KuromameApp {
             martini_visible: true,
             view_revision: 0,
             pending_pick: None,
+            pending_load: None,
         }
     }
 
@@ -687,31 +811,357 @@ impl KuromameApp {
         }
     }
 
-    /// Route a picked path (or TOP/GRO pair) to the loader named by its kind.
+    /// Route a picked path (or TOP/GRO pair) to a background *load* worker for its
+    /// kind. The read+parse — the part that stalls the UI on a big file — runs off
+    /// thread; the parsed payload is applied by [`Self::apply_finished_load`] once
+    /// [`Self::poll_pending_load`] receives it.
     fn dispatch_pick(&mut self, picked: PickedFiles) {
-        let PickedFiles { kind, mut paths } = picked;
+        let PickedFiles { kind, paths } = picked;
         if let PickKind::TopGroPair = kind {
+            // Paths arrive as `[top, gro]`; keep that order so the worker pairs
+            // them correctly.
             if paths.len() == 2 {
-                let gro = paths.pop().unwrap();
-                let top = paths.pop().unwrap();
-                self.load_top_and_gro_for_resname_sync(top, gro);
+                self.spawn_load(kind, paths);
             } else {
                 self.set_status("TOP/GRO pair selection cancelled");
             }
             return;
         }
-        let Some(path) = paths.into_iter().next() else {
+        if paths.is_empty() {
             return; // dialog cancelled
+        }
+        self.spawn_load(kind, paths);
+    }
+
+    /// Spawn a worker that reads+parses `paths` for `kind` off the UI thread and
+    /// sends back a [`FinishedLoad`]. Only one load runs at a time; a new one
+    /// replaces any in-flight `pending_load` (the old worker's send then simply
+    /// fails, exactly like the picker).
+    fn spawn_load(&mut self, kind: PickKind, paths: Vec<PathBuf>) {
+        let progress = Arc::new(LoadProgress::default());
+        progress.set_stage("Loading");
+        let (tx, rx) = mpsc::channel();
+        let worker_progress = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let result = KuromameApp::run_parse(kind, &paths, &worker_progress);
+            // A cancel that lands mid-parse surfaces as an I/O error; collapse
+            // any outcome under a set cancel flag to the sentinel so the applier
+            // stays quiet instead of reporting "load cancelled" as a read failure.
+            let result = if worker_progress.is_cancelled() {
+                Err(CANCELLED_SENTINEL.to_string())
+            } else {
+                result
+            };
+            // Ignore the send error: it only means a newer load replaced this one.
+            let _ = tx.send(FinishedLoad { kind, paths, result });
+        });
+        self.pending_load = Some(PendingLoad { rx, progress });
+        self.set_status("Loading …");
+    }
+
+    /// Poll the in-flight load, if any, and apply a finished result. Non-blocking;
+    /// call once per frame (mirrors [`Self::poll_pending_pick`]).
+    fn poll_pending_load(&mut self) {
+        let Some(pending) = self.pending_load.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(finished) => {
+                self.pending_load = None;
+                self.apply_finished_load(finished);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.pending_load = None,
+        }
+    }
+
+    /// Whether a background file load is currently in flight.
+    pub fn load_in_progress(&self) -> bool {
+        self.pending_load.is_some()
+    }
+
+    /// Progress fraction (0..1) of the in-flight load, or `None` when nothing is
+    /// loading or the total size is unknown (indeterminate bar).
+    pub fn load_fraction(&self) -> Option<f32> {
+        self.pending_load.as_ref().and_then(|p| p.progress.fraction())
+    }
+
+    /// Short stage label for the in-flight load ("Loading", "Parsing topology",
+    /// …), empty when nothing is loading.
+    pub fn load_stage(&self) -> String {
+        self.pending_load
+            .as_ref()
+            .map(|p| p.progress.stage_text())
+            .unwrap_or_default()
+    }
+
+    /// Ask the in-flight load worker to stop. The worker checks this flag (and its
+    /// `ProgressReader` unwinds on the next read), then sends the cancel sentinel
+    /// that [`Self::apply_finished_load`] turns into a "Load cancelled" status.
+    pub fn request_load_cancel(&mut self) {
+        if let Some(pending) = self.pending_load.as_ref() {
+            pending.progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Worker entry point: dispatch to the right pure parse helper for `kind`.
+    /// Runs on the load thread — takes no `self` and touches no viewport state.
+    fn run_parse(
+        kind: PickKind,
+        paths: &[PathBuf],
+        progress: &Arc<LoadProgress>,
+    ) -> Result<LoadPayload, String> {
+        let first = || {
+            paths
+                .first()
+                .map(PathBuf::as_path)
+                .ok_or_else(|| "No file to load".to_string())
         };
         match kind {
-            PickKind::Structure => self.load_file(path),
-            PickKind::Top => self.load_top_file_only(path),
-            PickKind::Gro => self.load_gro_file_only(path),
-            PickKind::Ndx => self.load_ndx_file(path),
-            PickKind::Xtc => self.load_xtc_file(path),
-            PickKind::OverlaySurface => self.load_overlay_surface_file(path),
-            PickKind::StructureLayer => self.load_structure_path(path),
-            PickKind::TopGroPair => unreachable!("handled above"),
+            PickKind::Structure => Self::parse_structure(first()?, progress),
+            PickKind::StructureLayer => Self::parse_structure_layer(first()?, progress),
+            PickKind::Top => Self::parse_top(first()?, progress),
+            PickKind::Gro => Self::parse_gro(first()?, progress),
+            PickKind::Ndx => Self::parse_ndx(first()?, progress),
+            PickKind::Xtc => Self::parse_xtc(first()?, progress),
+            PickKind::OverlaySurface => Self::parse_overlay(first()?, progress),
+            PickKind::TopGroPair => {
+                let top = first()?;
+                let gro = paths
+                    .get(1)
+                    .map(PathBuf::as_path)
+                    .ok_or_else(|| "No file to load".to_string())?;
+                Self::parse_topgro(top, gro, progress)
+            }
+        }
+    }
+
+    // --- Pure parse helpers (run on the load worker) -----------------------
+    //
+    // Each opens the file(s), reads through a `ProgressReader` for byte-level
+    // progress + cancellation, and returns pure data. They mirror the read+parse
+    // step of the old synchronous loaders exactly (same error messages), so the
+    // UI-thread apply step below is the only place that mutates `self`.
+
+    /// Open `path` for reading, record its byte length as the progress total, and
+    /// wrap it so reads report progress and honour cancellation.
+    fn open_progress_reader(
+        path: &Path,
+        progress: &Arc<LoadProgress>,
+    ) -> std::io::Result<ProgressReader<File>> {
+        let file = File::open(path)?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        progress.total.store(len, Ordering::Relaxed);
+        progress.done.store(0, Ordering::Relaxed);
+        Ok(ProgressReader {
+            inner: file,
+            progress: Arc::clone(progress),
+        })
+    }
+
+    /// Read the whole file into a `String` through the progress reader (for the
+    /// parsers that consume `&str`).
+    fn read_file_to_string(path: &Path, progress: &Arc<LoadProgress>) -> std::io::Result<String> {
+        let mut reader = Self::open_progress_reader(path, progress)?;
+        let mut s = String::new();
+        reader.read_to_string(&mut s)?;
+        Ok(s)
+    }
+
+    /// Structure into the active layer (PDB/MOL2 only), mirroring `load_file`'s
+    /// extension routing.
+    fn parse_structure(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            return Err("Unsupported file type".to_string());
+        };
+        match ext.to_lowercase().as_str() {
+            "pdb" | "ent" => Self::parse_pdb(path, progress),
+            "mol2" => Self::parse_mol2(path, progress),
+            _ => Err("Unsupported file type".to_string()),
+        }
+    }
+
+    /// Structure into a new layer, dispatched by extension, mirroring
+    /// `load_structure_path` (GRO / TOP-ITP / else PDB-MOL2).
+    fn parse_structure_layer(
+        path: &Path,
+        progress: &Arc<LoadProgress>,
+    ) -> Result<LoadPayload, String> {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "gro" => Self::parse_gro(path, progress),
+            "top" | "itp" => Self::parse_top(path, progress),
+            _ => Self::parse_structure(path, progress),
+        }
+    }
+
+    fn parse_pdb(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| "Failed to load PDB file".to_string())?;
+        Ok(LoadPayload::Pdb(PdbFile::load(&content)))
+    }
+
+    fn parse_mol2(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| "Failed to load MOL2 file".to_string())?;
+        Ok(LoadPayload::Mol2(Mol2File::load(&content)))
+    }
+
+    fn parse_gro(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let gro = Self::read_gro(path, progress)?;
+        Ok(LoadPayload::Gro(gro))
+    }
+
+    /// Read a GRO through the progress reader. Shared by `parse_gro` and the
+    /// TOP+GRO pair. Any I/O/parse failure maps to the message the old loader
+    /// used so the status text is unchanged.
+    fn read_gro(path: &Path, progress: &Arc<LoadProgress>) -> Result<GroFile, String> {
+        let reader = Self::open_progress_reader(path, progress)
+            .map_err(|_| "Failed to read GRO file".to_string())?;
+        // GroFile::load_from_reader needs `BufRead`; the ProgressReader is only
+        // `Read`, so buffer it. Progress then advances in buffer-sized steps,
+        // which is fine for a bar.
+        GroFile::load_from_reader(BufReader::new(reader))
+            .map_err(|_| "Failed to read GRO file".to_string())
+    }
+
+    fn parse_ndx(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| "Failed to read NDX file".to_string())?;
+        let ndx = NdxFile::parse(&content).map_err(|err| format!("NDX parse failed: {err}"))?;
+        Ok(LoadPayload::Ndx(ndx))
+    }
+
+    fn parse_overlay(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| format!("Failed to read {file_name}"))?;
+        let dots = PdbFile::load(&content).surface_dots();
+        if dots.is_empty() {
+            return Err(format!("{file_name} contains no DOT surface"));
+        }
+        Ok(LoadPayload::Overlay(dots))
+    }
+
+    fn parse_xtc(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let reader = Self::open_progress_reader(path, progress)
+            .map_err(|e| format!("Failed to load XTC: {e}"))?;
+        // Buffer the (unbuffered) file+progress reader: the XTC decoder issues
+        // many small reads. Cancellation still works — the ProgressReader under
+        // the buffer returns `Interrupted`, which surfaces as the I/O error.
+        let xtc = XtcFile::load_from_reader(BufReader::new(reader))
+            .map_err(|e| format!("Failed to load XTC: {e}"))?;
+        Ok(LoadPayload::Xtc(xtc))
+    }
+
+    fn parse_top(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        // `#include` expansion spans several files, so there is no single byte
+        // total to track — leave `total == 0` for an indeterminate bar.
+        progress.total.store(0, Ordering::Relaxed);
+        progress.set_stage("Parsing topology");
+        let top = TopFile::load_from_path(path)?;
+        let martini = Self::parse_martini_ff(path);
+        Ok(LoadPayload::Top(top, martini))
+    }
+
+    fn parse_topgro(
+        top_path: &Path,
+        gro_path: &Path,
+        progress: &Arc<LoadProgress>,
+    ) -> Result<LoadPayload, String> {
+        progress.total.store(0, Ordering::Relaxed);
+        progress.set_stage("Parsing topology");
+        let top = TopFile::load_from_path(top_path)?;
+        let martini = Self::parse_martini_ff(top_path);
+        progress.set_stage("Reading coordinates");
+        let gro = Self::read_gro(gro_path, progress)?;
+        Ok(LoadPayload::TopGro { top, martini, gro })
+    }
+
+    /// Parse the Martini force field a topology pulls in via `#include`, if the
+    /// include-expanded content really is one. The pure counterpart of the parse
+    /// step in [`Self::apply_martini_ff`] — mirrors the old `try_load_martini_ff`
+    /// without touching `self` so it can run on the worker.
+    fn parse_martini_ff(path: &Path) -> Option<MartiniForceField> {
+        TopFile::expand_includes(path)
+            .ok()
+            .map(|expanded| MartiniForceField::parse(&expanded))
+            .filter(|ff| ff.is_forcefield())
+    }
+
+    // --- Apply a finished load (UI thread) ---------------------------------
+
+    /// Apply a worker's [`FinishedLoad`] on the UI thread: route the parsed
+    /// payload into `self`/viewport with the exact same side effects and status
+    /// messages the old synchronous loaders produced after their parse step.
+    fn apply_finished_load(&mut self, finished: FinishedLoad) {
+        let FinishedLoad { paths, result, .. } = finished;
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(msg) if msg == CANCELLED_SENTINEL => {
+                self.set_status("Load cancelled");
+                return;
+            }
+            Err(msg) => {
+                self.set_status(msg);
+                return;
+            }
+        };
+
+        // `paths` echoes the original pick: one path for every kind except the
+        // TOP/GRO pair, which carries `[top, gro]`.
+        let mut paths = paths.into_iter();
+        match payload {
+            LoadPayload::Pdb(pdb) => {
+                if let Some(path) = paths.next() {
+                    self.apply_pdb(pdb, path);
+                    self.post_load_cleanup();
+                }
+            }
+            LoadPayload::Mol2(mol2) => {
+                if let Some(path) = paths.next() {
+                    self.apply_mol2(mol2, path);
+                    self.post_load_cleanup();
+                }
+            }
+            LoadPayload::Gro(gro) => {
+                if let Some(path) = paths.next() {
+                    self.apply_gro(gro, path);
+                }
+            }
+            LoadPayload::Top(top, martini) => {
+                if let Some(path) = paths.next() {
+                    self.apply_top(top, martini, path);
+                }
+            }
+            LoadPayload::TopGro { top, martini, gro } => {
+                if let (Some(top_path), Some(gro_path)) = (paths.next(), paths.next()) {
+                    self.apply_topgro(top, martini, gro, top_path, gro_path);
+                }
+            }
+            LoadPayload::Ndx(ndx) => {
+                if let Some(path) = paths.next() {
+                    self.apply_ndx(ndx, path);
+                }
+            }
+            LoadPayload::Xtc(xtc) => {
+                if let Some(path) = paths.next() {
+                    self.apply_xtc(xtc, path);
+                }
+            }
+            LoadPayload::Overlay(dots) => {
+                if let Some(path) = paths.next() {
+                    self.apply_overlay(dots, path);
+                }
+            }
         }
     }
 
@@ -774,7 +1224,15 @@ impl KuromameApp {
             }
             let mut bonds: Vec<Bond> = Vec::new();
             for bond in &full.bonds {
-                if let (Some(a), Some(b)) = (orig_to_view[bond.atom_a], orig_to_view[bond.atom_b]) {
+                // Index with `get`: a bond endpoint can point past the atom list
+                // when the topology and the coordinate file disagree on the atom
+                // count, and a bad bond must degrade to a missing stick, not a
+                // panic in the middle of a repaint.
+                let (va, vb) = (
+                    orig_to_view.get(bond.atom_a).copied().flatten(),
+                    orig_to_view.get(bond.atom_b).copied().flatten(),
+                );
+                if let (Some(a), Some(b)) = (va, vb) {
                     bonds.push(Bond {
                         atom_a: a as usize,
                         atom_b: b as usize,
@@ -904,20 +1362,14 @@ impl KuromameApp {
         self.viewport.set_atom_colors(Some(colors));
     }
 
-    /// Parse `path` as a Martini force field and register it when it really is
-    /// one, refreshing bead styling for any loaded structure. Returns the
-    /// bead-type count when a force field was found.
+    /// Register a Martini force field parsed off-thread (see
+    /// [`Self::parse_martini_ff`]) and refresh bead styling for any loaded
+    /// structure. Returns the bead-type count when a force field was found.
     ///
     /// The force field belongs to the topology, so a topology that is *not*
-    /// Martini drops any previously registered one rather than leaving the old
-    /// beads applied to the new structure.
-    fn try_load_martini_ff(&mut self, path: &std::path::Path) -> Option<usize> {
-        // Parse from the include-expanded content so a Martini force field that a
-        // system `.top` pulls in via `#include` is still found.
-        let ff = TopFile::expand_includes(path)
-            .ok()
-            .map(|expanded| MartiniForceField::parse(&expanded))
-            .filter(|ff| ff.is_forcefield());
+    /// Martini (`ff == None`) drops any previously registered one rather than
+    /// leaving the old beads applied to the new structure.
+    fn apply_martini_ff(&mut self, ff: Option<MartiniForceField>) -> Option<usize> {
         let count = ff.as_ref().map(|ff| ff.bead_type_count());
         self.martini_ff = ff;
         self.recompute_bead_types();
@@ -993,6 +1445,28 @@ impl KuromameApp {
     }
 
     fn post_load_cleanup(&mut self) {
+        // A newly loaded structure may have a different atom count than a
+        // trajectory still held from an earlier file. Applying that trajectory
+        // would either index the new molecule with stale positions or silently
+        // resurrect the old molecule from `base_molecule`, so drop a trajectory
+        // that no longer matches. One whose atom count still fits (the same
+        // system reloaded) is kept so a reload does not throw it away.
+        if let Some(mol) = self.molecule.as_ref() {
+            let atom_count = mol.atoms.len();
+            let stale = self
+                .trajectory
+                .first()
+                .is_some_and(|frame| frame.positions.len() != atom_count);
+            if stale {
+                self.trajectory.clear();
+                self.trajectory_path = None;
+                self.base_molecule = None;
+                self.traj_ui.current_frame = 0;
+                self.traj_ui.is_playing = false;
+                self.traj_ui.interp_sub = 0;
+            }
+        }
+
         // A freshly loaded structure invalidates any prior atom selection (its
         // indices refer to the old molecule); clear it so `rebuild_viewport`
         // does not project stale indices onto the new geometry.
@@ -1049,26 +1523,14 @@ impl KuromameApp {
         });
     }
 
-    fn load_overlay_surface_file(&mut self, path: PathBuf) {
+    /// Apply an overlay surface's dots (parsed off-thread by
+    /// [`Self::parse_overlay`]) as a new, distinctly-coloured overlay.
+    fn apply_overlay(&mut self, dots: Vec<Vec3>, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => {
-                self.set_status(format!("Failed to read {file_name}"));
-                return;
-            }
-        };
-
-        let dots = PdbFile::load(&content).surface_dots();
-        if dots.is_empty() {
-            self.set_status(format!("{file_name} contains no DOT surface"));
-            return;
-        }
 
         let count = dots.len();
         let color = OVERLAY_SURFACE_PALETTE
@@ -1360,21 +1822,6 @@ impl KuromameApp {
         });
     }
 
-    /// Dispatch a path to the right loader by extension (all operate on the
-    /// active layer).
-    fn load_structure_path(&mut self, path: PathBuf) {
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        match ext.as_str() {
-            "gro" => self.load_gro_file_only(path),
-            "top" | "itp" => self.load_top_file_only(path),
-            _ => self.load_file(path),
-        }
-    }
-
     pub fn layer_count(&self) -> usize {
         self.layers.len()
     }
@@ -1632,28 +2079,25 @@ impl KuromameApp {
         }
     }
 
+    /// Synchronous NDX load (drag-and-drop / reload / CLI). The file-dialog path
+    /// loads through the async worker instead; both funnel into [`Self::apply_ndx`].
     fn load_ndx_file(&mut self, path: PathBuf) {
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_ndx(&path, &progress) {
+            Ok(LoadPayload::Ndx(ndx)) => self.apply_ndx(ndx, path),
+            Ok(_) => unreachable!("parse_ndx only yields Ndx"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
+
+    /// Apply a parsed NDX file: rebuild the per-group UI, store it, and draw the
+    /// first group. Shared by the sync and async load paths.
+    fn apply_ndx(&mut self, ndx: NdxFile, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => {
-                self.set_status("Failed to read NDX file");
-                return;
-            }
-        };
-
-        let ndx = match NdxFile::parse(&content) {
-            Ok(ndx) => ndx,
-            Err(err) => {
-                self.set_status(format!("NDX parse failed: {err}"));
-                return;
-            }
-        };
 
         let group_count = ndx.groups.len();
         // Give every group a palette colour up front so the list shows a stable
@@ -2283,6 +2727,22 @@ impl KuromameApp {
             return true;
         }
 
+        // The topology's expanded atom list and the GRO's are the same system
+        // seen twice; if they disagree the pairing is wrong (a stale/short
+        // `conf.gro`, a truncated one, or a GRO whose first malformed line cut
+        // the atom list short). Refuse the pair with a message rather than
+        // building a molecule whose bonds index atoms that do not exist — the
+        // same contract the XTC path already applies.
+        let top_atom_count = top.expanded_atom_types().len();
+        if top_atom_count != gro.atoms.len() {
+            self.set_status(format!(
+                "TOP atom count ({}) does not match GRO atom count ({})",
+                top_atom_count,
+                gro.atoms.len()
+            ));
+            return false;
+        }
+
         match top.generate_molecule_with_gro(&gro) {
             Ok((molecule, interaction_pairs)) => {
                 let boxsize = gro.box_line;
@@ -2422,55 +2882,74 @@ impl KuromameApp {
         rows
     }
 
+    /// Synchronous TOP+GRO load (drag-and-drop / reload / CLI). The file-dialog
+    /// path loads through the async worker instead; both funnel into
+    /// [`Self::apply_topgro`].
     fn load_top_and_gro_for_resname_sync(&mut self, top_path: PathBuf, gro_path: PathBuf) {
-        let top = match TopFile::load_from_path(&top_path) {
-            Ok(top) => top,
-            Err(err) => {
-                self.set_status(err);
-                return;
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_topgro(&top_path, &gro_path, &progress) {
+            Ok(LoadPayload::TopGro { top, martini, gro }) => {
+                self.apply_topgro(top, martini, gro, top_path, gro_path)
             }
-        };
-        let gro = match GroFile::load_from_path(&gro_path) {
-            Ok(gro) => gro,
-            Err(_) => {
-                self.set_status("Failed to read GRO file");
-                return;
-            }
-        };
+            Ok(_) => unreachable!("parse_topgro only yields TopGro"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
 
+    /// Apply a parsed TOP+GRO pair (residue-name sync). Shared by the sync and
+    /// async load paths; `martini` is the force field the worker already parsed.
+    fn apply_topgro(
+        &mut self,
+        top: TopFile,
+        martini: Option<MartiniForceField>,
+        gro: GroFile,
+        top_path: PathBuf,
+        gro_path: PathBuf,
+    ) {
         self.data.top_file = Some(top);
-        let martini_types = self.try_load_martini_ff(&top_path);
+        let martini_types = self.apply_martini_ff(martini);
         self.data.top_file_path = Some(top_path);
         self.data.structure_file = Some(StructureFile::Gro(gro));
         self.data.structure_file_path = Some(gro_path);
 
-        self.generate_and_set_molecule_from_stored_files();
+        let built = self.generate_and_set_molecule_from_stored_files();
         self.update_loaded_summary();
         self.mark_clean();
-        match martini_types {
-            Some(n) => self.set_status(format!("Loaded Martini FF + GRO ({} bead types)", n)),
-            None => self.set_status("Loaded TOP+GRO"),
+        // Keep the rejection message when the pair did not match; overwriting it
+        // with "Loaded" would hide the only clue the user gets.
+        if built {
+            match martini_types {
+                Some(n) => self.set_status(format!("Loaded Martini FF + GRO ({} bead types)", n)),
+                None => self.set_status("Loaded TOP+GRO"),
+            }
         }
         self.post_load_cleanup();
     }
 
+    /// Synchronous TOP-only load (drag-and-drop / reload / CLI). The file-dialog
+    /// path loads through the async worker instead; both funnel into
+    /// [`Self::apply_top`].
     fn load_top_file_only(&mut self, path: PathBuf) {
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_top(&path, &progress) {
+            Ok(LoadPayload::Top(top, martini)) => self.apply_top(top, martini, path),
+            Ok(_) => unreachable!("parse_top only yields Top"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
+
+    /// Apply a parsed TOP file: register it and its Martini force field, then
+    /// either build the molecule against an already-loaded GRO or wait for one.
+    /// Shared by the sync and async load paths.
+    fn apply_top(&mut self, top: TopFile, martini: Option<MartiniForceField>, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let top = match TopFile::load_from_path(&path) {
-            Ok(t) => t,
-            Err(err) => {
-                self.set_status(err);
-                return;
-            }
-        };
-
         self.data.top_file = Some(top);
-        let martini_types = self.try_load_martini_ff(&path);
+        let martini_types = self.apply_martini_ff(martini);
         self.data.top_file_path = Some(path);
 
         let has_gro = self
@@ -2481,16 +2960,19 @@ impl KuromameApp {
             .is_some();
 
         if has_gro {
-            self.generate_and_set_molecule_from_stored_files();
+            let built = self.generate_and_set_molecule_from_stored_files();
             self.update_loaded_summary();
             self.mark_clean();
             self.post_load_cleanup();
-            match martini_types {
-                Some(n) => self.set_status(format!(
-                    "Loaded Martini force field: {} ({} bead types)",
-                    file_name, n
-                )),
-                None => self.set_status(format!("Loaded TOP: {}", file_name)),
+            // Preserve the mismatch message set by the builder.
+            if built {
+                match martini_types {
+                    Some(n) => self.set_status(format!(
+                        "Loaded Martini force field: {} ({} bead types)",
+                        file_name, n
+                    )),
+                    None => self.set_status(format!("Loaded TOP: {}", file_name)),
+                }
             }
         } else {
             self.update_loaded_summary();
@@ -2508,20 +2990,27 @@ impl KuromameApp {
         }
     }
 
+    /// Synchronous GRO-only load (drag-and-drop / reload / CLI). The file-dialog
+    /// path loads through the async worker instead; both funnel into
+    /// [`Self::apply_gro`].
     fn load_gro_file_only(&mut self, path: PathBuf) {
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_gro(&path, &progress) {
+            Ok(LoadPayload::Gro(gro)) => self.apply_gro(gro, path),
+            Ok(_) => unreachable!("parse_gro only yields Gro"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
+
+    /// Apply a parsed GRO file: build the molecule (against a loaded TOP when
+    /// present, else distance-inferred bonds) and set the simulation cell. Shared
+    /// by the sync and async load paths.
+    fn apply_gro(&mut self, gro: GroFile, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        let gro = match GroFile::load_from_path(&path) {
-            Ok(g) => g,
-            Err(_) => {
-                self.set_status("Failed to read GRO file");
-                return;
-            }
-        };
 
         let boxsize = gro.box_line;
         self.data.structure_file = Some(StructureFile::Gro(gro));
@@ -2529,8 +3018,9 @@ impl KuromameApp {
         self.viewport
             .set_state_by_type(SimulationCellRenderState::new(boxsize));
 
+        let mut built = true;
         if self.data.top_file.is_some() {
-            self.generate_and_set_molecule_from_stored_files();
+            built = self.generate_and_set_molecule_from_stored_files();
         } else {
             let mol = self
                 .data
@@ -2546,78 +3036,101 @@ impl KuromameApp {
 
         self.update_loaded_summary();
         self.mark_clean();
-        self.set_status(format!("Loaded GRO: {}", file_name));
+        // Preserve the mismatch message when the GRO did not fit the loaded TOP.
+        if built {
+            self.set_status(format!("Loaded GRO: {}", file_name));
+        }
         self.post_load_cleanup();
     }
 
+    /// Synchronous structure load (drag-and-drop / reload / CLI), PDB/MOL2 by
+    /// extension. The file-dialog path loads through the async worker instead;
+    /// both funnel into [`Self::apply_pdb`]/[`Self::apply_mol2`]. `post_load_cleanup`
+    /// runs on success exactly as before (it used to sit in this wrapper).
     pub fn load_file(&mut self, path: PathBuf) {
-        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-            self.set_status("Unsupported file type");
-            return;
-        };
-
-        match ext.to_lowercase().as_str() {
-            "pdb" | "ent" => self.load_pdb_file(path),
-            "mol2" => self.load_mol2_file(path),
-            _ => {
-                self.set_status("Unsupported file type");
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_structure(&path, &progress) {
+            Ok(LoadPayload::Pdb(pdb)) => {
+                self.apply_pdb(pdb, path);
+                self.post_load_cleanup();
             }
+            Ok(LoadPayload::Mol2(mol2)) => {
+                self.apply_mol2(mol2, path);
+                self.post_load_cleanup();
+            }
+            Ok(_) => unreachable!("parse_structure only yields Pdb/Mol2"),
+            Err(msg) => self.set_status(msg),
         }
-        self.post_load_cleanup();
     }
 
-    fn load_pdb_file(&mut self, path: PathBuf) {
+    /// Apply a parsed PDB structure into the active layer. Shared by the sync and
+    /// async load paths; the caller runs `post_load_cleanup` afterwards.
+    fn apply_pdb(&mut self, pdb: PdbFile, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let pdb = PdbFile::load(&content);
-                let mol = pdb.to_molecule();
-                self.interaction_pairs.clear();
-                self.surface_dots = pdb.surface_dots();
-                self.set_molecule_and_frame(mol);
-                self.data.clear_structures();
-                self.data.structure_file = Some(StructureFile::Pdb(pdb));
-                self.data.structure_file_path = Some(path);
-                self.update_loaded_summary();
-                self.mark_clean();
-                self.set_status(format!("Loaded PDB: {}", file_name));
-            }
-            Err(_) => self.set_status("Failed to load PDB file"),
-        }
+        let mol = pdb.to_molecule();
+        self.interaction_pairs.clear();
+        self.surface_dots = pdb.surface_dots();
+        self.set_molecule_and_frame(mol);
+        self.data.clear_structures();
+        self.data.structure_file = Some(StructureFile::Pdb(pdb));
+        self.data.structure_file_path = Some(path);
+        self.update_loaded_summary();
+        self.mark_clean();
+        self.set_status(format!("Loaded PDB: {}", file_name));
     }
 
-    fn load_mol2_file(&mut self, path: PathBuf) {
+    /// Apply a parsed MOL2 structure into the active layer. Shared by the sync and
+    /// async load paths; the caller runs `post_load_cleanup` afterwards.
+    fn apply_mol2(&mut self, mol2: Mol2File, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let mol2 = Mol2File::load(&content);
-                let mol = mol2.to_molecule();
-                let pdb_from_mol2 = PdbFile::from_molecule(&mol);
-                self.interaction_pairs.clear();
-                self.surface_dots.clear();
-                self.set_molecule_and_frame(mol);
-                self.data.clear_structures();
-                self.data.structure_file = Some(StructureFile::Pdb(pdb_from_mol2));
-                self.data.structure_file_path = Some(path);
-                self.update_loaded_summary();
-                self.mark_clean();
-                self.set_status(format!("Loaded MOL2: {}", file_name));
-            }
-            Err(_) => self.set_status("Failed to load MOL2 file"),
-        }
+        let mol = mol2.to_molecule();
+        let pdb_from_mol2 = PdbFile::from_molecule(&mol);
+        self.interaction_pairs.clear();
+        self.surface_dots.clear();
+        self.set_molecule_and_frame(mol);
+        self.data.clear_structures();
+        self.data.structure_file = Some(StructureFile::Pdb(pdb_from_mol2));
+        self.data.structure_file_path = Some(path);
+        self.update_loaded_summary();
+        self.mark_clean();
+        self.set_status(format!("Loaded MOL2: {}", file_name));
     }
 
-    fn set_molecule_and_frame(&mut self, molecule: Molecule) {
+    fn set_molecule_and_frame(&mut self, mut molecule: Molecule) {
+        // Every molecule enters the app through here, so this is the one place
+        // that can guarantee the invariant the renderer relies on: it indexes
+        // `mol.atoms[bond.atom_a]` unchecked, so a single bond pointing past the
+        // atom list (a topology declaring more atoms than the coordinate file
+        // supplies, a truncated GRO, ...) would kill the process on the next
+        // paint. Drop those bonds instead.
+        let dropped = Self::drop_out_of_range_bonds(&mut molecule);
+        if dropped > 0 {
+            self.set_status(format!(
+                "Ignored {} bond(s) referring to atoms the coordinate file does not contain",
+                dropped
+            ));
+        }
         self.molecule = Some(molecule);
         // Syncing to the viewport is handled by post_load_cleanup() — callers are responsible.
+    }
+
+    /// Remove bonds whose endpoints are not valid atom indices, returning how
+    /// many were dropped. Bond indices come from file content (a `.top`'s
+    /// `[ bonds ]`, a MOL2 bond block) and are never validated against the
+    /// coordinates they are paired with.
+    fn drop_out_of_range_bonds(molecule: &mut Molecule) -> usize {
+        let n = molecule.atoms.len();
+        let before = molecule.bonds.len();
+        molecule.bonds.retain(|b| b.atom_a < n && b.atom_b < n);
+        before - molecule.bonds.len()
     }
 
     pub fn open_xtc_file(&mut self) {
@@ -2631,20 +3144,15 @@ impl KuromameApp {
         });
     }
 
-    fn load_xtc_file(&mut self, path: PathBuf) {
+    /// Apply a parsed XTC trajectory: validate its atom count against the current
+    /// structure, set the base molecule and trajectory, and show frame 0. Shared
+    /// by the sync and async load paths.
+    fn apply_xtc(&mut self, xtc: XtcFile, path: PathBuf) {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        let xtc = match XtcFile::load_from_path(&path) {
-            Ok(x) => x,
-            Err(e) => {
-                self.set_status(format!("Failed to load XTC: {e}"));
-                return;
-            }
-        };
 
         if xtc.frames.is_empty() {
             self.set_status("XTC file contains no frames");
@@ -2781,13 +3289,18 @@ impl KuromameApp {
                 }
             }
             // The viewport may hold a filtered subset; feed it positions in
-            // viewport-index order.
+            // viewport-index order. Index through `.get()` rather than `[orig]`:
+            // `view_to_orig` is rebuilt to match the molecule, but should it ever
+            // lag behind a shorter `positions` (a trajectory frame narrower than
+            // the current structure), an unchecked index would panic mid-repaint.
+            // Fall back to the origin for any missing atom so the length still
+            // matches what the viewport expects.
             if self.visibility.is_filtered() {
                 let view_positions: Vec<Vec3> = self
                     .visibility
                     .view_to_orig
                     .iter()
-                    .map(|&orig| positions[orig])
+                    .map(|&orig| positions.get(orig).copied().unwrap_or(Vec3::new(0.0, 0.0, 0.0)))
                     .collect();
                 let _ = self.viewport.update_positions(&view_positions);
             } else {
@@ -2931,33 +3444,36 @@ impl KuromameApp {
             }
         }
 
+        // Route through the async worker (same as the file-dialog path) so a big
+        // dropped/CLI file reads off the UI thread with a progress bar instead of
+        // freezing — dropping a large `.xtc` is the very case the user hit.
         if let (Some(top), Some(gro)) = (top_path.clone(), gro_path.clone()) {
-            self.load_top_and_gro_for_resname_sync(top, gro);
+            self.spawn_load(PickKind::TopGroPair, vec![top, gro]);
             return;
         }
 
         if let Some(top) = top_path {
-            self.load_top_file_only(top);
+            self.spawn_load(PickKind::Top, vec![top]);
             return;
         }
 
         if let Some(gro) = gro_path {
-            self.load_gro_file_only(gro);
+            self.spawn_load(PickKind::Gro, vec![gro]);
             return;
         }
 
         if let Some(path) = xtc_path {
-            self.load_xtc_file(path);
+            self.spawn_load(PickKind::Xtc, vec![path]);
             return;
         }
 
         if let Some(path) = ndx_path {
-            self.load_ndx_file(path);
+            self.spawn_load(PickKind::Ndx, vec![path]);
             return;
         }
 
         if let Some(path) = other_path {
-            self.load_file(path);
+            self.spawn_load(PickKind::Structure, vec![path]);
         }
     }
 
@@ -2970,7 +3486,7 @@ impl KuromameApp {
             return;
         };
 
-        // Find all atoms on all simple paths between start and end
+        // Find the atoms on the shortest bonded path between start and end
         let atoms_on_path = Self::find_atoms_between_dfs(mol, start, end);
 
         // Toggle only the atoms on the path first.
@@ -3003,49 +3519,56 @@ impl KuromameApp {
             adj.entry(bond.atom_b).or_default().insert(bond.atom_a);
         }
 
-        // 2. DFS to find all simple paths and collect all atoms on any path
-        let mut all_path_atoms = std::collections::HashSet::new();
+        // 2. Breadth-first search for the shortest path, recording each atom's
+        //    predecessor. This used to be a recursive DFS enumerating *every*
+        //    simple path, which on file-sized graphs is fatal: recursion depth
+        //    follows the longest path, so a few thousand bonded atoms blow the
+        //    1 MB main-thread stack (no unwind, no panic message, the process is
+        //    simply gone), and on cyclic graphs — which distance-inferred bonds
+        //    always produce — the number of simple paths is exponential, so the
+        //    UI thread never returns. BFS is O(V+E), iterative and allocates on
+        //    the heap, and it answers what the caller actually asks for.
+        let mut parent: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        parent.insert(start, start);
 
-        fn dfs(
-            current: usize,
-            target: usize,
-            adj: &std::collections::HashMap<usize, std::collections::HashSet<usize>>,
-            visited: &mut std::collections::HashSet<usize>,
-            path: &mut Vec<usize>,
-            all_path_atoms: &mut std::collections::HashSet<usize>,
-        ) {
-            if current == target {
-                // Found a path - add all atoms in this path
-                all_path_atoms.extend(path.iter());
-                return;
+        let mut found = false;
+        while let Some(current) = queue.pop_front() {
+            if current == end {
+                found = true;
+                break;
             }
-
             if let Some(neighbors) = adj.get(&current) {
                 for &neighbor in neighbors {
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        path.push(neighbor);
-                        dfs(neighbor, target, adj, visited, path, all_path_atoms);
-                        path.pop();
-                        visited.remove(&neighbor);
+                    // `parent` doubles as the visited set, so every atom is
+                    // expanded at most once.
+                    if !parent.contains_key(&neighbor) {
+                        parent.insert(neighbor, current);
+                        queue.push_back(neighbor);
                     }
                 }
             }
         }
 
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(start);
-        let mut path = vec![start];
-        dfs(
-            start,
-            end,
-            &adj,
-            &mut visited,
-            &mut path,
-            &mut all_path_atoms,
-        );
+        if !found {
+            // Not bonded to each other: nothing lies "between" them.
+            return Vec::new();
+        }
 
-        // 3. Return as sorted vector
+        // 3. Walk the predecessors back to `start`, then return sorted.
+        let mut all_path_atoms = std::collections::HashSet::new();
+        let mut node = end;
+        loop {
+            all_path_atoms.insert(node);
+            let Some(&prev) = parent.get(&node) else { break };
+            if prev == node {
+                break; // reached `start`, whose parent is itself
+            }
+            node = prev;
+        }
+
         let mut result: Vec<usize> = all_path_atoms.into_iter().collect();
         result.sort();
         result
@@ -3169,11 +3692,13 @@ impl eframe::App for KuromameApp {
             .and_then(|atom| self.hovered_atom_info(atom))
             .unwrap_or_else(|| "Hover an atom for details".to_string());
 
-        // Deliver any file chosen by a background picker thread, then keep
-        // repainting while a dialog is open so the result is dispatched promptly
-        // (egui otherwise idles with no pending input events).
+        // Deliver any file chosen by a background picker thread, then any parsed
+        // payload from a background load worker. Keep repainting while either is
+        // in flight so results are dispatched promptly and the progress bar
+        // animates (egui otherwise idles with no pending input events).
         self.poll_pending_pick();
-        if self.pending_pick.is_some() {
+        self.poll_pending_load();
+        if self.pending_pick.is_some() || self.pending_load.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -3345,5 +3870,112 @@ mod tests {
         let mut groups = vec![vec![0, 1], vec![2, 3]];
         KuromameApp::resolve_ndx_overlaps(&mut groups);
         assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    /// Build a chain-free molecule of `n` atoms plus the given bonds.
+    fn test_molecule(n: usize, bonds: &[(usize, usize)]) -> Molecule {
+        let atoms = (0..n)
+            .map(|i| view_atom(Vec3::new(i as f32, 0.0, 0.0), "C", i, None))
+            .collect();
+        let bonds = bonds
+            .iter()
+            .map(|&(a, b)| Bond {
+                atom_a: a,
+                atom_b: b,
+                order: 1,
+            })
+            .collect();
+        molecule_from_parts(atoms, bonds)
+    }
+
+    #[test]
+    fn out_of_range_bonds_are_dropped_from_the_molecule() {
+        // A TOP describing 4 atoms loaded against a 2-atom GRO produces exactly
+        // this: bonds indexing atoms the coordinates never provided.
+        let mut mol = test_molecule(2, &[(0, 1), (1, 2), (2, 3)]);
+        let dropped = KuromameApp::drop_out_of_range_bonds(&mut mol);
+
+        assert_eq!(dropped, 2, "both bonds reaching past atom 1 are dropped");
+        assert_eq!(mol.bonds.len(), 1);
+        assert_eq!((mol.bonds[0].atom_a, mol.bonds[0].atom_b), (0, 1));
+    }
+
+    #[test]
+    fn well_formed_bonds_survive_untouched() {
+        let mut mol = test_molecule(3, &[(0, 1), (1, 2)]);
+        assert_eq!(KuromameApp::drop_out_of_range_bonds(&mut mol), 0);
+        assert_eq!(mol.bonds.len(), 2);
+    }
+
+    #[test]
+    fn select_between_takes_the_shortest_route_around_a_ring() {
+        // Six-membered ring: 0-1-2-3-4-5-0. Between 0 and 3 both arcs are three
+        // bonds long, so either is acceptable, but the result must never be the
+        // whole ring (the old all-simple-paths walk returned every atom).
+        let mol = test_molecule(6, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]);
+        let path = KuromameApp::find_atoms_between_dfs(&mol, 0, 3);
+
+        assert_eq!(path.len(), 4, "start, end and the two atoms in between");
+        assert!(path.contains(&0) && path.contains(&3));
+    }
+
+    #[test]
+    fn select_between_survives_a_chain_far_longer_than_the_stack() {
+        // The previous recursive DFS pushed one frame per atom, so a chain this
+        // long killed the process with STATUS_STACK_OVERFLOW on Windows' 1 MB
+        // main-thread stack. BFS must simply return the whole chain.
+        const N: usize = 20_000;
+        let bonds: Vec<(usize, usize)> = (0..N - 1).map(|i| (i, i + 1)).collect();
+        let mol = test_molecule(N, &bonds);
+
+        let path = KuromameApp::find_atoms_between_dfs(&mol, 0, N - 1);
+        assert_eq!(path.len(), N);
+    }
+
+    #[test]
+    fn select_between_returns_nothing_for_unconnected_atoms() {
+        let mol = test_molecule(4, &[(0, 1), (2, 3)]);
+        assert!(KuromameApp::find_atoms_between_dfs(&mol, 0, 3).is_empty());
+    }
+
+    #[test]
+    fn progress_reader_forwards_bytes_and_tracks_done() {
+        // Every byte read through the wrapper reaches the consumer unchanged and
+        // is counted in `done`, which is what drives the byte-fraction bar.
+        let data = b"hello world".to_vec();
+        let progress = Arc::new(LoadProgress::default());
+        let mut reader = ProgressReader {
+            inner: std::io::Cursor::new(data.clone()),
+            progress: Arc::clone(&progress),
+        };
+        let mut out = Vec::new();
+        let n = reader.read_to_end(&mut out).expect("read succeeds");
+        assert_eq!(n, data.len());
+        assert_eq!(out, data, "bytes pass through untouched");
+        assert_eq!(
+            progress.done.load(Ordering::Relaxed),
+            data.len() as u64,
+            "done reflects the bytes read"
+        );
+    }
+
+    #[test]
+    fn progress_reader_errors_when_cancelled() {
+        // A set cancel flag makes the very next read fail with `Interrupted`, so
+        // an in-flight parse unwinds instead of finishing abandoned work.
+        let progress = Arc::new(LoadProgress::default());
+        progress.cancel.store(true, Ordering::Relaxed);
+        let mut reader = ProgressReader {
+            inner: std::io::Cursor::new(vec![1u8, 2, 3]),
+            progress: Arc::clone(&progress),
+        };
+        let mut buf = [0u8; 3];
+        let err = reader.read(&mut buf).expect_err("cancelled read errors");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            progress.done.load(Ordering::Relaxed),
+            0,
+            "nothing was consumed on a cancelled read"
+        );
     }
 }
