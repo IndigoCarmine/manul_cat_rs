@@ -137,6 +137,313 @@ pub fn render_edit_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
     }
 }
 
+/// Checker size (px) behind a transparent preview, so alpha is visible.
+const CHECKER: f32 = 8.0;
+
+/// Paint the standard light/dark checkerboard, marking out where the image is
+/// transparent rather than dark-coloured.
+fn paint_checkerboard(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::MUTED2);
+    let cols = (rect.width() / CHECKER).ceil() as i32;
+    let rows = (rect.height() / CHECKER).ceil() as i32;
+    for row in 0..rows {
+        for col in 0..cols {
+            if (row + col) % 2 != 0 {
+                continue;
+            }
+            let cell = egui::Rect::from_min_size(
+                rect.min + egui::vec2(col as f32 * CHECKER, row as f32 * CHECKER),
+                egui::vec2(CHECKER, CHECKER),
+            )
+            .intersect(rect);
+            painter.rect_filled(cell, egui::CornerRadius::ZERO, theme::BADGE_FG);
+        }
+    }
+}
+
+/// The image-export dialog: a low-resolution render of the current view, a
+/// region you drag on it, and the resulting full-size export.
+///
+/// The preview deliberately shows the *export's* background rather than the
+/// viewer's, so a transparent export reads as a checkerboard before it is saved.
+pub fn render_export_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
+    if !app.export_dialog_open() {
+        return;
+    }
+    let mut open = true;
+    let mut close_requested = false;
+    let mut save_requested = false;
+    let mut reset_region = false;
+    let mut clear_region = false;
+
+    egui::Window::new("Export Image")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            let view = app.viewport_pixel_size();
+
+            // ---- preview + region drag -------------------------------------
+            if let Some(texture) = app.export_preview().cloned() {
+                let size = texture.size_vec2();
+                let (rect, response) =
+                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let painter = ui.painter_at(rect);
+                if app.export_settings().transparent {
+                    paint_checkerboard(&painter, rect);
+                }
+                painter.image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+                // Pointer position as a normalised view coordinate (y down),
+                // which is the space both the region and the engine work in.
+                let to_norm = |pos: egui::Pos2| {
+                    [
+                        ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                        ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                    ]
+                };
+
+                let view_aspect = crate::image_export::region_pixel_aspect([0.0, 0.0, 1.0, 1.0], view);
+                let ratio = app.export_settings().aspect.ratio(view_aspect);
+
+                if response.drag_started() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        app.set_export_drag_anchor(Some(to_norm(pos)));
+                    }
+                }
+                if let (Some(anchor), Some(pos)) =
+                    (app.export_drag_anchor(), response.interact_pointer_pos())
+                {
+                    if response.dragged() || response.drag_stopped() {
+                        let region = crate::image_export::region_from_drag(
+                            anchor,
+                            to_norm(pos),
+                            ratio,
+                            view,
+                        );
+                        // A click without a real drag means "clear the region",
+                        // handled on release below.
+                        if !crate::image_export::is_degenerate(region, view) {
+                            app.set_export_region(Some(region));
+                        }
+                    }
+                }
+                if response.drag_stopped() {
+                    app.set_export_drag_anchor(None);
+                }
+                if response.clicked() {
+                    clear_region = true;
+                }
+
+                // ---- region outline + dimmed surroundings -------------------
+                let region = app.export_settings().region;
+                if let Some([x0, y0, x1, y1]) = region {
+                    let sel = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(x0 * rect.width(), y0 * rect.height()),
+                        rect.min + egui::vec2(x1 * rect.width(), y1 * rect.height()),
+                    );
+                    let shade = egui::Color32::from_black_alpha(120);
+                    // Four bands around the selection, so the kept area stays clean.
+                    for band in [
+                        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), sel.top())),
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), sel.bottom()),
+                            rect.right_bottom(),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), sel.top()),
+                            egui::pos2(sel.left(), sel.bottom()),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(sel.right(), sel.top()),
+                            egui::pos2(rect.right(), sel.bottom()),
+                        ),
+                    ] {
+                        if band.is_positive() {
+                            painter.rect_filled(band, egui::CornerRadius::ZERO, shade);
+                        }
+                    }
+                    painter.rect_stroke(
+                        sel,
+                        egui::CornerRadius::ZERO,
+                        egui::Stroke::new(1.5, theme::ACCENT),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(if region.is_some() {
+                        "Drag to re-frame · click to use the whole view"
+                    } else {
+                        "Drag on the preview to pick a region"
+                    })
+                    .color(theme::MUTED2)
+                    .size(11.0),
+                );
+            } else if let Some(err) = app.export_error() {
+                ui.colored_label(egui::Color32::from_rgb(0xe0, 0xb3, 0x41), err);
+            } else {
+                ui.label(
+                    egui::RichText::new("Rendering preview…")
+                        .color(theme::MUTED)
+                        .size(12.0),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // ---- settings ---------------------------------------------------
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Aspect").color(theme::MUTED).size(12.0));
+                let current = app.export_settings().aspect;
+                egui::ComboBox::from_id_salt("export_aspect")
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for preset in crate::image_export::AspectPreset::ALL {
+                            if ui
+                                .selectable_label(preset == current, preset.label())
+                                .clicked()
+                                && preset != current
+                            {
+                                app.edit_export_settings().aspect = preset;
+                                reset_region = true;
+                            }
+                        }
+                    });
+
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("Long edge")
+                        .color(theme::MUTED)
+                        .size(12.0),
+                );
+                let mut long_edge = app.export_settings().long_edge;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut long_edge)
+                            .speed(16.0)
+                            .range(
+                                crate::image_export::MIN_LONG_EDGE
+                                    ..=crate::image_export::MAX_LONG_EDGE,
+                            )
+                            .suffix(" px"),
+                    )
+                    .changed()
+                {
+                    app.edit_export_settings().long_edge = long_edge;
+                }
+
+                ui.add_space(12.0);
+                let mut supersample = app.export_settings().supersample;
+                ui.label(egui::RichText::new("AA").color(theme::MUTED).size(12.0))
+                    .on_hover_text(
+                        "Supersampling: render this many times larger, then shrink.\n\
+                         The renderer has no MSAA, so this is what smooths the edges.",
+                    );
+                egui::ComboBox::from_id_salt("export_supersample")
+                    .selected_text(format!("{supersample}x"))
+                    .show_ui(ui, |ui| {
+                        for factor in [1u32, 2, 3] {
+                            if ui
+                                .selectable_label(factor == supersample, format!("{factor}x"))
+                                .clicked()
+                            {
+                                supersample = factor;
+                            }
+                        }
+                    });
+                if supersample != app.export_settings().supersample {
+                    app.edit_export_settings().supersample = supersample;
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let mut transparent = app.export_settings().transparent;
+                if ui
+                    .checkbox(&mut transparent, "Transparent background")
+                    .changed()
+                {
+                    app.edit_export_settings().transparent = transparent;
+                }
+                if !transparent {
+                    ui.add_space(10.0);
+                    let mut background = app.export_settings().background;
+                    if ui.color_edit_button_rgb(&mut background).changed() {
+                        app.edit_export_settings().background = background;
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            let (out_w, out_h) = app.export_output_size();
+            let region_note = match app.export_settings().region {
+                Some(_) => "region",
+                None => "whole view",
+            };
+            ui.label(
+                egui::RichText::new(format!("Output: {out_w} x {out_h} px  ({region_note})"))
+                    .color(theme::MUTED)
+                    .size(12.0),
+            );
+            if app.export_preview().is_some() {
+                if let Some(err) = app.export_error() {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(0xe0, 0xb3, 0x41), err);
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Save PNG…")
+                                .color(theme::ACCENT_FG)
+                                .size(12.5)
+                                .strong(),
+                        )
+                        .fill(theme::ACCENT)
+                        .corner_radius(egui::CornerRadius::same(7))
+                        .min_size(egui::vec2(110.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    save_requested = true;
+                }
+                if secondary_button(ui, "Whole view".to_string(), true).clicked() {
+                    clear_region = true;
+                }
+                if secondary_button(ui, "Close".to_string(), true).clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+
+    if reset_region {
+        app.reset_export_region_for_aspect();
+    }
+    if clear_region {
+        app.set_export_region(None);
+        app.set_export_drag_anchor(None);
+    }
+    if save_requested {
+        app.pick_export_image_path();
+    }
+    if !open || close_requested {
+        app.close_export_image_dialog();
+    }
+}
+
 pub fn render_menu_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::top("menu_bar")
         .frame(
@@ -250,6 +557,14 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             app.export_structure();
             ui.close();
         }
+        if ui
+            .button(format!("{} Export Image…", mi(MaterialIcon::Image)))
+            .on_hover_text("Ctrl+E — render the view to a PNG, optionally transparent")
+            .clicked()
+        {
+            app.open_export_image_dialog();
+            ui.close();
+        }
         ui.separator();
         if ui
             .button(format!("{} Update All", mi(MaterialIcon::Refresh)))
@@ -318,6 +633,7 @@ fn help_menu(ui: &mut egui::Ui) {
             "Ctrl+H   Toggle hbond",
             "Ctrl+Shift+A   Clear",
             "Ctrl+P   Command bar",
+            "Ctrl+E   Export image",
         ] {
             ui.label(egui::RichText::new(line).color(theme::MUTED).size(12.0));
         }

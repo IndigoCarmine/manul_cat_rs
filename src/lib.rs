@@ -19,6 +19,7 @@ pub mod axis_render;
 pub mod surface_mesh_render;
 
 pub mod component;
+pub mod image_export;
 pub mod parsing;
 pub mod selection;
 pub mod view_rs;

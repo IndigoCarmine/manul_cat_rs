@@ -11,6 +11,7 @@ use crate::parsing::{
 };
 use crate::axis_render::{AxisRender, AxisRenderState};
 use crate::component::ComponentState;
+use crate::image_export::{self, ExportSettings};
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
@@ -22,8 +23,8 @@ use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
 use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 use moleucle_3dview_rs::{
-    Atom, InteractiveMoleculeViewport, Molecule, SelectedAtomRender, ViewPortEvent,
-    ball_stick_radius, default_color_fn,
+    Atom, ImageExportRequest, InteractiveMoleculeViewport, Molecule, SelectedAtomRender,
+    ViewPortEvent, ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
 use std::collections::HashSet;
@@ -283,6 +284,41 @@ pub struct LogEntry {
 /// How many command-log lines and history entries are kept.
 const LOG_CAPACITY: usize = 200;
 const HISTORY_CAPACITY: usize = 200;
+
+/// Sphere/cylinder mesh resolution forced for a full-size export.
+///
+/// The interactive view runs a LOD that trades detail for frame rate, which is
+/// invisible at a few hundred pixels and unmistakably faceted at a couple of
+/// thousand. Only the final render pays for this; the preview keeps whatever the
+/// view is already on.
+const EXPORT_MESH_RESOLUTION: usize = 32;
+
+/// State behind the image-export dialog.
+///
+/// The dialog shows a small render of the current view, the user drags the
+/// region they want on it, and the export re-renders just that region at full
+/// size. Both renders go through
+/// [`InteractiveMoleculeViewport::render_image`], which resizes the shared color
+/// target and blocks on a GPU readback — so they are queued here and run at the
+/// top of the next frame, before the viewport draws itself.
+#[derive(Default)]
+struct ExportUiState {
+    open: bool,
+    settings: ExportSettings,
+    /// Cached preview, uploaded from the last preview render.
+    preview: Option<egui::TextureHandle>,
+    /// Viewport size the cached preview was rendered for; a window resize
+    /// invalidates it.
+    preview_view_size: (u32, u32),
+    /// Set when the preview no longer reflects the settings.
+    preview_dirty: bool,
+    /// Drag origin in normalised view coordinates while a region is being drawn.
+    drag_anchor: Option<[f32; 2]>,
+    /// Destination picked by the Save button, consumed on the next frame.
+    pending_save: Option<PathBuf>,
+    /// Last failure, shown inside the dialog.
+    error: Option<String>,
+}
 
 struct UiState {
     status_msg: String,
@@ -612,6 +648,9 @@ pub struct KuromameApp {
     /// renumbering that filtering produced.
     components: ComponentState,
     visibility: VisibilityState,
+    /// Image-export dialog state. Global, not per layer — it describes the
+    /// camera framing, which the viewport owns, not the structure.
+    export_ui: ExportUiState,
     /// Per-atom lookup tables for the command language, rebuilt lazily whenever
     /// the molecule itself changes (not on visibility-only rebuilds). Guarded by
     /// `atom_table_dirty`, mirroring the `bead_types_dirty` pattern.
@@ -847,6 +886,7 @@ impl KuromameApp {
             },
             components: ComponentState::default(),
             visibility: VisibilityState::default(),
+            export_ui: ExportUiState::default(),
             atom_table: None,
             atom_table_dirty: true,
             interaction_pairs: Vec::new(),
@@ -1302,6 +1342,214 @@ impl KuromameApp {
 
     pub fn toggle_command_log_expanded(&mut self) {
         self.ui.command_log_expanded = !self.ui.command_log_expanded;
+    }
+
+    // ------------------------------------------------------------ image export
+
+    pub fn export_dialog_open(&self) -> bool {
+        self.export_ui.open
+    }
+
+    /// Open the image-export dialog, queueing a first preview render.
+    pub fn open_export_image_dialog(&mut self) {
+        if self.molecule.is_none() {
+            self.set_status("Load a structure before exporting an image");
+            return;
+        }
+        self.export_ui.open = true;
+        self.export_ui.error = None;
+        self.export_ui.preview_dirty = true;
+    }
+
+    pub fn close_export_image_dialog(&mut self) {
+        self.export_ui.open = false;
+        self.export_ui.drag_anchor = None;
+        // Drop the cached preview so reopening cannot show a stale camera.
+        self.export_ui.preview = None;
+    }
+
+    pub fn export_settings(&self) -> &ExportSettings {
+        &self.export_ui.settings
+    }
+
+    /// Mutable settings plus the dirty flag, so the dialog can edit them without
+    /// having to remember to invalidate the preview.
+    pub fn edit_export_settings(&mut self) -> &mut ExportSettings {
+        self.export_ui.preview_dirty = true;
+        &mut self.export_ui.settings
+    }
+
+    pub fn export_preview(&self) -> Option<&egui::TextureHandle> {
+        self.export_ui.preview.as_ref()
+    }
+
+    pub fn export_error(&self) -> Option<&str> {
+        self.export_ui.error.as_deref()
+    }
+
+    pub fn export_drag_anchor(&self) -> Option<[f32; 2]> {
+        self.export_ui.drag_anchor
+    }
+
+    pub fn set_export_drag_anchor(&mut self, anchor: Option<[f32; 2]>) {
+        self.export_ui.drag_anchor = anchor;
+    }
+
+    /// On-screen viewport size in pixels, which every region calculation is
+    /// measured against.
+    pub fn viewport_pixel_size(&self) -> (u32, u32) {
+        self.viewport.viewport_size()
+    }
+
+    /// Size the export would come out at with the current settings.
+    pub fn export_output_size(&self) -> (u32, u32) {
+        self.export_ui
+            .settings
+            .output_size(self.viewport_pixel_size())
+    }
+
+    pub fn set_export_region(&mut self, region: Option<[f32; 4]>) {
+        self.export_ui.settings.region = region;
+        self.export_ui.preview_dirty = true;
+    }
+
+    /// Re-derive the region from the chosen aspect preset: a locked preset gets
+    /// the largest centred rectangle that fits, `Screen`/`Free` get the whole view.
+    pub fn reset_export_region_for_aspect(&mut self) {
+        let view = self.viewport_pixel_size();
+        let view_aspect = image_export::region_pixel_aspect([0.0, 0.0, 1.0, 1.0], view);
+        let ratio = self.export_ui.settings.aspect.ratio(view_aspect);
+        let region = image_export::centred_region(ratio, view);
+        self.set_export_region(region);
+    }
+
+    /// Queue a save to `path`; the render happens at the top of the next frame.
+    pub fn request_export_image(&mut self, path: PathBuf) {
+        self.export_ui.pending_save = Some(path);
+    }
+
+    /// Ask for a destination and queue the export. Blocks on the native dialog,
+    /// the same way [`Self::export_structure`] does.
+    pub fn pick_export_image_path(&mut self) {
+        let stem = self
+            .data
+            .structure_file_path
+            .as_ref()
+            .or(self.data.top_file_path.as_ref())
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "molecule".to_string());
+
+        if let Some(path) = FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .set_file_name(format!("{stem}.png"))
+            .set_title("Export image")
+            .save_file()
+        {
+            // `image::save` picks its encoder from the extension, so make sure
+            // there is one rather than failing after the render.
+            let path = if path.extension().is_none() {
+                path.with_extension("png")
+            } else {
+                path
+            };
+            self.request_export_image(path);
+        }
+    }
+
+    /// Run any queued preview/export render.
+    ///
+    /// Must be called *before* the viewport draws itself: `render_image` resizes
+    /// the shared color target, and `show` is what puts it back.
+    fn process_pending_image_export(&mut self, ctx: &egui::Context) {
+        if !self.export_ui.open && self.export_ui.pending_save.is_none() {
+            return;
+        }
+        // Cloning is cheap — RenderState is a bundle of Arcs — and it keeps the
+        // viewport borrow below independent of `self.render_state`.
+        let Some(render_state) = self.render_state.clone() else {
+            return;
+        };
+        let view = self.viewport.viewport_size();
+        if view.0 == 0 || view.1 == 0 {
+            return; // the viewport has not been laid out yet
+        }
+
+        // A window resize changes the view aspect, so both the preview and any
+        // centred region have to be recomputed.
+        if self.export_ui.preview_view_size != view {
+            self.export_ui.preview_view_size = view;
+            self.export_ui.preview_dirty = true;
+        }
+
+        if self.export_ui.open && self.export_ui.preview_dirty {
+            let (pw, ph) = self.export_ui.settings.preview_size(view);
+            let request = ImageExportRequest {
+                width: pw,
+                height: ph,
+                // The preview always shows the whole view — the region is chosen
+                // on top of it, so cropping it would be circular.
+                region: None,
+                clear_color: self.export_ui.settings.clear_color(),
+                supersample: 1,
+                // The preview is only a framing aid, and it re-renders on every
+                // settings change — leave the detail alone and keep it cheap.
+                mesh_resolution: None,
+            };
+            match self.viewport.render_image(&render_state, &request) {
+                Ok(image) => {
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width as usize, image.height as usize],
+                        &image.rgba,
+                    );
+                    self.export_ui.preview = Some(ctx.load_texture(
+                        "export_preview",
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    self.export_ui.error = None;
+                }
+                Err(err) => self.export_ui.error = Some(err),
+            }
+            self.export_ui.preview_dirty = false;
+        }
+
+        if let Some(path) = self.export_ui.pending_save.take() {
+            let (width, height) = self.export_ui.settings.output_size(view);
+            let request = ImageExportRequest {
+                width,
+                height,
+                region: self.export_ui.settings.region,
+                clear_color: self.export_ui.settings.clear_color(),
+                supersample: self.export_ui.settings.supersample,
+                // A figure gets blown up well past the on-screen size, where the
+                // interactive LOD's mesh reads as visibly faceted spheres.
+                mesh_resolution: Some(EXPORT_MESH_RESOLUTION),
+            };
+            let result = self
+                .viewport
+                .render_image(&render_state, &request)
+                .and_then(|image| {
+                    image_export::write_png(&path, image.width, image.height, image.rgba)
+                        .map(|()| (image.width, image.height))
+                });
+            match result {
+                Ok((w, h)) => {
+                    self.export_ui.error = None;
+                    self.export_ui.open = false;
+                    self.set_status(format!(
+                        "Saved {w}x{h} image to {}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    ));
+                }
+                Err(err) => {
+                    self.set_status("Image export failed");
+                    self.export_ui.error = Some(err);
+                }
+            }
+        }
     }
 
     /// Ask the UI to put keyboard focus in the command bar next frame.
@@ -2896,6 +3144,7 @@ impl KuromameApp {
                 ctrl && !shift && i.key_pressed(egui::Key::T),
                 ctrl && !shift && i.key_pressed(egui::Key::G),
                 ctrl && !shift && i.key_pressed(egui::Key::P),
+                ctrl && !shift && i.key_pressed(egui::Key::E),
             )
         });
 
@@ -2934,6 +3183,9 @@ impl KuromameApp {
             // command bar can only be reached by a request the UI picks up on
             // the next frame.
             self.ui.focus_command_bar = true;
+        }
+        if shortcuts.10 {
+            self.open_export_image_dialog();
         }
     }
 
@@ -4211,6 +4463,11 @@ impl eframe::App for KuromameApp {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(due_in));
         }
 
+        // Run any queued image-export render before the viewport is drawn: it
+        // resizes the shared color target, and `viewport.show` below is what
+        // puts it back to the on-screen size.
+        self.process_pending_image_export(&ctx);
+
         // egui 0.35: panels are shown into the root `ui`, not the context.
         app_ui::render_menu_bar(self, ui);
         app_ui::render_bottom_status_bar(self, ui);
@@ -4221,6 +4478,7 @@ impl eframe::App for KuromameApp {
         app_ui::render_overlay_panel(self, ui);
         app_ui::render_bottom_dock(self, ui);
         app_ui::render_edit_dialog(self, &ctx);
+        app_ui::render_export_dialog(self, &ctx);
 
         // Top-left overlay text: filename · frame.
         let overlay_label = if self.trajectory_frame_count() > 0 {

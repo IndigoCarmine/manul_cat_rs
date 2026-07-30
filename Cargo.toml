@@ -1,6 +1,6 @@
 [package]
 name = "manul_cat_rs"
-version = "0.7.5"
+version = "0.8.0"
 edition = "2024"
 # Raised from edition 2024's 1.85 by the egui-winit fork in [patch.crates-io].
 rust-version = "1.92"
@@ -11,7 +11,7 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.8.1" }
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.9.0" }
 
 eframe = "0.35.0"
 egui = "0.35.0"
