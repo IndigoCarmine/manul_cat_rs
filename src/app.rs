@@ -10,6 +10,10 @@ use crate::parsing::{
     XtcFile, XtcFrame,
 };
 use crate::axis_render::{AxisRender, AxisRenderState};
+use crate::component::ComponentState;
+use crate::selection::{
+    AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
+};
 use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
 use crate::surface_mesh_render::{SurfaceLayer, SurfaceMeshRender, SurfaceMeshState};
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
@@ -22,7 +26,7 @@ use moleucle_3dview_rs::{
     ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -258,14 +262,53 @@ struct NdxGroupUi {
     color: [f32; 3],
 }
 
+/// Severity of one line in the command log, which only drives its colour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One line of command output.
+///
+/// The status bar holds a single overwriting `String`, which cannot show a
+/// parse error's caret line or the several resolution notes one expression can
+/// produce — hence a real log alongside it.
+pub struct LogEntry {
+    pub level: LogLevel,
+    pub text: String,
+}
+
+/// How many command-log lines and history entries are kept.
+const LOG_CAPACITY: usize = 200;
+const HISTORY_CAPACITY: usize = 200;
+
 struct UiState {
     status_msg: String,
     show_edit_dialog: bool,
     new_res_name: String,
     hovered_atom_info: String,
     selector_input: String,
+    /// Contents of the bottom command bar.
+    command_input: String,
+    /// Commands as entered, oldest first. Global, not per layer — the history is
+    /// the user's, not the structure's.
+    command_history: Vec<String>,
+    /// Position while walking `command_history` with the arrow keys; `None` when
+    /// the user is editing a fresh line.
+    history_cursor: Option<usize>,
+    command_log: Vec<LogEntry>,
+    /// Set for one frame to pull keyboard focus into the command bar (Ctrl+P).
+    focus_command_bar: bool,
+    /// Whether the log area shows a few lines or a taller scroll.
+    command_log_expanded: bool,
     ndx_groups: Vec<NdxGroupUi>,
     ndx_visible: bool,
+    /// Alpha of the NDX highlight spheres in `0.0..=1.0`. Separate from the
+    /// layer's structure opacity, so a faded structure can still carry a solid
+    /// NDX colouring (and vice versa).
+    ndx_opacity: f32,
     ndx_selected_atom_count: usize,
 }
 
@@ -284,9 +327,12 @@ struct TrajectoryUiState {
     interp_sub: u32,
 }
 
-/// Per-residue-name show/hide state plus the index mapping between the full
-/// molecule (`self.molecule`, original indices) and the possibly-filtered
-/// molecule actually handed to the viewport (view indices).
+/// The index mapping between the full molecule (`self.molecule`, original
+/// indices) and the possibly-filtered molecule actually handed to the viewport
+/// (view indices).
+///
+/// Which atoms are filtered out is decided by [`ComponentState`]; this type
+/// only records the resulting renumbering.
 ///
 /// The maps are empty when nothing is hidden, which means "identity" — the
 /// viewport gets the full molecule and `to_view`/`to_orig` are no-ops. This
@@ -294,16 +340,11 @@ struct TrajectoryUiState {
 /// to before the feature existed.
 #[derive(Default)]
 struct VisibilityState {
-    res_visible: BTreeMap<String, bool>,
     view_to_orig: Vec<usize>,
     orig_to_view: Vec<Option<u32>>,
 }
 
 impl VisibilityState {
-    fn any_hidden(&self) -> bool {
-        self.res_visible.values().any(|&v| !v)
-    }
-
     fn is_filtered(&self) -> bool {
         !self.view_to_orig.is_empty()
     }
@@ -422,6 +463,9 @@ struct Layer {
     trajectory: Vec<XtcFrame>,
     trajectory_path: Option<PathBuf>,
     traj_ui: TrajectoryUiState,
+    /// This layer's COMPONENTS partition — its own splits, merges and show/hide
+    /// choices, independent of every other layer's.
+    components: ComponentState,
     visibility: VisibilityState,
     interaction_pairs: Vec<(usize, usize)>,
     surface_dots: Vec<Vec3>,
@@ -433,6 +477,7 @@ struct Layer {
     selector_input: String,
     ndx_groups: Vec<NdxGroupUi>,
     ndx_visible: bool,
+    ndx_opacity: f32,
     ndx_selected_atom_count: usize,
 }
 
@@ -460,6 +505,7 @@ impl Layer {
                 interp_steps: 1,
                 ..TrajectoryUiState::default()
             },
+            components: ComponentState::default(),
             visibility: VisibilityState::default(),
             interaction_pairs: Vec::new(),
             surface_dots: Vec::new(),
@@ -470,6 +516,7 @@ impl Layer {
             selector_input: String::new(),
             ndx_groups: Vec::new(),
             ndx_visible: true,
+            ndx_opacity: 1.0,
             ndx_selected_atom_count: 0,
         }
     }
@@ -559,7 +606,17 @@ pub struct KuromameApp {
     trajectory_path: Option<PathBuf>,
     base_molecule: Option<Molecule>,
     traj_ui: TrajectoryUiState,
+    /// The active layer's COMPONENTS partition: which named group every atom
+    /// belongs to and whether that group is drawn. Decides what
+    /// [`Self::rebuild_viewport`] filters out; `visibility` then records the
+    /// renumbering that filtering produced.
+    components: ComponentState,
     visibility: VisibilityState,
+    /// Per-atom lookup tables for the command language, rebuilt lazily whenever
+    /// the molecule itself changes (not on visibility-only rebuilds). Guarded by
+    /// `atom_table_dirty`, mirroring the `bead_types_dirty` pattern.
+    atom_table: Option<AtomTable>,
+    atom_table_dirty: bool,
     /// Inter-molecular interaction pairs (1-based, original indices) kept so they
     /// can be remapped whenever the visible set changes.
     interaction_pairs: Vec<(usize, usize)>,
@@ -764,8 +821,15 @@ impl KuromameApp {
                 new_res_name: String::new(),
                 hovered_atom_info: "Hover an atom for details".to_string(),
                 selector_input: String::new(),
+                command_input: String::new(),
+                command_history: Vec::new(),
+                history_cursor: None,
+                command_log: Vec::new(),
+                focus_command_bar: false,
+                command_log_expanded: false,
                 ndx_groups: Vec::new(),
                 ndx_visible: true,
+                ndx_opacity: 1.0,
                 ndx_selected_atom_count: 0,
             },
             hovered_atom,
@@ -781,7 +845,10 @@ impl KuromameApp {
                 interp_sub: 0,
                 last_advance_time: 0.0,
             },
+            components: ComponentState::default(),
             visibility: VisibilityState::default(),
+            atom_table: None,
+            atom_table_dirty: true,
             interaction_pairs: Vec::new(),
             surface_dots: Vec::new(),
             surface_visible: true,
@@ -1193,6 +1260,60 @@ impl KuromameApp {
         self.ui.status_msg = msg.into();
     }
 
+    /// Append to the command log, oldest lines falling off the front.
+    fn log(&mut self, level: LogLevel, text: impl Into<String>) {
+        self.ui.command_log.push(LogEntry {
+            level,
+            text: text.into(),
+        });
+        let overflow = self.ui.command_log.len().saturating_sub(LOG_CAPACITY);
+        if overflow > 0 {
+            self.ui.command_log.drain(..overflow);
+        }
+    }
+
+    fn log_info(&mut self, text: impl Into<String>) {
+        self.log(LogLevel::Info, text);
+    }
+
+    fn log_error(&mut self, text: impl Into<String>) {
+        self.log(LogLevel::Error, text);
+    }
+
+    pub fn command_log(&self) -> &[LogEntry] {
+        &self.ui.command_log
+    }
+
+    pub fn clear_command_log(&mut self) {
+        self.ui.command_log.clear();
+    }
+
+    pub fn command_input(&self) -> &str {
+        &self.ui.command_input
+    }
+
+    pub fn command_input_mut(&mut self) -> &mut String {
+        &mut self.ui.command_input
+    }
+
+    pub fn command_log_expanded(&self) -> bool {
+        self.ui.command_log_expanded
+    }
+
+    pub fn toggle_command_log_expanded(&mut self) {
+        self.ui.command_log_expanded = !self.ui.command_log_expanded;
+    }
+
+    /// Ask the UI to put keyboard focus in the command bar next frame.
+    pub fn request_command_focus(&mut self) {
+        self.ui.focus_command_bar = true;
+    }
+
+    /// Consume the pending focus request, if any.
+    pub fn take_command_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.ui.focus_command_bar)
+    }
+
     fn set_loaded_summary(&mut self, summary: impl Into<String>) {
         self.data.loaded_summary = summary.into();
     }
@@ -1227,7 +1348,7 @@ impl KuromameApp {
         };
 
         let pushed_positions: Vec<Vec3>;
-        if !self.visibility.any_hidden() {
+        if !self.components.any_hidden() {
             // Identity: hand over the full molecule, no remapping needed.
             self.visibility.view_to_orig.clear();
             self.visibility.orig_to_view.clear();
@@ -1238,9 +1359,7 @@ impl KuromameApp {
             let mut orig_to_view: Vec<Option<u32>> = vec![None; full.atoms.len()];
             let mut atoms: Vec<Atom> = Vec::new();
             for (orig, atom) in full.atoms.iter().enumerate() {
-                let res = atom.res_name().unwrap_or("");
-                let visible = self.visibility.res_visible.get(res).copied().unwrap_or(true);
-                if visible {
+                if self.components.is_atom_visible(orig) {
                     orig_to_view[orig] = Some(view_to_orig.len() as u32);
                     view_to_orig.push(orig);
                     atoms.push(atom.clone());
@@ -1441,58 +1560,332 @@ impl KuromameApp {
         }
     }
 
-    /// Refresh the set of residue names known to the UI from the current
-    /// molecule, keeping any existing show/hide choices for names that persist.
-    fn refresh_res_names(&mut self) {
+    /// Bring the COMPONENTS partition in line with the current molecule.
+    ///
+    /// A partition whose atom count still matches is *kept* — that is what lets
+    /// a user's splits and merges survive a trajectory frame or a reload of the
+    /// same system. Anything else is rebuilt into the default
+    /// one-component-per-residue-name layout, which is exactly what the old
+    /// `refresh_res_names` produced, so a fresh load looks unchanged.
+    fn refresh_components(&mut self) {
         let Some(mol) = self.molecule.as_ref() else {
             return;
         };
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for atom in &mol.atoms {
-            seen.insert(atom.res_name().unwrap_or("").to_string());
+        if self.components.matches_atom_count(mol.atoms.len()) && !self.components.is_empty() {
+            return;
         }
-        self.visibility.res_visible.retain(|name, _| seen.contains(name));
-        for name in seen {
-            self.visibility.res_visible.entry(name).or_insert(true);
+        let had_components = !self.components.is_empty();
+        let mol = mol.clone();
+        let previous_atoms = self.components.atom_count();
+        self.components.rebuild_from_molecule(&mol);
+        self.atom_table_dirty = true;
+        if had_components {
+            self.log_info(format!(
+                "components reset (atom count changed {} -> {})",
+                previous_atoms,
+                mol.atoms.len()
+            ));
         }
     }
 
-    /// Residue names with their current visibility, for the UI panel.
-    pub fn res_visibility_list(&self) -> Vec<(String, bool)> {
-        self.visibility
-            .res_visible
+    /// Components with their visibility and size, for the UI panel.
+    pub fn component_list(&self) -> Vec<(String, bool, usize)> {
+        self.components
+            .components()
             .iter()
-            .map(|(name, &visible)| (name.clone(), visible))
+            .map(|c| (c.name.clone(), c.visible, c.atoms.len()))
             .collect()
     }
 
-    pub fn has_res_names(&self) -> bool {
-        !self.visibility.res_visible.is_empty()
+    pub fn has_components(&self) -> bool {
+        !self.components.is_empty()
     }
 
-    pub fn set_res_visible(&mut self, name: &str, visible: bool) {
-        if let Some(entry) = self.visibility.res_visible.get_mut(name) {
-            if *entry != visible {
-                *entry = visible;
+    pub fn set_component_visible(&mut self, name: &str, visible: bool) {
+        if matches!(self.components.set_visible(name, visible), Ok(true)) {
+            self.rebuild_viewport(false);
+        }
+    }
+
+    pub fn set_all_components_visible(&mut self, visible: bool) {
+        if self.components.set_all_visible(visible) {
+            self.rebuild_viewport(false);
+        }
+    }
+
+    /// (Re)build the per-atom lookup tables the command language evaluates
+    /// against. Cheap to call; does nothing unless the molecule changed.
+    fn ensure_atom_table(&mut self) {
+        if !self.atom_table_dirty && self.atom_table.is_some() {
+            return;
+        }
+        if let Some(mol) = self.molecule.as_ref() {
+            self.atom_table = Some(AtomTable::from_molecule(mol));
+            self.atom_table_dirty = false;
+        }
+    }
+
+    /// Evaluate an expression against the current molecule, logging how each
+    /// bare word resolved. Returns the matched atoms as original indices.
+    fn eval_expr(&mut self, expr: &crate::selection::Expr) -> Option<Vec<u32>> {
+        self.ensure_atom_table();
+        // Move the table out so `&mut self` stays available for logging; it is
+        // put straight back, and nothing in between can observe the gap.
+        let Some(table) = self.atom_table.take() else {
+            self.log_error("no molecule loaded");
+            return None;
+        };
+        let pairs = self.components.name_atom_pairs();
+        let selected = self.selection.selected_atom_indices.clone();
+        let mut notes = Vec::new();
+        let result = {
+            let ctx = EvalCtx {
+                table: &table,
+                components: &pairs,
+                selected: &selected,
+            };
+            evaluate(expr, &ctx, &mut notes)
+        };
+        self.atom_table = Some(table);
+
+        for note in notes {
+            self.log_info(format!("  {note}"));
+        }
+        match result {
+            Ok(mask) => Some(to_indices(&mask)),
+            Err(err) => {
+                self.log_error(err.to_string());
+                self.set_status("Selection failed");
+                None
+            }
+        }
+    }
+
+    /// Run one line from the command bar.
+    ///
+    /// Everything here is display-only: components are regrouped, but no PDB /
+    /// GRO / TOP record is touched and `mark_modified` is deliberately not
+    /// called, so splitting and merging never dirties the user's files.
+    pub fn run_command(&mut self, input: &str) {
+        let line = input.trim().to_string();
+        if line.is_empty() {
+            return;
+        }
+        self.push_history(&line);
+        self.log_info(format!("> {line}"));
+
+        let stmt = match parse_statement(&line) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                // The `> {line}` echo above already shows the input, so log only
+                // the caret and hint.
+                self.log_error(err.caret(&line));
+                self.set_status(err.to_string());
+                return;
+            }
+        };
+
+        // Everything except `list`/`help` needs a structure to talk about.
+        let needs_molecule = !matches!(stmt, Statement::List | Statement::Help);
+        if needs_molecule && self.molecule.is_none() {
+            self.log_error("no molecule loaded");
+            self.set_status("No molecule loaded");
+            return;
+        }
+
+        match stmt {
+            Statement::Count(expr) => {
+                if let Some(atoms) = self.eval_expr(&expr) {
+                    let msg = format!("matched {} atoms", atoms.len());
+                    self.log_info(format!("  {msg}"));
+                    self.set_status(msg);
+                }
+            }
+
+            Statement::Assign { name, expr } => {
+                let Some(atoms) = self.eval_expr(&expr) else {
+                    return;
+                };
+                if atoms.is_empty() {
+                    self.log_error(format!("'{name}' not created: the selection matched 0 atoms"));
+                    self.set_status("Selection matched 0 atoms");
+                    return;
+                }
+                let outcome = match self.components.assign(
+                    &name,
+                    &atoms,
+                    Some(line.clone()),
+                    self.molecule.as_ref().expect("checked above"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.fail(err.to_string());
+                        return;
+                    }
+                };
+                let verb = if outcome.created { "created" } else { "updated" };
+                let mut msg = format!("{name}: {verb}, {} atoms", outcome.claimed);
+                if !outcome.absorbed.is_empty() {
+                    msg.push_str(&format!(" (merged in {})", outcome.absorbed.join(", ")));
+                }
+                self.log_info(format!("  {msg}"));
+                self.set_status(msg);
                 self.rebuild_viewport(false);
             }
+
+            Statement::Show(targets) => self.apply_visibility(targets, true),
+            Statement::Hide(targets) => self.apply_visibility(targets, false),
+
+            Statement::Only(name) => match self.components.only(&name) {
+                Ok(()) => {
+                    self.set_status(format!("Showing only {name}"));
+                    self.rebuild_viewport(false);
+                }
+                Err(err) => self.fail(err.to_string()),
+            },
+
+            Statement::Del(names) => {
+                let mut moved = 0usize;
+                for name in &names {
+                    match self
+                        .components
+                        .dissolve(name, self.molecule.as_ref().expect("checked above"))
+                    {
+                        Ok(count) => moved += count,
+                        Err(err) => {
+                            self.fail(err.to_string());
+                            return;
+                        }
+                    }
+                }
+                let msg = format!("dissolved {} ({moved} atoms returned)", names.join(", "));
+                self.log_info(format!("  {msg}"));
+                self.set_status(msg);
+                self.rebuild_viewport(false);
+            }
+
+            Statement::Rename { from, to } => match self.components.rename(&from, &to) {
+                Ok(()) => self.set_status(format!("Renamed {from} to {to}")),
+                Err(err) => self.fail(err.to_string()),
+            },
+
+            Statement::List => {
+                if self.components.is_empty() {
+                    self.log_info("  (no components — load a structure)");
+                    return;
+                }
+                for (name, visible, count) in self.component_list() {
+                    let label = if name.is_empty() { "(no residue)" } else { &name };
+                    let source = self
+                        .components
+                        .find(&name)
+                        .and_then(|i| self.components.components()[i].source.clone())
+                        .map(|s| format!("   {s}"))
+                        .unwrap_or_default();
+                    self.log_info(format!(
+                        "  {label:<14} {count:>8} atoms  {}{source}",
+                        if visible { "shown " } else { "hidden" }
+                    ));
+                }
+                self.set_status(format!("{} components", self.components.len()));
+            }
+
+            Statement::Reset => {
+                let mol = self.molecule.clone().expect("checked above");
+                self.components.rebuild_from_molecule(&mol);
+                let msg = format!("reset to {} residue components", self.components.len());
+                self.log_info(format!("  {msg}"));
+                self.set_status(msg);
+                self.rebuild_viewport(false);
+            }
+
+            Statement::Help => {
+                for line in HELP_TEXT.lines() {
+                    self.log_info(line);
+                }
+            }
         }
     }
 
-    pub fn set_all_res_visible(&mut self, visible: bool) {
-        let mut changed = false;
-        for value in self.visibility.res_visible.values_mut() {
-            if *value != visible {
-                *value = visible;
-                changed = true;
+    /// Shared tail of `show` / `hide`.
+    fn apply_visibility(&mut self, targets: Targets, visible: bool) {
+        let word = if visible { "Showing" } else { "Hiding" };
+        let changed = match targets {
+            Targets::All => {
+                let changed = self.components.set_all_visible(visible);
+                self.set_status(format!("{word} all components"));
+                changed
             }
-        }
+            Targets::Named(names) => {
+                let mut changed = false;
+                for name in &names {
+                    match self.components.set_visible(name, visible) {
+                        Ok(did) => changed |= did,
+                        Err(err) => {
+                            self.fail(err.to_string());
+                            return;
+                        }
+                    }
+                }
+                self.set_status(format!("{word} {}", names.join(", ")));
+                changed
+            }
+        };
+        // A rebuild re-uploads the whole molecule; skip it when the command was
+        // a no-op (hiding what is already hidden).
         if changed {
             self.rebuild_viewport(false);
         }
     }
 
+    /// Report a command failure to both the log and the status bar.
+    fn fail(&mut self, msg: String) {
+        self.log_error(format!("  {msg}"));
+        self.set_status(msg);
+    }
+
+    /// Record a command, skipping an immediate repeat so holding Enter does not
+    /// fill the history with one line.
+    fn push_history(&mut self, line: &str) {
+        self.ui.history_cursor = None;
+        if self.ui.command_history.last().map(String::as_str) == Some(line) {
+            return;
+        }
+        self.ui.command_history.push(line.to_string());
+        let overflow = self
+            .ui
+            .command_history
+            .len()
+            .saturating_sub(HISTORY_CAPACITY);
+        if overflow > 0 {
+            self.ui.command_history.drain(..overflow);
+        }
+    }
+
+    /// Step through the command history. `delta` is -1 for older, +1 for newer.
+    /// Walking past the newest entry restores an empty line.
+    pub fn recall_history(&mut self, delta: i32) {
+        if self.ui.command_history.is_empty() {
+            return;
+        }
+        let last = self.ui.command_history.len() - 1;
+        self.ui.history_cursor = match (self.ui.history_cursor, delta) {
+            (None, d) if d < 0 => Some(last),
+            (None, _) => None,
+            (Some(i), d) if d < 0 => Some(i.saturating_sub(1)),
+            (Some(i), _) if i >= last => None,
+            (Some(i), _) => Some(i + 1),
+        };
+        self.ui.command_input = match self.ui.history_cursor {
+            Some(i) => self.ui.command_history[i].clone(),
+            None => String::new(),
+        };
+    }
+
     fn post_load_cleanup(&mut self) {
+        // A new structure invalidates the command language's per-atom tables
+        // even when the atom count happens to match the old one.
+        self.atom_table_dirty = true;
         // A newly loaded structure may have a different atom count than a
         // trajectory still held from an earlier file. Applying that trajectory
         // would either index the new molecule with stale positions or silently
@@ -1519,14 +1912,12 @@ impl KuromameApp {
         // indices refer to the old molecule); clear it so `rebuild_viewport`
         // does not project stale indices onto the new geometry.
         self.selection.selected_atom_indices.clear();
-        self.refresh_res_names();
+        self.refresh_components();
         // When a dot surface is present, draw it through the dedicated surface
         // renderer and hide the raw "DOT" atoms from the main geometry so they
         // do not show up as a blob of large spheres on top of the surface.
         if !self.surface_dots.is_empty() {
-            self.visibility
-                .res_visible
-                .insert(SURFACE_RES_NAME.to_string(), false);
+            let _ = self.components.set_visible(SURFACE_RES_NAME, false);
         }
         self.refresh_surface_state();
         self.sync_viewer_molecule_and_focus();
@@ -1674,6 +2065,7 @@ impl KuromameApp {
         self.layers[a].trajectory = std::mem::take(&mut self.trajectory);
         self.layers[a].trajectory_path = self.trajectory_path.take();
         self.layers[a].traj_ui = std::mem::take(&mut self.traj_ui);
+        self.layers[a].components = std::mem::take(&mut self.components);
         self.layers[a].visibility = std::mem::take(&mut self.visibility);
         self.layers[a].interaction_pairs = std::mem::take(&mut self.interaction_pairs);
         self.layers[a].surface_dots = std::mem::take(&mut self.surface_dots);
@@ -1684,6 +2076,7 @@ impl KuromameApp {
         self.layers[a].selector_input = std::mem::take(&mut self.ui.selector_input);
         self.layers[a].ndx_groups = std::mem::take(&mut self.ui.ndx_groups);
         self.layers[a].ndx_visible = self.ui.ndx_visible;
+        self.layers[a].ndx_opacity = self.ui.ndx_opacity;
         self.layers[a].ndx_selected_atom_count = self.ui.ndx_selected_atom_count;
     }
 
@@ -1699,7 +2092,11 @@ impl KuromameApp {
         self.trajectory = std::mem::take(&mut self.layers[idx].trajectory);
         self.trajectory_path = self.layers[idx].trajectory_path.take();
         self.traj_ui = std::mem::take(&mut self.layers[idx].traj_ui);
+        self.components = std::mem::take(&mut self.layers[idx].components);
         self.visibility = std::mem::take(&mut self.layers[idx].visibility);
+        // The incoming layer's atom table has to be rebuilt for its molecule.
+        self.atom_table = None;
+        self.atom_table_dirty = true;
         self.interaction_pairs = std::mem::take(&mut self.layers[idx].interaction_pairs);
         self.surface_dots = std::mem::take(&mut self.layers[idx].surface_dots);
         self.surface_visible = self.layers[idx].surface_visible;
@@ -1711,6 +2108,7 @@ impl KuromameApp {
         self.ui.selector_input = std::mem::take(&mut self.layers[idx].selector_input);
         self.ui.ndx_groups = std::mem::take(&mut self.layers[idx].ndx_groups);
         self.ui.ndx_visible = self.layers[idx].ndx_visible;
+        self.ui.ndx_opacity = self.layers[idx].ndx_opacity;
         self.ui.ndx_selected_atom_count = self.layers[idx].ndx_selected_atom_count;
     }
 
@@ -1777,22 +2175,13 @@ impl KuromameApp {
             let Some(mol) = layer.molecule.as_ref() else {
                 continue;
             };
-            let filtered = layer.visibility.any_hidden();
+            let filtered = layer.components.any_hidden();
             let atoms: Vec<OverlayAtom> = mol
                 .atoms
                 .iter()
-                .filter(|atom| {
-                    !filtered || {
-                        let res = atom.res_name().unwrap_or("");
-                        layer
-                            .visibility
-                            .res_visible
-                            .get(res)
-                            .copied()
-                            .unwrap_or(true)
-                    }
-                })
-                .map(|a| {
+                .enumerate()
+                .filter(|(orig, _)| !filtered || layer.components.is_atom_visible(*orig))
+                .map(|(_, a)| {
                     let (r, g, b, _) = default_color_fn(a, false);
                     OverlayAtom {
                         position: a.position,
@@ -2072,6 +2461,7 @@ impl KuromameApp {
         self.viewport.set_state_by_type(NdxSelectionState {
             groups,
             visible: self.ui.ndx_visible,
+            opacity: self.ui.ndx_opacity,
         });
     }
 
@@ -2271,6 +2661,23 @@ impl KuromameApp {
 
     pub fn set_ndx_visible(&mut self, visible: bool) {
         self.ui.ndx_visible = visible;
+        self.refresh_ndx_selection_state();
+    }
+
+    /// Alpha of the NDX highlight spheres in `0.0..=1.0`. Held per layer and
+    /// independent of [`layer_opacity`](Self::layer_opacity), which fades the
+    /// structure itself.
+    pub fn ndx_opacity(&self) -> f32 {
+        self.ui.ndx_opacity
+    }
+
+    /// Set the NDX highlight alpha (clamped to `0.0..=1.0`) for the active layer.
+    pub fn set_ndx_opacity(&mut self, opacity: f32) {
+        let clamped = opacity.clamp(0.0, 1.0);
+        if self.ui.ndx_opacity == clamped {
+            return;
+        }
+        self.ui.ndx_opacity = clamped;
         self.refresh_ndx_selection_state();
     }
 
@@ -2488,6 +2895,7 @@ impl KuromameApp {
                 ctrl && shift && i.key_pressed(egui::Key::A),
                 ctrl && !shift && i.key_pressed(egui::Key::T),
                 ctrl && !shift && i.key_pressed(egui::Key::G),
+                ctrl && !shift && i.key_pressed(egui::Key::P),
             )
         });
 
@@ -2520,6 +2928,12 @@ impl KuromameApp {
         }
         if shortcuts.8 {
             self.open_gro_file();
+        }
+        if shortcuts.9 {
+            // Nothing else in the app grabs keyboard focus on its own, so the
+            // command bar can only be reached by a request the UI picks up on
+            // the next frame.
+            self.ui.focus_command_bar = true;
         }
     }
 
@@ -2601,6 +3015,9 @@ impl KuromameApp {
     }
 
     fn sync_viewer_resnames_from_loaded_files(&mut self) {
+        // Residue names feed both the default component names and `resname`
+        // selections, so any rewrite here invalidates the cached atom table.
+        self.atom_table_dirty = true;
         let viewer_atom_count = self
             .molecule
             .as_ref()
@@ -3368,7 +3785,8 @@ impl KuromameApp {
             self.molecule = Some(mol);
             // The base molecule was swapped in; its bead types may differ.
             self.bead_types_dirty = true;
-            self.refresh_res_names();
+            self.atom_table_dirty = true;
+            self.refresh_components();
             self.sync_viewer_molecule();
         }
     }
@@ -3697,9 +4115,25 @@ impl KuromameApp {
         self.sync_viewer_resnames_from_loaded_files();
         self.mark_modified();
 
+        // The renamed atoms belong under a different residue now. While the
+        // partition is still the residue-derived default, re-derive it so the
+        // new name shows up in COMPONENTS as it always has. Once the user has
+        // split or merged anything by hand, their grouping wins — silently
+        // throwing it away would be worse than leaving it stale, so say so.
+        if self.components.is_default_partition() {
+            if let Some(mol) = self.molecule.clone() {
+                self.components.rebuild_from_molecule(&mol);
+            }
+        } else {
+            self.log_info(
+                "residue names changed; COMPONENTS kept as-is (run 'reset' to re-derive)",
+            );
+        }
+
         // Clear selection
         self.selection.selected_atom_indices.clear();
         self.sync_selection_to_viewport();
+        self.rebuild_viewport(false);
         self.set_status("Residue names updated");
     }
 
@@ -3780,6 +4214,9 @@ impl eframe::App for KuromameApp {
         // egui 0.35: panels are shown into the root `ui`, not the context.
         app_ui::render_menu_bar(self, ui);
         app_ui::render_bottom_status_bar(self, ui);
+        // Shown after the status bar so it stacks directly above it, and before
+        // the left panel so it spans the full window width.
+        app_ui::render_command_bar(self, ui);
         app_ui::render_left_panel(self, ui);
         app_ui::render_overlay_panel(self, ui);
         app_ui::render_bottom_dock(self, ui);

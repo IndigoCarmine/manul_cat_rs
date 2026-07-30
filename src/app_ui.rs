@@ -317,9 +317,16 @@ fn help_menu(ui: &mut egui::Ui) {
             "Ctrl+B   Select path",
             "Ctrl+H   Toggle hbond",
             "Ctrl+Shift+A   Clear",
+            "Ctrl+P   Command bar",
         ] {
             ui.label(egui::RichText::new(line).color(theme::MUTED).size(12.0));
         }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Type 'help' in the command bar for the\ncomponent syntax.")
+                .color(theme::MUTED2)
+                .size(11.5),
+        );
     });
 }
 
@@ -498,13 +505,13 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
     section_label(ui, "COMPONENTS");
     ui.add_space(6.0);
 
-    if app.has_res_names() {
+    if app.has_components() {
         ui.horizontal(|ui| {
             if secondary_button(ui, "Show all".to_string(), true).clicked() {
-                app.set_all_res_visible(true);
+                app.set_all_components_visible(true);
             }
             if secondary_button(ui, "Hide all".to_string(), true).clicked() {
-                app.set_all_res_visible(false);
+                app.set_all_components_visible(false);
             }
         });
         ui.add_space(4.0);
@@ -513,9 +520,9 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
             .id_salt("res_visibility_scroll")
             .max_height(260.0)
             .show(ui, |ui| {
-                let rows = app.res_visibility_list();
+                let rows = app.component_list();
                 let mut toggles: Vec<(String, bool)> = Vec::new();
-                for (name, visible) in &rows {
+                for (name, visible, count) in &rows {
                     let label = if name.is_empty() {
                         "(no residue)".to_string()
                     } else {
@@ -537,17 +544,27 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
                             .stroke(egui::Stroke::NONE)
                             .corner_radius(egui::CornerRadius::same(7)),
                     );
+                    // The atom count is painted right-aligned inside the row's
+                    // own rect rather than added as a second widget, so it does
+                    // not steal clicks from the toggle button underneath.
+                    ui.painter().text(
+                        resp.rect.right_center() - egui::vec2(10.0, 0.0),
+                        egui::Align2::RIGHT_CENTER,
+                        count.to_string(),
+                        egui::FontId::proportional(11.0),
+                        theme::MUTED2,
+                    );
                     if resp.clicked() {
                         toggles.push((name.clone(), !visible));
                     }
                 }
                 for (name, vis) in toggles {
-                    app.set_res_visible(&name, vis);
+                    app.set_component_visible(&name, vis);
                 }
             });
     } else {
         ui.label(
-            egui::RichText::new("Load a structure to list residues")
+            egui::RichText::new("Load a structure to list components")
                 .color(theme::MUTED2)
                 .size(12.0),
         );
@@ -586,6 +603,31 @@ fn components_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
         if ui.checkbox(&mut ndx_visible, "Show NDX groups").changed() {
             app.set_ndx_visible(ndx_visible);
         }
+        ui.add_space(6.0);
+
+        // Alpha of the highlight spheres only. The structure behind them keeps
+        // the layer's own OPACITY slider, so the two fade independently.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("OPACITY")
+                    .size(9.5)
+                    .color(theme::MUTED2)
+                    .strong(),
+            );
+            let mut op = app.ndx_opacity();
+            ui.spacing_mut().slider_width = (ui.available_width() - 44.0).max(60.0);
+            let resp = ui.add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false));
+            if resp.changed() {
+                app.set_ndx_opacity(op);
+            }
+            ui.label(
+                egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
+                    .size(11.0)
+                    .color(theme::MUTED),
+            );
+        })
+        .response
+        .on_hover_text("Transparency of the NDX colouring, independent of the structure's opacity");
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
@@ -889,9 +931,10 @@ fn render_layers_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
                     });
 
                     // Opacity: fades the main molecule for the active layer, or
-                    // the sphere overlay for the others.
+                    // the sphere overlay for the others. The NDX highlight has
+                    // its own slider and is not affected by this one.
                     ui.add_space(9.0);
-                    ui.horizontal(|ui| {
+                    let op_row = ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("OPACITY")
                                 .size(9.5)
@@ -911,6 +954,9 @@ fn render_layers_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
                                 .color(theme::MUTED),
                         );
                     });
+                    op_row
+                        .response
+                        .on_hover_text("Structure opacity — NDX colouring has its own slider");
 
                     (toggle, remove_req, set_op)
                 });
@@ -1131,6 +1177,163 @@ fn trajectory_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
             app.set_trajectory_frame(frame_idx);
         }
     });
+}
+
+/// The shared command bar, stacked directly above the status bar.
+///
+/// It carries the COMPONENTS language today, but nothing about the bar is
+/// component-specific — later verbs (layers, NDX, export) belong here too.
+///
+/// The log above the input exists because `status_msg` is one overwriting
+/// `String`: it cannot show a parse error's caret line, and one expression can
+/// emit several name-resolution notes that would each clobber the last.
+pub fn render_command_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    egui::Panel::bottom("command_bar")
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(16, 6)),
+        )
+        .show(ui, |ui| {
+            let mut toggle_expand = false;
+            let mut clear_log = false;
+
+            if !app.command_log().is_empty() {
+                let expanded = app.command_log_expanded();
+                let max_height = if expanded { 240.0 } else { 68.0 };
+                egui::ScrollArea::vertical()
+                    .id_salt("command_log_scroll")
+                    .max_height(max_height)
+                    .auto_shrink([false, true])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for entry in app.command_log() {
+                            let color = match entry.level {
+                                crate::app::LogLevel::Info => theme::MUTED,
+                                crate::app::LogLevel::Warn => theme::AMBER,
+                                crate::app::LogLevel::Error => theme::AMBER,
+                            };
+                            // Monospace: the parse-error caret line only lines
+                            // up under its token in a fixed-width font.
+                            ui.label(
+                                egui::RichText::new(&entry.text)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(color),
+                            );
+                        }
+                    });
+                ui.add_space(4.0);
+            }
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(">")
+                        .monospace()
+                        .size(13.0)
+                        .color(theme::ACCENT)
+                        .strong(),
+                );
+
+                // Leave room for the two trailing buttons.
+                let field_width = (ui.available_width() - 96.0).max(120.0);
+                let input = ui.add_sized(
+                    egui::vec2(field_width, 26.0),
+                    egui::TextEdit::singleline(app.command_input_mut())
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("DOM1 = PROT and resid 1-100        (help)"),
+                );
+
+                // Ctrl+P, handled in `handle_keyboard_shortcuts`, parks a
+                // one-frame request here — the same trick the resname dialog
+                // uses, since nothing else in the app grabs focus on its own.
+                if app.take_command_focus_request() {
+                    input.request_focus();
+                }
+
+                if input.has_focus() {
+                    // Consume the arrow keys so the text field does not also act
+                    // on them, then move through the history.
+                    let up = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    });
+                    let down = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                    });
+                    if up || down {
+                        app.recall_history(if up { -1 } else { 1 });
+                        // Recall replaces the buffer behind the widget's back, so
+                        // park the caret at the end instead of leaving it at 0.
+                        let end = app.command_input().chars().count();
+                        if let Some(mut state) =
+                            egui::TextEdit::load_state(ui.ctx(), input.id)
+                        {
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(end),
+                            )));
+                            state.store(ui.ctx(), input.id);
+                        }
+                    }
+                }
+
+                let submitted =
+                    input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if submitted {
+                    let line = std::mem::take(app.command_input_mut());
+                    app.run_command(&line);
+                    // Keep focus so a run of commands can be typed without
+                    // reaching for the mouse between them. This has to go
+                    // through the same one-frame request Ctrl+P uses:
+                    // `Response::request_focus` here loses to egui's own
+                    // end-of-frame focus surrender on Enter, leaving the bar
+                    // dead until clicked.
+                    app.request_command_focus();
+                }
+
+                let icon = if app.command_log_expanded() {
+                    MaterialIcon::ExpandMore
+                } else {
+                    MaterialIcon::ExpandLess
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(mi(icon)).size(14.0).color(theme::MUTED),
+                        )
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE),
+                    )
+                    .on_hover_text("Expand / collapse the command log")
+                    .clicked()
+                {
+                    toggle_expand = true;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(mi(MaterialIcon::Delete))
+                                .size(14.0)
+                                .color(theme::MUTED),
+                        )
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE),
+                    )
+                    .on_hover_text("Clear the command log")
+                    .clicked()
+                {
+                    clear_log = true;
+                }
+            });
+
+            if toggle_expand {
+                app.toggle_command_log_expanded();
+            }
+            if clear_log {
+                app.clear_command_log();
+            }
+        });
 }
 
 pub fn render_bottom_status_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {

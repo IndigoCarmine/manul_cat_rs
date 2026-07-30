@@ -18,5 +18,7 @@ pub mod axis_render;
 #[path = "additional_render/surface_mesh_render.rs"]
 pub mod surface_mesh_render;
 
+pub mod component;
 pub mod parsing;
+pub mod selection;
 pub mod view_rs;

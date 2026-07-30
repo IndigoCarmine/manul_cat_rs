@@ -11,7 +11,7 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git" }
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.8.1" }
 
 eframe = "0.35.0"
 egui = "0.35.0"

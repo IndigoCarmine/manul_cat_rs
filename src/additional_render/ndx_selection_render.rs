@@ -18,10 +18,24 @@ pub struct NdxSelectionGroup {
 }
 
 /// State type for the NDX groups currently drawn, stored in SharedRenderStates.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NdxSelectionState {
     pub groups: Vec<NdxSelectionGroup>,
     pub visible: bool,
+    /// Alpha applied to every group's spheres, in `0.0..=1.0`. Independent of
+    /// the main molecule's opacity so the highlight can stay solid over a faded
+    /// structure (or the other way round).
+    pub opacity: f32,
+}
+
+impl Default for NdxSelectionState {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            visible: false,
+            opacity: 1.0,
+        }
+    }
 }
 
 impl NdxSelectionRender {
@@ -61,6 +75,11 @@ impl AdditionalRender for NdxSelectionRender {
             return;
         }
 
+        let alpha = state.opacity.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return;
+        }
+
         for group in &state.groups {
             for &atom_index in &group.atom_indices {
                 let Some(atom) = molecule.atoms.get(atom_index) else {
@@ -72,7 +91,7 @@ impl AdditionalRender for NdxSelectionRender {
                     frame_state,
                     atom.position,
                     self.radius,
-                    (group.color.0, group.color.1, group.color.2, 1.0),
+                    (group.color.0, group.color.1, group.color.2, alpha),
                 );
             }
         }
