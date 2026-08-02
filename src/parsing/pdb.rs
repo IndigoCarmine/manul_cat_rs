@@ -1,13 +1,10 @@
 use crate::view_rs::{AtomMeta, To3dViewMolecule, molecule_from_parts, view_atom};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::{Molecule, molecule::Bond};
+use moleucle_3dview_rs::{ANGSTROM_TO_NM, Molecule, NM_TO_ANGSTROM, molecule::Bond};
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use super::AtomRecord;
-
-const ANGSTROM_TO_NM: f32 = 0.1;
-const NM_TO_ANGSTROM: f32 = 10.0;
 
 /// Residue name that `gmx sasa` (and similar tools) use for the dots of a
 /// Connolly / solvent-accessible-surface point cloud embedded in a PDB.

@@ -1,10 +1,8 @@
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::{Molecule, molecule::Bond};
+use moleucle_3dview_rs::{ANGSTROM_TO_NM, Molecule, molecule::Bond};
 use std::collections::HashMap;
 use std::fmt::Write;
-
-const ANGSTROM_TO_NM: f32 = 0.1;
 
 // --- Mol2 Structures ---
 

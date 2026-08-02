@@ -69,3 +69,16 @@ assets = [
 [patch.crates-io]
 winit = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
 egui-winit = { git = "https://github.com/IndigoCarmine/egui-winit", branch = "main" }
+
+# --- Local development against the sibling moleucle_3dview_rs checkout ---
+# A git dependency is patched by its repository URL, not through
+# [patch.crates-io]; the key must match the URL in [dependencies] verbatim.
+#
+# The `version = "0.9.0"` on the dependency line still applies as `^0.9.0`, so
+# the local crate must stay 0.9.x for this patch to take effect. If it is ever
+# bumped to 0.10, bump the dependency line in the same commit — otherwise Cargo
+# quietly falls back to the git source and local edits stop having any effect.
+#
+# Remove this block (and re-pin the dependency to a `rev`) before release.
+[patch."https://github.com/IndigoCarmine/moleucle_3dview_rs.git"]
+moleucle_3dview_rs = { path = "../moleucle_3dview_rs" }
