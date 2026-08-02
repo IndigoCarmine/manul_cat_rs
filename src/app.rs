@@ -1,30 +1,22 @@
-use crate::layer_overlay_render::{
-    LayerOverlayGeom, LayerOverlayRender, LayerOverlayState, OverlayAtom,
-};
-use crate::inter_molecular_interaction_render::{
-    InterMolecularInteractionRender, InteractionPairsState,
-};
-use crate::ndx_selection_render::{NdxSelectionGroup, NdxSelectionRender, NdxSelectionState};
+use crate::component::ComponentState;
+use crate::image_export::{self, ExportSettings};
 use crate::parsing::{
     AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
     XtcFile, XtcFrame,
 };
-use crate::axis_render::{AxisRender, AxisRenderState};
-use crate::component::ComponentState;
-use crate::image_export::{self, ExportSettings};
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
-use crate::simulation_cell_render::{SimulationCellRender, SimulationCellRenderState};
-use crate::surface_mesh_render::{SurfaceLayer, SurfaceMeshRender, SurfaceMeshState};
 use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::additional_render::SelectedAtomRenderState;
 use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 use moleucle_3dview_rs::{
-    Atom, ImageExportRequest, InteractiveMoleculeViewport, Molecule, SelectedAtomRender,
-    ViewPortEvent, ball_stick_radius, default_color_fn,
+    Atom, AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
+    AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
+    PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRender,
+    SelectedAtomRenderState, SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender,
+    SphereSetState, ViewPortEvent, ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
 use std::collections::HashSet;
@@ -411,11 +403,7 @@ impl VisibilityState {
         }
         pairs
             .iter()
-            .filter_map(|&(a, b)| {
-                let va = self.to_view(a.checked_sub(1)?)?;
-                let vb = self.to_view(b.checked_sub(1)?)?;
-                Some((va + 1, vb + 1))
-            })
+            .filter_map(|&(a, b)| Some((self.to_view(a)?, self.to_view(b)?)))
             .collect()
     }
 }
@@ -687,8 +675,12 @@ pub struct KuromameApp {
     martini_visible: bool,
     /// Whether the XYZ orientation triad is drawn at the world origin. A global
     /// view preference (not per-layer); mirrored into the viewport's
-    /// [`AxisRenderState`] whenever it changes.
+    /// [`AxesState`] whenever it changes.
     axis_visible: bool,
+    /// Edge lengths of the active layer's simulation box, in nm; `(0, 0, 0)`
+    /// when there is none. Kept here because the axis triad is sized from it,
+    /// and the two overlay states have to be written together.
+    sim_cell: (f32, f32, f32),
     /// `false` once `bead_types` matches the current molecule/topology. Lets
     /// `recompute_bead_types` skip its O(atoms) rebuild (which re-expands the whole
     /// topology) on visibility-only viewport rebuilds — bead types depend on the
@@ -799,15 +791,18 @@ impl KuromameApp {
         Self::apply_visual_theme(&cc.egui_ctx);
         let mut viewport = InteractiveMoleculeViewport::new(None);
         viewport.add_additional_render_box(Box::new(SelectedAtomRender::new()));
-        viewport.add_additional_render_box(Box::new(InterMolecularInteractionRender::new()));
-        viewport.add_additional_render_box(Box::new(NdxSelectionRender::new()));
+        viewport.add_additional_render_box(Box::new(AtomPairRender::new()));
+        viewport.add_additional_render_box(Box::new(AtomGroupRender::new()));
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));
-        viewport.add_additional_render_box(Box::new(SurfaceMeshRender::new()));
-        viewport.add_additional_render_box(Box::new(LayerOverlayRender::new()));
-        viewport.add_additional_render_box(Box::new(AxisRender::new()));
+        viewport.add_additional_render_box(Box::new(PointCloudRender::new()));
+        viewport.add_additional_render_box(Box::new(SphereSetRender::new()));
+        viewport.add_additional_render_box(Box::new(AxesRender::new()));
         // Show the XYZ orientation triad by default so the coordinate frame is
         // always visible; the user can hide it from the view options.
-        viewport.set_state_by_type(AxisRenderState { visible: true });
+        viewport.set_state_by_type(AxesState {
+            visible: true,
+            length: None,
+        });
 
         let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let hovered_atom_for_handler = Arc::clone(&hovered_atom);
@@ -894,6 +889,7 @@ impl KuromameApp {
             bead_types_dirty: true,
             martini_visible: true,
             axis_visible: true,
+            sim_cell: (0.0, 0.0, 0.0),
             pending_pick: None,
             pending_load: None,
         }
@@ -1643,7 +1639,7 @@ impl KuromameApp {
     fn refresh_interaction_pairs(&mut self) {
         let pairs = self.visibility.map_pairs(&self.interaction_pairs);
         self.viewport
-            .set_state_by_type(InteractionPairsState { pairs });
+            .set_state_by_type(AtomPairState { pairs });
     }
 
     /// Re-derive the bead type of every atom in `self.molecule` (original-index
@@ -1777,11 +1773,11 @@ impl KuromameApp {
     }
 
     /// Show or hide the XYZ orientation triad. Pushes the new visibility to the
-    /// viewport's [`AxisRenderState`]; the axis render reads it on the next frame.
+    /// viewport's [`AxesState`]; the axis render reads it on the next frame.
     pub fn set_axis_visible(&mut self, visible: bool) {
         if self.axis_visible != visible {
             self.axis_visible = visible;
-            self.viewport.set_state_by_type(AxisRenderState { visible });
+            self.refresh_axes_state();
         }
     }
 
@@ -2153,9 +2149,9 @@ impl KuromameApp {
     /// Collect the base surface (if visible) and every visible overlay surface
     /// into a single layered render state and push it to the viewport.
     fn refresh_surface_state(&mut self) {
-        let mut layers: Vec<SurfaceLayer> = Vec::new();
+        let mut layers: Vec<PointCloudLayer> = Vec::new();
         if self.surface_visible && !self.surface_dots.is_empty() {
-            layers.push(SurfaceLayer {
+            layers.push(PointCloudLayer {
                 positions: self.surface_dots.clone(),
                 color: (
                     BASE_SURFACE_COLOR[0],
@@ -2166,13 +2162,13 @@ impl KuromameApp {
         }
         for overlay in &self.overlay_surfaces {
             if overlay.visible && !overlay.dots.is_empty() {
-                layers.push(SurfaceLayer {
+                layers.push(PointCloudLayer {
                     positions: overlay.dots.clone(),
                     color: (overlay.color[0], overlay.color[1], overlay.color[2]),
                 });
             }
         }
-        self.viewport.set_state_by_type(SurfaceMeshState { layers });
+        self.viewport.set_state_by_type(PointCloudState { layers });
     }
 
     /// Open a file dialog to add an overlay surface from a PDB with a dot surface.
@@ -2376,15 +2372,37 @@ impl KuromameApp {
         } else {
             (0.0, 0.0, 0.0)
         };
+        self.set_sim_cell(box_diag);
+    }
+
+    /// Push the simulation box to the viewport, and size the XYZ triad to match
+    /// so each coloured arm runs along the box edge leaving the origin.
+    ///
+    /// The two states are written together because the axis overlay takes its
+    /// length as an explicit input rather than reading the cell state itself —
+    /// that keeps the two overlays independent in the library.
+    fn set_sim_cell(&mut self, size: (f32, f32, f32)) {
+        self.sim_cell = size;
         self.viewport
-            .set_state_by_type(SimulationCellRenderState::new(box_diag));
+            .set_state_by_type(SimulationCellState::new(Vec3::new(size.0, size.1, size.2)));
+        self.refresh_axes_state();
+    }
+
+    /// Push the current axis visibility and triad length to the viewport.
+    fn refresh_axes_state(&mut self) {
+        let (x, y, z) = self.sim_cell;
+        let length = (x > 0.0 || y > 0.0 || z > 0.0).then(|| Vec3::new(x, y, z));
+        self.viewport.set_state_by_type(AxesState {
+            visible: self.axis_visible,
+            length,
+        });
     }
 
     /// Rebuild the sphere geometry for every non-active, visible layer and push
     /// it to the viewport. Respects each layer's own residue-visibility filter.
     fn refresh_layer_overlays(&mut self) {
         let active = self.active_layer;
-        let mut geoms: Vec<LayerOverlayGeom> = Vec::new();
+        let mut geoms: Vec<SphereSet> = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             if i == active || !layer.visible {
                 continue;
@@ -2393,14 +2411,14 @@ impl KuromameApp {
                 continue;
             };
             let filtered = layer.components.any_hidden();
-            let atoms: Vec<OverlayAtom> = mol
+            let atoms: Vec<OverlaySphere> = mol
                 .atoms
                 .iter()
                 .enumerate()
                 .filter(|(orig, _)| !filtered || layer.components.is_atom_visible(*orig))
                 .map(|(_, a)| {
                     let (r, g, b, _) = default_color_fn(a, false);
-                    OverlayAtom {
+                    OverlaySphere {
                         position: a.position,
                         radius: ball_stick_radius(&a.element, false),
                         // Element colour, faded by the layer's opacity (alpha).
@@ -2409,11 +2427,11 @@ impl KuromameApp {
                 })
                 .collect();
             if !atoms.is_empty() {
-                geoms.push(LayerOverlayGeom { atoms });
+                geoms.push(SphereSet { spheres: atoms });
             }
         }
         self.viewport
-            .set_state_by_type(LayerOverlayState { layers: geoms });
+            .set_state_by_type(SphereSetState { sets: geoms });
     }
 
     /// Switch which layer is active (drawn as the main molecule). No-op when the
@@ -2662,12 +2680,12 @@ impl KuromameApp {
 
         Self::resolve_ndx_overlaps(&mut atoms_per_group);
 
-        let groups: Vec<NdxSelectionGroup> = group_indices
+        let groups: Vec<AtomGroup> = group_indices
             .into_iter()
             .zip(atoms_per_group)
             .map(|(idx, atom_indices)| {
                 let [r, g, b] = self.ndx_group_color(idx);
-                NdxSelectionGroup {
+                AtomGroup {
                     atom_indices,
                     color: (r, g, b),
                 }
@@ -2675,7 +2693,7 @@ impl KuromameApp {
             .collect();
 
         self.ui.ndx_selected_atom_count = groups.iter().map(|g| g.atom_indices.len()).sum();
-        self.viewport.set_state_by_type(NdxSelectionState {
+        self.viewport.set_state_by_type(AtomGroupState {
             groups,
             visible: self.ui.ndx_visible,
             opacity: self.ui.ndx_opacity,
@@ -3410,8 +3428,7 @@ impl KuromameApp {
             self.interaction_pairs.clear();
             self.surface_dots.clear();
             self.set_molecule_and_frame(mol);
-            self.viewport
-                .set_state_by_type(SimulationCellRenderState::new(boxsize));
+            self.set_sim_cell(boxsize);
             return true;
         }
 
@@ -3439,8 +3456,7 @@ impl KuromameApp {
                 self.interaction_pairs = interaction_pairs;
                 self.surface_dots.clear();
                 self.set_molecule_and_frame(molecule);
-                self.viewport
-                    .set_state_by_type(SimulationCellRenderState::new(boxsize));
+                self.set_sim_cell(boxsize);
                 true
             }
             Err(err) => {
@@ -3703,8 +3719,7 @@ impl KuromameApp {
         let boxsize = gro.box_line;
         self.data.structure_file = Some(StructureFile::Gro(gro));
         self.data.structure_file_path = Some(path);
-        self.viewport
-            .set_state_by_type(SimulationCellRenderState::new(boxsize));
+        self.set_sim_cell(boxsize);
 
         let mut built = true;
         if self.data.top_file.is_some() {
@@ -3960,8 +3975,7 @@ impl KuromameApp {
     /// reusing the current molecule's bonds/metadata/camera when the atom count
     /// matches. Shared by exact and interpolated frame display.
     fn apply_positions(&mut self, positions: Vec<Vec3>, box_diag: (f32, f32, f32)) {
-        self.viewport
-            .set_state_by_type(SimulationCellRenderState::new(box_diag));
+        self.set_sim_cell(box_diag);
 
         let same_atom_count = self
             .molecule

@@ -497,11 +497,16 @@ impl TopFile {
                 .filter(|line| matches!(line, TopLine::IntermolecularInteraction(_)))
                 .count()
         );
+        // GROMACS numbers atoms from 1; convert here so nothing downstream has
+        // to remember which convention a pair is in. A serial of 0 is malformed
+        // and is dropped rather than wrapping to usize::MAX.
         let intermolecular_pairs: Vec<(usize, usize)> = self
             .lines
             .iter()
             .filter_map(|line| match line {
-                TopLine::IntermolecularInteraction(bond) => Some((bond.ai, bond.aj)),
+                TopLine::IntermolecularInteraction(bond) => {
+                    Some((bond.ai.checked_sub(1)?, bond.aj.checked_sub(1)?))
+                }
                 _ => None,
             })
             .collect();
