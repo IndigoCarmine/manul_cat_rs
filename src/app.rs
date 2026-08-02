@@ -695,13 +695,6 @@ pub struct KuromameApp {
     /// molecule and topology, not on which residues are hidden. Set whenever atom
     /// identity or the topology changes.
     bead_types_dirty: bool,
-    /// Monotonic counter bumped on every viewport rebuild. Used to give each
-    /// filtered molecule a distinct generation so the renderer's geometry cache
-    /// (keyed on `(molecule_ptr, generation, …)`) actually rebuilds when the
-    /// visible atom set changes — otherwise hiding/showing residues has no
-    /// visible effect because every filtered molecule starts at generation 0 and
-    /// lives at the same viewer address.
-    view_revision: u64,
     /// Receiver for an in-flight file dialog running on a background thread, so
     /// the UI keeps rendering while the native picker is open. `update`/`ui`
     /// polls this and dispatches the chosen path(s) to the matching loader.
@@ -901,7 +894,6 @@ impl KuromameApp {
             bead_types_dirty: true,
             martini_visible: true,
             axis_visible: true,
-            view_revision: 0,
             pending_pick: None,
             pending_load: None,
         }
@@ -1595,12 +1587,10 @@ impl KuromameApp {
             return;
         };
 
-        let pushed_positions: Vec<Vec3>;
         if !self.components.any_hidden() {
             // Identity: hand over the full molecule, no remapping needed.
             self.visibility.view_to_orig.clear();
             self.visibility.orig_to_view.clear();
-            pushed_positions = full.atoms.iter().map(|a| a.position).collect();
             self.viewport.set_molecule(full.clone());
         } else {
             let mut view_to_orig: Vec<usize> = Vec::with_capacity(full.atoms.len());
@@ -1633,21 +1623,8 @@ impl KuromameApp {
             }
             self.visibility.view_to_orig = view_to_orig;
             self.visibility.orig_to_view = orig_to_view;
-            pushed_positions = atoms.iter().map(|a| a.position).collect();
             self.viewport.set_molecule(molecule_from_parts(atoms, bonds));
         }
-
-        // `set_molecule` always installs a molecule at generation 0, and the
-        // viewer stores it at a fixed address, so two successive filtered
-        // molecules would share the renderer's geometry-cache key and the view
-        // would not update. Bump the generation to a value that cycles so each
-        // rebuild differs from the previous one, forcing a cache miss. The
-        // position payload is unchanged; only the generation counter advances.
-        let bump = (self.view_revision % 4) + 1;
-        for _ in 0..bump {
-            let _ = self.viewport.update_positions(&pushed_positions);
-        }
-        self.view_revision = self.view_revision.wrapping_add(1);
 
         if focus {
             self.viewport.focus_on_molecule_center();
@@ -2370,14 +2347,6 @@ impl KuromameApp {
             // Empty layer: clear the main molecule and its index-based overlays.
             self.viewport
                 .set_molecule(molecule_from_parts(Vec::new(), Vec::new()));
-            // Bump the generation like rebuild_viewport does, so the renderer's
-            // geometry cache drops the previously-active layer's atoms instead of
-            // leaving them on screen.
-            let bump = (self.view_revision % 4) + 1;
-            for _ in 0..bump {
-                let _ = self.viewport.update_positions(&[]);
-            }
-            self.view_revision = self.view_revision.wrapping_add(1);
             self.refresh_ndx_selection_state();
             self.refresh_interaction_pairs();
             self.refresh_martini_bead_state();
