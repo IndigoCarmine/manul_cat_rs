@@ -618,14 +618,6 @@ pub struct KuromameApp {
     data: LoadedDataState,
     selection: SelectionState,
     ui: UiState,
-    hovered_atom: Arc<Mutex<Option<usize>>>,
-    /// Viewport-space atom indices clicked since the last frame. The viewport
-    /// event handler (a closure with no access to `self`) queues them here;
-    /// `update` drains the queue into the app-side selection
-    /// (`selection.selected_atom_indices`, original indices) each frame. Without
-    /// this bridge, clicking an atom would highlight it in the 3D view but never
-    /// reach the selection the panels and menu actions actually operate on.
-    clicked_atoms: Arc<Mutex<Vec<usize>>>,
     trajectory: Vec<XtcFrame>,
     trajectory_path: Option<PathBuf>,
     base_molecule: Option<Molecule>,
@@ -789,7 +781,7 @@ impl KuromameApp {
         }
         cc.egui_ctx.set_fonts(fonts);
         Self::apply_visual_theme(&cc.egui_ctx);
-        let mut viewport = InteractiveMoleculeViewport::new(None);
+        let mut viewport = InteractiveMoleculeViewport::new();
         viewport.add_additional_render_box(Box::new(SelectedAtomRender::new()));
         viewport.add_additional_render_box(Box::new(AtomPairRender::new()));
         viewport.add_additional_render_box(Box::new(AtomGroupRender::new()));
@@ -803,26 +795,6 @@ impl KuromameApp {
             visible: true,
             length: None,
         });
-
-        let hovered_atom: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
-        let hovered_atom_for_handler = Arc::clone(&hovered_atom);
-        let clicked_atoms: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-        let clicked_atoms_for_handler = Arc::clone(&clicked_atoms);
-        viewport.register_event_handler(Box::new(move |_vp, event| match event {
-            ViewPortEvent::hovered { atom } => {
-                if let Ok(mut g) = hovered_atom_for_handler.lock() {
-                    *g = Some(atom);
-                }
-            }
-            // Only queue the click here; the app owns the selection and pushes
-            // the resulting red highlight back to the viewport in `update`, so a
-            // click and every other selection path share one source of truth.
-            ViewPortEvent::clicked { atom } => {
-                if let Ok(mut g) = clicked_atoms_for_handler.lock() {
-                    g.push(atom);
-                }
-            }
-        }));
 
         Self {
             molecule: None,
@@ -859,8 +831,6 @@ impl KuromameApp {
                 ndx_opacity: 1.0,
                 ndx_selected_atom_count: 0,
             },
-            hovered_atom,
-            clicked_atoms,
             trajectory: Vec::new(),
             trajectory_path: None,
             base_molecule: None,
@@ -2953,22 +2923,39 @@ impl KuromameApp {
         });
     }
 
-    /// Fold any atom clicks the viewport captured since the last frame into the
-    /// app-side selection (toggling each), then reflect the result in the view.
-    /// Bridges the viewport's click events, which arrive in viewport-index space,
-    /// to the selection stored in original-index space.
-    fn process_atom_clicks(&mut self) {
-        let clicks: Vec<usize> = match self.clicked_atoms.lock() {
-            Ok(mut g) if !g.is_empty() => std::mem::take(&mut *g),
-            _ => return,
-        };
-        for view_idx in clicks {
-            let orig = self.visibility.to_orig(view_idx);
-            let now_selected = self.toggle_selected_atom(orig);
-            if now_selected && self.selection.with_hbond_chk {
-                self.add_connected_hydrogens(orig);
+    /// Drain the viewport's click events into the app-side selection (toggling
+    /// each), and refresh the hovered-atom readout.
+    ///
+    /// Both arrive in viewport-index space and are translated to the
+    /// original-index space the panels and menu actions operate in. The app owns
+    /// the selection and pushes the resulting red highlight back through
+    /// `sync_selection_to_viewport`, so a click and every other selection path
+    /// share one source of truth.
+    fn process_viewport_events(&mut self) {
+        self.ui.hovered_atom_info = self
+            .viewport
+            .hovered_atom()
+            .map(|view| self.visibility.to_orig(view))
+            .and_then(|atom| self.hovered_atom_info(atom))
+            .unwrap_or_else(|| "Hover an atom for details".to_string());
+
+        let events = self.viewport.take_events();
+        if events.is_empty() {
+            return;
+        }
+
+        for event in events {
+            match event {
+                ViewPortEvent::Clicked { atom } => {
+                    let orig = self.visibility.to_orig(atom);
+                    let now_selected = self.toggle_selected_atom(orig);
+                    if now_selected && self.selection.with_hbond_chk {
+                        self.add_connected_hydrogens(orig);
+                    }
+                }
             }
         }
+
         self.sync_selection_to_viewport();
     }
 
@@ -4407,14 +4394,6 @@ impl eframe::App for KuromameApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Update hover info from the previous frame's viewport pick result. The
-        // picked index is in viewport space; translate it to the full molecule.
-        let last_hovered = self.hovered_atom.lock().ok().and_then(|mut g| g.take());
-        self.ui.hovered_atom_info = last_hovered
-            .map(|view| self.visibility.to_orig(view))
-            .and_then(|atom| self.hovered_atom_info(atom))
-            .unwrap_or_else(|| "Hover an atom for details".to_string());
-
         // Deliver any file chosen by a background picker thread, then any parsed
         // payload from a background load worker. Keep repainting while either is
         // in flight so results are dispatched promptly and the progress bar
@@ -4427,9 +4406,6 @@ impl eframe::App for KuromameApp {
 
         self.handle_dropped_files(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
-        // Fold clicks the viewport captured last frame into the selection before
-        // the panels (which read the selection count / enablement) are drawn.
-        self.process_atom_clicks();
 
         // Advance trajectory playback
         if self.traj_ui.is_playing {
@@ -4486,6 +4462,9 @@ impl eframe::App for KuromameApp {
                 if let Err(err) = self.viewport.show(ui, render_state) {
                     ui.colored_label(egui::Color32::RED, format!("Render failed: {err}"));
                 }
+                // `show` is where the viewport raises its events, so drain them
+                // here: a click reaches the selection on the frame it happened.
+                self.process_viewport_events();
 
                 // Corner overlays drawn on top of the 3D view.
                 let rect = ui.max_rect();
@@ -4543,18 +4522,6 @@ impl eframe::App for KuromameApp {
                 });
         }
 
-        // The viewport's click events fire during `viewport.show()` above, i.e.
-        // after `process_atom_clicks` already ran this frame. Schedule another
-        // frame so a just-captured click is folded into the selection promptly
-        // rather than waiting for an unrelated repaint.
-        let clicks_pending = self
-            .clicked_atoms
-            .lock()
-            .map(|g| !g.is_empty())
-            .unwrap_or(false);
-        if clicks_pending {
-            ctx.request_repaint();
-        }
     }
 
     fn on_exit(&mut self) {
