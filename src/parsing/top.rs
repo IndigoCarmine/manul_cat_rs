@@ -69,12 +69,11 @@ impl TopAtomRecord {
             self.charge,
             self.mass
         );
-        if let Some(comment) = &self.comment {
-            if !comment.is_empty() {
+        if let Some(comment) = &self.comment
+            && !comment.is_empty() {
                 line.push_str(" ; ");
                 line.push_str(comment);
             }
-        }
         line
     }
 
@@ -128,18 +127,17 @@ impl TopBondRecord {
         if let Some(k) = self.k {
             line.push_str(&format!("{:>13.4e}", k));
         }
-        if let Some(comment) = &self.comment {
-            if !comment.is_empty() {
+        if let Some(comment) = &self.comment
+            && !comment.is_empty() {
                 line.push_str(" ; ");
                 line.push_str(comment);
             }
-        }
         line
     }
 }
 
 #[derive(Debug, Clone)]
-struct TopMolRecord {
+pub struct TopMolRecord {
     name: String,
     nmols: usize,
 }
@@ -375,7 +373,6 @@ impl TopFile {
                 TopLine::Other(text) if current_section == "moleculetype" => {
                     if let Some(template) = current_template.as_mut() {
                         template.name = text
-                            .trim()
                             .split_whitespace()
                             .next()
                             .unwrap_or("")
@@ -553,6 +550,13 @@ impl TopFile {
 }
 
 #[derive(Debug, Clone)]
+/// State of one `#ifdef`/`#ifndef` block.
+///
+/// Conditional handling is deliberately disabled below: a viewer has no `-D`
+/// flags to evaluate the conditions against, so every branch is taken and the
+/// file is read as written. This type is the shape that support needs if it is
+/// ever turned on, so it outlives the commented-out block that uses it.
+#[allow(dead_code)]
 struct ConditionalFrame {
     parent_active: bool,
     condition_true: bool,
@@ -560,20 +564,14 @@ struct ConditionalFrame {
     else_used: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct TopPreprocessor {
+    /// Symbols from `#define`. Unused while conditional handling is disabled --
+    /// see [`ConditionalFrame`].
+    #[allow(dead_code)]
     defines: HashSet<String>,
 }
 
-impl Default for TopPreprocessor {
-    fn default() -> Self {
-        // By default no conditional symbols are defined. Calling code may
-        // choose to enable symbols (like INTER) explicitly when desired.
-        Self {
-            defines: HashSet::new(),
-        }
-    }
-}
 
 impl TopPreprocessor {
     fn expand(&mut self, content: &str, source_path: Option<&Path>) -> Result<String, String> {

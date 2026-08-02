@@ -92,7 +92,7 @@ fn sizeofints(sizes: &[u32; 3]) -> i32 {
         let mut tmp: u64 = 0;
         let mut bytecnt = 0usize;
         while bytecnt < num_of_bytes {
-            tmp = bytes[bytecnt] as u64 * size as u64 + tmp;
+            tmp += bytes[bytecnt] as u64 * size as u64;
             bytes[bytecnt] = (tmp & 0xff) as u32;
             tmp >>= 8;
             bytecnt += 1;
@@ -263,7 +263,7 @@ fn decompress_coords(
     let cap = natoms.min(buf.len().saturating_mul(8).saturating_add(12));
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cap);
 
-    let mut prevcoord = [0i32; 3];
+    let mut prevcoord: [i32; 3];
     // `run` persists across iterations exactly as in xdrfile: it is only
     // reassigned when the flag bit is set, so a cleared flag keeps the previous
     // run going. Resetting it per iteration desyncs the whole bitstream.
@@ -473,28 +473,23 @@ impl XtcFile {
         let mut frames = Vec::new();
         let mut natoms = 0usize;
 
-        loop {
-            match read_frame(&mut reader)? {
-                Some(frame) => {
-                    if frames.is_empty() {
-                        natoms = frame.positions.len();
-                    } else if frame.positions.len() != natoms {
-                        // Every consumer (the base molecule, selections, ndx
-                        // groups) indexes all frames with one atom count; a frame
-                        // that disagrees would corrupt those maps later on.
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "XTC frame {} has {} atoms, expected {natoms}",
-                                frames.len(),
-                                frame.positions.len()
-                            ),
-                        ));
-                    }
-                    frames.push(frame);
-                }
-                None => break,
+        while let Some(frame) = read_frame(&mut reader)? {
+            if frames.is_empty() {
+                natoms = frame.positions.len();
+            } else if frame.positions.len() != natoms {
+                // Every consumer (the base molecule, selections, ndx groups)
+                // indexes all frames with one atom count; a frame that disagrees
+                // would corrupt those maps later on.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "XTC frame {} has {} atoms, expected {natoms}",
+                        frames.len(),
+                        frame.positions.len()
+                    ),
+                ));
             }
+            frames.push(frame);
         }
 
         Ok(Self { frames, natoms })

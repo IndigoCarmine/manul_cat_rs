@@ -1,4 +1,4 @@
-use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
+use crate::view_rs::{To3dViewMolecule, view_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{ANGSTROM_TO_NM, Molecule, molecule::Bond};
 use std::collections::HashMap;
@@ -117,8 +117,8 @@ impl Mol2File {
                 continue;
             }
 
-            if line.starts_with("@<TRIPOS>") {
-                current_section = &line[9..];
+            if let Some(section) = line.strip_prefix("@<TRIPOS>") {
+                current_section = section;
                 lines.push(Mol2Line::SectionHeader(line.to_string()));
                 continue;
             }
@@ -220,6 +220,6 @@ impl To3dViewMolecule for Mol2File {
             }
         }
 
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 }

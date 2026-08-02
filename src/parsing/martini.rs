@@ -87,11 +87,10 @@ impl MartiniForceField {
                         continue;
                     }
                     // Skip funct, read sigma.
-                    if let Some(sigma) = parts.nth(1).and_then(|s| s.parse::<f32>().ok()) {
-                        if sigma > 0.0 {
+                    if let Some(sigma) = parts.nth(1).and_then(|s| s.parse::<f32>().ok())
+                        && sigma > 0.0 {
                             sigma_nm.insert(i.to_string(), sigma);
                         }
-                    }
                 }
                 Section::Other => {}
             }

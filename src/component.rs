@@ -343,13 +343,12 @@ impl ComponentState {
         let slot = self.find(from).ok_or_else(|| ComponentError::NotFound {
             name: from.to_string(),
         })?;
-        if let Some(clash) = self.find(to) {
-            if clash != slot {
+        if let Some(clash) = self.find(to)
+            && clash != slot {
                 return Err(ComponentError::NameTaken {
                     name: to.to_string(),
                 });
             }
-        }
         self.components[slot].name = to.trim().to_string();
         Ok(())
     }
@@ -440,7 +439,7 @@ fn residue_key(atom: &moleucle_3dview_rs::Atom) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view_rs::{molecule_from_parts, view_atom};
+    use crate::view_rs::{view_atom};
     use lin_alg::f32::Vec3;
     use moleucle_3dview_rs::molecule::AtomMeta;
 
@@ -474,7 +473,7 @@ mod tests {
                 )
             })
             .collect();
-        molecule_from_parts(atoms, Vec::new())
+        Molecule::from_atoms_bonds(atoms, Vec::new())
     }
 
     fn state() -> (ComponentState, Molecule) {
@@ -663,7 +662,7 @@ mod tests {
 mod command_flow {
     use super::*;
     use crate::selection::{AtomTable, EvalCtx, Statement, evaluate, parse_statement, to_indices};
-    use crate::view_rs::{molecule_from_parts, view_atom};
+    use crate::view_rs::{view_atom};
     use lin_alg::f32::Vec3;
     use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 
@@ -724,7 +723,7 @@ mod command_flow {
                 bond(o, hid);
             }
         }
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 
     /// Everything `run_command` does for one line, minus the logging.

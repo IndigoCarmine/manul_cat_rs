@@ -1,4 +1,4 @@
-use crate::view_rs::{AtomMeta, To3dViewMolecule, molecule_from_parts, view_atom};
+use crate::view_rs::{AtomMeta, To3dViewMolecule, view_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{ANGSTROM_TO_NM, Molecule, NM_TO_ANGSTROM, molecule::Bond};
 use std::collections::HashMap;
@@ -24,11 +24,10 @@ impl ConectRecord {
         let mut bonded = Vec::new();
 
         for range in [(11, 16), (16, 21), (21, 26), (26, 31)] {
-            if let Some(s) = line.get(range.0..range.1) {
-                if let Ok(v) = s.trim().parse::<usize>() {
+            if let Some(s) = line.get(range.0..range.1)
+                && let Ok(v) = s.trim().parse::<usize>() {
                     bonded.push(v);
                 }
-            }
         }
 
         Some(ConectRecord { serial, bonded })
@@ -64,12 +63,11 @@ impl PdbFile {
                     lines.push(PdbLine::Atom(atom));
                     continue;
                 }
-            } else if line.starts_with("CONECT") {
-                if let Some(conect) = ConectRecord::from_line(line) {
+            } else if line.starts_with("CONECT")
+                && let Some(conect) = ConectRecord::from_line(line) {
                     lines.push(PdbLine::Conect(conect));
                     continue;
                 }
-            }
             lines.push(PdbLine::Other(line.to_string()));
         }
         Self { lines }
@@ -166,8 +164,8 @@ impl PdbFile {
     }
 
     pub fn from_molecule(molecule: &Molecule) -> Self {
-        let mut lines: Vec<PdbLine> = Vec::new();
-        lines.reserve(molecule.atoms.len() + molecule.bonds.len());
+        let mut lines: Vec<PdbLine> =
+            Vec::with_capacity(molecule.atoms.len() + molecule.bonds.len());
 
         for (idx, atom) in molecule.atoms.iter().enumerate() {
             let serial = idx + 1;
@@ -263,24 +261,22 @@ impl To3dViewMolecule for PdbFile {
         }
 
         for line in &self.lines {
-            if let PdbLine::Conect(c) = line {
-                if let Some(&idx_a) = serial_to_index.get(&c.serial) {
+            if let PdbLine::Conect(c) = line
+                && let Some(&idx_a) = serial_to_index.get(&c.serial) {
                     for &bonded_serial in &c.bonded {
-                        if let Some(&idx_b) = serial_to_index.get(&bonded_serial) {
-                            if idx_a < idx_b {
+                        if let Some(&idx_b) = serial_to_index.get(&bonded_serial)
+                            && idx_a < idx_b {
                                 bonds.push(Bond {
                                     atom_a: idx_a,
                                     atom_b: idx_b,
                                     order: 1,
                                 });
                             }
-                        }
                     }
                 }
-            }
         }
 
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 }
 
@@ -288,22 +284,31 @@ impl To3dViewMolecule for PdbFile {
 mod tests {
     use super::*;
 
-    fn sample(name: &str) -> String {
-        let path = format!("{}/sample/{}", env!("CARGO_MANIFEST_DIR"), name);
-        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing sample: {path}"))
-    }
+    /// A `gmx sasa` output in miniature: a couple of real beads followed by the
+    /// DOT pseudo-atoms it appends for the surface point cloud.
+    const SASA_PDB: &str = concat!(
+        "TITLE     Solvent accessible surface\n",
+        "ATOM      1  C1  MCH     1      11.390   2.500   3.000  1.00  0.00           C\n",
+        "ATOM      2  C2  MCH     1      12.000   2.500   3.000  1.00  0.00           C\n",
+        "ATOM      3  DOT DOT     2      11.390   0.000   0.000  1.00  0.00\n",
+        "ATOM      4  DOT DOT     2       0.000  20.000   0.000  1.00  0.00\n",
+        "ATOM      5  DOT DOT     2       0.000   0.000 -30.000  1.00  0.00\n",
+        "END\n",
+    );
 
     #[test]
     fn extracts_dot_surface_from_gmx_sasa_pdb() {
-        let pdb = PdbFile::load(&sample("mch_C3_surface.pdb"));
+        let pdb = PdbFile::load(SASA_PDB);
 
-        // 3 coarse-grained beads (MCH) + 802 surface dots (DOT).
-        assert_eq!(pdb.atoms().count(), 805);
-        assert_eq!(pdb.surface_dots().len(), 802);
+        // Every ATOM record is read; only the DOT residues are surface points.
+        assert_eq!(pdb.atoms().count(), 5);
+        let dots = pdb.surface_dots();
+        assert_eq!(dots.len(), 3);
 
-        // Dots are converted to nanometers.
-        let first = pdb.surface_dots()[0];
-        assert!((first.x - 1.139).abs() < 1e-4, "x was {}", first.x);
+        // Dots are converted from the file's Angstrom to the viewer's nanometers.
+        assert!((dots[0].x - 1.1390).abs() < 1e-4, "x was {}", dots[0].x);
+        assert!((dots[1].y - 2.0).abs() < 1e-4, "y was {}", dots[1].y);
+        assert!((dots[2].z + 3.0).abs() < 1e-4, "z was {}", dots[2].z);
 
         // Non-surface files yield no dots.
         let plain = PdbFile::load("ATOM      1  CA  ALA     1      0.000   0.000   0.000\n");

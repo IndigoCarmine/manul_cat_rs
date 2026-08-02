@@ -212,15 +212,13 @@ pub fn render_export_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
                 let view_aspect = crate::image_export::region_pixel_aspect([0.0, 0.0, 1.0, 1.0], view);
                 let ratio = app.export_settings().aspect.ratio(view_aspect);
 
-                if response.drag_started() {
-                    if let Some(pos) = response.interact_pointer_pos() {
+                if response.drag_started()
+                    && let Some(pos) = response.interact_pointer_pos() {
                         app.set_export_drag_anchor(Some(to_norm(pos)));
                     }
-                }
                 if let (Some(anchor), Some(pos)) =
                     (app.export_drag_anchor(), response.interact_pointer_pos())
-                {
-                    if response.dragged() || response.drag_stopped() {
+                    && (response.dragged() || response.drag_stopped()) {
                         let region = crate::image_export::region_from_drag(
                             anchor,
                             to_norm(pos),
@@ -233,7 +231,6 @@ pub fn render_export_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
                             app.set_export_region(Some(region));
                         }
                     }
-                }
                 if response.drag_stopped() {
                     app.set_export_drag_anchor(None);
                 }
@@ -395,12 +392,11 @@ pub fn render_export_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
                     .color(theme::MUTED)
                     .size(12.0),
             );
-            if app.export_preview().is_some() {
-                if let Some(err) = app.export_error() {
+            if app.export_preview().is_some()
+                && let Some(err) = app.export_error() {
                     ui.add_space(4.0);
                     ui.colored_label(egui::Color32::from_rgb(0xe0, 0xb3, 0x41), err);
                 }
-            }
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {

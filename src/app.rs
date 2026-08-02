@@ -7,12 +7,12 @@ use crate::parsing::{
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
-use crate::view_rs::{To3dViewMolecule, molecule_from_parts, view_atom};
+use crate::view_rs::{To3dViewMolecule, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::molecule::AtomMeta;
 use moleucle_3dview_rs::{
-    Atom, AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
+    AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
     AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
     PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRender,
     SelectedAtomRenderState, SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender,
@@ -126,8 +126,7 @@ impl<R: Read> Read for ProgressReader<R> {
             // worker forever instead of unwinding. Any other kind is propagated,
             // so the parse returns `Err` and spawn_load's `is_cancelled()` path
             // collapses it to the cancel sentinel.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "load cancelled",
             ));
         }
@@ -489,62 +488,6 @@ impl Layer {
             ndx_selected_atom_count: 0,
         }
     }
-}
-
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
-    if s <= 0.0 {
-        return (l, l, l);
-    }
-
-    let q = if l < 0.5 {
-        l * (1.0 + s)
-    } else {
-        l + s - (l * s)
-    };
-    let p = 2.0 * l - q;
-
-    fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
-        if t < 0.0 {
-            t += 1.0;
-        }
-        if t > 1.0 {
-            t -= 1.0;
-        }
-        if t < 1.0 / 6.0 {
-            return p + (q - p) * 6.0 * t;
-        }
-        if t < 1.0 / 2.0 {
-            return q;
-        }
-        if t < 2.0 / 3.0 {
-            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-        }
-        p
-    }
-
-    (
-        hue_to_rgb(p, q, h + 1.0 / 3.0),
-        hue_to_rgb(p, q, h),
-        hue_to_rgb(p, q, h - 1.0 / 3.0),
-    )
-}
-
-fn color_by_res_name(atom: &Atom, is_selected: bool) -> (f32, f32, f32) {
-    if is_selected {
-        return (1.0, 0.0, 0.0);
-    }
-
-    let key = atom
-        .res_name()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(atom.element.as_str());
-
-    // Deterministic hash so the same residue name gets the same color each run.
-    let hash = key.bytes().fold(2166136261u32, |acc, b| {
-        (acc ^ (b as u32)).wrapping_mul(16777619)
-    });
-    let hue = (hash % 360) as f32 / 360.0;
-    hsl_to_rgb(hue, 0.65, 0.52)
 }
 
 /// One entry in the "loaded files" overview shown in the left panel: a short
@@ -2126,12 +2069,11 @@ impl KuromameApp {
     }
 
     pub fn set_overlay_visible(&mut self, idx: usize, visible: bool) {
-        if let Some(overlay) = self.overlay_surfaces.get_mut(idx) {
-            if overlay.visible != visible {
+        if let Some(overlay) = self.overlay_surfaces.get_mut(idx)
+            && overlay.visible != visible {
                 overlay.visible = visible;
                 self.refresh_surface_state();
             }
-        }
     }
 
     pub fn overlay_color(&self, idx: usize) -> [f32; 3] {
@@ -2142,12 +2084,11 @@ impl KuromameApp {
     }
 
     pub fn set_overlay_color(&mut self, idx: usize, color: [f32; 3]) {
-        if let Some(overlay) = self.overlay_surfaces.get_mut(idx) {
-            if overlay.color != color {
+        if let Some(overlay) = self.overlay_surfaces.get_mut(idx)
+            && overlay.color != color {
                 overlay.color = color;
                 self.refresh_surface_state();
             }
-        }
     }
 
     pub fn remove_overlay(&mut self, idx: usize) {
@@ -2229,7 +2170,7 @@ impl KuromameApp {
         } else {
             // Empty layer: clear the main molecule and its index-based overlays.
             self.viewport
-                .set_molecule(molecule_from_parts(Vec::new(), Vec::new()));
+                .set_molecule(Molecule::from_atoms_bonds(Vec::new(), Vec::new()));
             self.refresh_ndx_selection_state();
             self.refresh_interaction_pairs();
             self.refresh_martini_bead_state();
@@ -2476,12 +2417,11 @@ impl KuromameApp {
     }
 
     pub fn set_layer_visible(&mut self, idx: usize, visible: bool) {
-        if let Some(layer) = self.layers.get_mut(idx) {
-            if layer.visible != visible {
+        if let Some(layer) = self.layers.get_mut(idx)
+            && layer.visible != visible {
                 layer.visible = visible;
                 self.refresh_layer_overlays();
             }
-        }
     }
 
     /// Whether the currently loaded structure carries a dot surface.
@@ -2822,7 +2762,7 @@ impl KuromameApp {
     /// clear) stays visually consistent.
     fn sync_selection_to_viewport(&mut self) {
         let selected_atoms: Vec<usize> =
-            self.selection.selected_atom_indices.iter().copied().collect();
+            self.selection.selected_atom_indices.to_vec();
         self.viewport.set_state_by_type(SelectedAtomRenderState {
             selected_atoms,
             color: [1.0, 0.0, 0.0, 1.0],
@@ -2862,8 +2802,8 @@ impl KuromameApp {
     }
 
     fn atom_name_at(&self, atom_index: usize) -> Option<String> {
-        if let Some(mol) = &self.molecule {
-            if let Some(atom) = mol.atoms.get(atom_index) {
+        if let Some(mol) = &self.molecule
+            && let Some(atom) = mol.atoms.get(atom_index) {
                 if let Some(name) = atom.name() {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
@@ -2876,34 +2816,30 @@ impl KuromameApp {
                     return Some(element.to_ascii_uppercase());
                 }
             }
-        }
 
-        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
-            if let Some(atom) = gro.atoms().nth(atom_index) {
+        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro())
+            && let Some(atom) = gro.atoms().nth(atom_index) {
                 let name = atom.atom_name.trimmed();
                 if !name.is_empty() {
                     return Some(name.to_ascii_uppercase());
                 }
             }
-        }
 
-        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb()) {
-            if let Some(atom) = pdb.atoms().nth(atom_index) {
+        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb())
+            && let Some(atom) = pdb.atoms().nth(atom_index) {
                 let name = atom.name.trim();
                 if !name.is_empty() {
                     return Some(name.to_ascii_uppercase());
                 }
             }
-        }
 
-        if let Some(top) = &self.data.top_file {
-            if let Some(atom) = top.atoms().nth(atom_index) {
+        if let Some(top) = &self.data.top_file
+            && let Some(atom) = top.atoms().nth(atom_index) {
                 let name = atom.atom.trim();
                 if !name.is_empty() {
                     return Some(name.to_ascii_uppercase());
                 }
             }
-        }
 
         None
     }
@@ -2956,11 +2892,10 @@ impl KuromameApp {
         let mut selected_indices = Vec::new();
 
         for atom_index in 0..mol.atoms.len() {
-            if let Some(atom_name) = self.atom_name_at(atom_index) {
-                if token_set.contains(&atom_name) {
+            if let Some(atom_name) = self.atom_name_at(atom_index)
+                && token_set.contains(&atom_name) {
                     selected_indices.push(atom_index);
                 }
-            }
         }
 
         self.selection.selected_atom_indices = selected_indices;
@@ -2985,11 +2920,10 @@ impl KuromameApp {
         let mut selector_tokens = Vec::new();
 
         for &atom_index in &self.selection.selected_atom_indices {
-            if let Some(atom_name) = self.atom_name_at(atom_index) {
-                if seen.insert(atom_name.clone()) {
+            if let Some(atom_name) = self.atom_name_at(atom_index)
+                && seen.insert(atom_name.clone()) {
                     selector_tokens.push(format!("a{}", atom_name));
                 }
-            }
         }
 
         if selector_tokens.is_empty() {
@@ -3069,8 +3003,8 @@ impl KuromameApp {
         let mut atom_name: Option<String> = None;
         let mut res_name: Option<String> = None;
 
-        if let Some(mol) = &self.molecule {
-            if let Some(atom) = mol.atoms.get(atom_index) {
+        if let Some(mol) = &self.molecule
+            && let Some(atom) = mol.atoms.get(atom_index) {
                 if let Some(name) = atom.name() {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
@@ -3089,10 +3023,9 @@ impl KuromameApp {
                     }
                 }
             }
-        }
 
-        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb()) {
-            if let Some(atom) = pdb.atoms().nth(atom_index) {
+        if let Some(pdb) = self.data.structure_file.as_ref().and_then(|s| s.pdb())
+            && let Some(atom) = pdb.atoms().nth(atom_index) {
                 if atom_name.is_none() && !atom.name.trim().is_empty() {
                     atom_name = Some(atom.name.trim().to_string());
                 }
@@ -3100,10 +3033,9 @@ impl KuromameApp {
                     res_name = Some(atom.res_name.trim().to_string());
                 }
             }
-        }
 
-        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
-            if let Some(atom) = gro.atoms().nth(atom_index) {
+        if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro())
+            && let Some(atom) = gro.atoms().nth(atom_index) {
                 if atom_name.is_none() {
                     let name = atom.atom_name.trimmed();
                     if !name.is_empty() {
@@ -3117,10 +3049,9 @@ impl KuromameApp {
                     }
                 }
             }
-        }
 
-        if let Some(top) = &self.data.top_file {
-            if let Some(atom) = top.atoms().nth(atom_index) {
+        if let Some(top) = &self.data.top_file
+            && let Some(atom) = top.atoms().nth(atom_index) {
                 if atom_name.is_none() && !atom.atom.trim().is_empty() {
                     atom_name = Some(atom.atom.trim().to_string());
                 }
@@ -3128,7 +3059,6 @@ impl KuromameApp {
                     res_name = Some(atom.res.trim().to_string());
                 }
             }
-        }
 
         if atom_name.is_none() && res_name.is_none() {
             return None;
@@ -3195,7 +3125,7 @@ impl KuromameApp {
         }
 
         if let Some(mol) = &mut self.molecule {
-            for (atom, name) in mol.atoms.iter_mut().zip(resnames.into_iter()) {
+            for (atom, name) in mol.atoms.iter_mut().zip(resnames) {
                 atom.meta
                     .get_or_insert_with(|| Box::new(AtomMeta::default()))
                     .res_name = Some(name);
@@ -3231,20 +3161,6 @@ impl KuromameApp {
                 self.selection.selected_atom_indices.push(idx);
             }
         }
-    }
-
-    fn remove_connected_hydrogens(&mut self, atom_index: usize) {
-        let Some(mol) = &self.molecule else {
-            return;
-        };
-
-        let mut targets = Self::collect_connected_hydrogens(atom_index, mol);
-        targets.sort_unstable();
-        targets.dedup();
-
-        self.selection
-            .selected_atom_indices
-            .retain(|idx| !targets.contains(idx));
     }
 
     pub fn open_file(&mut self) {
@@ -3698,11 +3614,11 @@ impl KuromameApp {
 
     fn set_molecule_and_frame(&mut self, mut molecule: Molecule) {
         // Every molecule enters the app through here, so this is the one place
-        // that can guarantee the invariant the renderer relies on: it indexes
-        // `mol.atoms[bond.atom_a]` unchecked, so a single bond pointing past the
-        // atom list (a topology declaring more atoms than the coordinate file
-        // supplies, a truncated GRO, ...) would kill the process on the next
-        // paint. Drop those bonds instead.
+        // that can tell the user their topology and coordinates disagree. The
+        // renderer skips out-of-range bonds on its own, so this is a diagnostic
+        // rather than a safety measure -- but silently drawing fewer bonds than
+        // the file declares is exactly the kind of thing a viewer should say out
+        // loud.
         let dropped = Self::drop_out_of_range_bonds(&mut molecule);
         if dropped > 0 {
             self.set_status(format!(
@@ -3721,10 +3637,12 @@ impl KuromameApp {
     /// `[ bonds ]`, a MOL2 bond block) and are never validated against the
     /// coordinates they are paired with.
     fn drop_out_of_range_bonds(molecule: &mut Molecule) -> usize {
-        let n = molecule.atoms.len();
-        let before = molecule.bonds.len();
-        molecule.bonds.retain(|b| b.atom_a < n && b.atom_b < n);
-        before - molecule.bonds.len()
+        let dropped = molecule.invalid_bonds().count();
+        if dropped > 0 {
+            let n = molecule.atoms.len();
+            molecule.bonds.retain(|b| b.atom_a < n && b.atom_b < n);
+        }
+        dropped
     }
 
     pub fn open_xtc_file(&mut self) {
@@ -3769,7 +3687,7 @@ impl KuromameApp {
             let atoms = (0..xtc.natoms)
                 .map(|i| view_atom(Vec3::new(0.0, 0.0, 0.0), "C", i, None))
                 .collect();
-            self.base_molecule = Some(molecule_from_parts(atoms, Vec::new()));
+            self.base_molecule = Some(Molecule::from_atoms_bonds(atoms, Vec::new()));
         }
 
         let frame_count = xtc.frames.len();
@@ -4125,8 +4043,8 @@ impl KuromameApp {
                 for &neighbor in neighbors {
                     // `parent` doubles as the visited set, so every atom is
                     // expanded at most once.
-                    if !parent.contains_key(&neighbor) {
-                        parent.insert(neighbor, current);
+                    if let std::collections::hash_map::Entry::Vacant(e) = parent.entry(neighbor) {
+                        e.insert(current);
                         queue.push_back(neighbor);
                     }
                 }
@@ -4166,14 +4084,13 @@ impl KuromameApp {
                 None
             };
 
-            if let Some(n_idx) = neighbor {
-                if let Some(atom) = mol.atoms.get(n_idx) {
+            if let Some(n_idx) = neighbor
+                && let Some(atom) = mol.atoms.get(n_idx) {
                     // Check if element starts with "H" (matching Python's "H" in name check)
                     if atom.element.starts_with("H") && !hydrogens.contains(&n_idx) {
                         hydrogens.push(n_idx);
                     }
                 }
-            }
         }
         hydrogens
     }
@@ -4247,11 +4164,10 @@ impl KuromameApp {
     }
 
     fn export_structure(&mut self) {
-        if self.data.top_file.is_none() && self.data.structure_file.is_none() {
-            if let Some(mol) = &self.molecule {
+        if self.data.top_file.is_none() && self.data.structure_file.is_none()
+            && let Some(mol) = &self.molecule {
                 self.data.structure_file = Some(StructureFile::Pdb(PdbFile::from_molecule(mol)));
             }
-        }
 
         if let Some(path) = FileDialog::new().save_file() {
             let saved = if let Some(top) = &self.data.top_file {
@@ -4480,7 +4396,7 @@ mod tests {
                 order: 1,
             })
             .collect();
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 
     #[test]

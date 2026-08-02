@@ -214,33 +214,32 @@ pub fn evaluate(
         }
         Expr::ResName(names) => {
             let wanted = upper(names);
-            for i in 0..n {
-                set[i] = wanted.iter().any(|w| *w == ctx.table.res_name[i]);
+            for (slot, value) in set.iter_mut().zip(&ctx.table.res_name).take(n) {
+                *slot = wanted.iter().any(|w| w == value);
             }
         }
         Expr::Name(names) => {
             let wanted = upper(names);
-            for i in 0..n {
-                set[i] = wanted.iter().any(|w| *w == ctx.table.name[i]);
+            for (slot, value) in set.iter_mut().zip(&ctx.table.name).take(n) {
+                *slot = wanted.iter().any(|w| w == value);
             }
         }
         Expr::Element(names) => {
             let wanted = upper(names);
-            for i in 0..n {
-                set[i] = wanted.iter().any(|w| *w == ctx.table.element[i]);
+            for (slot, value) in set.iter_mut().zip(&ctx.table.element).take(n) {
+                *slot = wanted.iter().any(|w| w == value);
             }
         }
         Expr::ResId(ranges) => {
-            for i in 0..n {
-                set[i] = ctx.table.res_seq[i]
-                    .is_some_and(|seq| in_ranges(ranges, seq as i64));
+            for (slot, seq) in set.iter_mut().zip(&ctx.table.res_seq).take(n) {
+                *slot = seq.is_some_and(|seq| in_ranges(ranges, seq as i64));
             }
         }
         Expr::Index(ranges) => {
             // 1-based on the way in, GROMACS style, matching the NDX files these
             // structures come with.
-            for i in 0..n {
-                set[i] = in_ranges(ranges, i as i64 + 1);
+            for (i, slot) in set.iter_mut().enumerate().take(n) {
+                *slot = in_ranges(ranges, i as i64 + 1);
             }
         }
         Expr::Hybrid(h) => {
@@ -253,8 +252,8 @@ pub fn evaluate(
                     },
                 });
             }
-            for i in 0..n {
-                set[i] = hybridisation(&ctx.table.element[i], ctx.table.degree(i)) == Some(*h);
+            for (i, slot) in set.iter_mut().enumerate().take(n) {
+                *slot = hybridisation(&ctx.table.element[i], ctx.table.degree(i)) == Some(*h);
             }
         }
         Expr::NumBonds(spec) => {
@@ -263,8 +262,8 @@ pub fn evaluate(
                     predicate: "numbonds",
                 });
             }
-            for i in 0..n {
-                set[i] = spec.matches(ctx.table.degree(i) as i64);
+            for (i, slot) in set.iter_mut().enumerate().take(n) {
+                *slot = spec.matches(ctx.table.degree(i) as i64);
             }
         }
         Expr::With { count, of } => {
@@ -272,14 +271,14 @@ pub fn evaluate(
                 return Err(EvalError::NoBonds { predicate: "with" });
             }
             let inner = evaluate(of, ctx, notes)?;
-            for i in 0..n {
+            for (i, slot) in set.iter_mut().enumerate().take(n) {
                 let hits = ctx
                     .table
                     .neighbours(i)
                     .iter()
                     .filter(|&&nb| inner[nb as usize])
                     .count();
-                set[i] = count.matches(hits as i64);
+                *slot = count.matches(hits as i64);
             }
         }
         Expr::Ident(word) => {
@@ -458,7 +457,7 @@ mod tests {
     use super::*;
     use crate::selection::parser::parse_statement;
     use crate::selection::ast::Statement;
-    use crate::view_rs::{molecule_from_parts, view_atom};
+    use crate::view_rs::{view_atom};
     use lin_alg::f32::Vec3;
     use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 
@@ -510,7 +509,7 @@ mod tests {
             bond(2, 9),
             bond(2, 10),
         ];
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 
     fn run(mol: &moleucle_3dview_rs::Molecule, src: &str) -> Vec<u32> {
@@ -587,7 +586,7 @@ mod tests {
     #[test]
     fn connectivity_predicates_refuse_a_structure_without_bonds() {
         // A bare .gro carries coordinates and no topology at all.
-        let bondless = molecule_from_parts(propane().atoms, Vec::new());
+        let bondless = Molecule::from_atoms_bonds(propane().atoms, Vec::new());
         let table = AtomTable::from_molecule(&bondless);
         assert!(!table.has_bonds);
         let components: Vec<(String, Vec<u32>)> = vec![];
@@ -693,7 +692,7 @@ mod tests {
             atom_b: 9999,
             order: 1,
         });
-        let patched = molecule_from_parts(mol.atoms.clone(), bonds);
+        let patched = Molecule::from_atoms_bonds(mol.atoms.clone(), bonds);
         let table = AtomTable::from_molecule(&patched);
         assert_eq!(table.degree(0), 4, "the bogus bond is dropped, not counted");
     }

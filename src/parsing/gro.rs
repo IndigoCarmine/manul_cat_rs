@@ -1,4 +1,4 @@
-use crate::view_rs::{AtomMeta, To3dViewMolecule, molecule_from_parts, view_atom};
+use crate::view_rs::{AtomMeta, To3dViewMolecule, view_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{
     Molecule,
@@ -198,12 +198,11 @@ impl GroFile {
             // line - and any following frame in a multi-frame .gro - is never
             // swallowed as an atom.
             let expecting_atom = declared_atom_count.is_none_or(|n| atoms.len() < n);
-            if box_line.is_empty() && expecting_atom {
-                if let Some(atom) = GroAtomRecord::from_line(&line) {
+            if box_line.is_empty() && expecting_atom
+                && let Some(atom) = GroAtomRecord::from_line(&line) {
                     atoms.push(atom);
                     continue;
                 }
-            }
 
             // First non-atom line is the box line; everything after it (extra
             // frames, trailing junk) is ignored rather than clobbering it.
@@ -216,8 +215,8 @@ impl GroFile {
         // dump, short record, comment inside the atom block) used to load
         // silently short, which later detonates when a TOP's bond indices are
         // applied to the missing tail. Reject it here so the caller can report it.
-        if let Some(declared) = declared_atom_count {
-            if atoms.len() != declared {
+        if let Some(declared) = declared_atom_count
+            && atoms.len() != declared {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -227,7 +226,6 @@ impl GroFile {
                     ),
                 ));
             }
-        }
 
         let box_values = box_line
             .split_whitespace()
@@ -425,7 +423,7 @@ impl GroFile {
             Self::infer_single_bonds_from_distance(&atoms)
         };
 
-        molecule_from_parts(atoms, bonds)
+        Molecule::from_atoms_bonds(atoms, bonds)
     }
 }
 
