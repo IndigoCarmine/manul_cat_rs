@@ -11,7 +11,10 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.9.0" }
+# 0.10 is not on the remote yet -- it only exists in the sibling checkout the
+# [patch] at the bottom of this file points at. Push the library and add an
+# explicit `rev` before removing that patch, or this will not resolve.
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.10.0" }
 
 eframe = "0.35.0"
 egui = "0.35.0"
