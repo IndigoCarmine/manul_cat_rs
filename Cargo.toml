@@ -1,6 +1,6 @@
 [package]
 name = "manul_cat_rs"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # Raised from edition 2024's 1.85 by the egui-winit fork in [patch.crates-io].
 rust-version = "1.92"
@@ -11,10 +11,16 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-# 0.10 is not on the remote yet -- it only exists in the sibling checkout the
-# [patch] at the bottom of this file points at. Push the library and add an
-# explicit `rev` before removing that patch, or this will not resolve.
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", version = "0.10.0" }
+# Pinned by `rev`, not just by version: without it a `cargo update` silently
+# moves the dependency to whatever the branch points at, and the pin would live
+# only in Cargo.lock.
+#
+# To develop against a local checkout, add
+#   [patch."https://github.com/IndigoCarmine/moleucle_3dview_rs.git"]
+#   moleucle_3dview_rs = { path = "../moleucle_3dview_rs" }
+# and keep the version above in step with the local crate's, or Cargo falls back
+# to the git source without saying so.
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", rev = "8f758cd372cd3f87fc72835df73143c62b272356", version = "0.11.0" }
 
 eframe = "0.35.0"
 egui = "0.35.0"
@@ -72,16 +78,3 @@ assets = [
 [patch.crates-io]
 winit = { git = "https://github.com/IndigoCarmine/winit", branch = "wayland-native-dnd" }
 egui-winit = { git = "https://github.com/IndigoCarmine/egui-winit", branch = "main" }
-
-# --- Local development against the sibling moleucle_3dview_rs checkout ---
-# A git dependency is patched by its repository URL, not through
-# [patch.crates-io]; the key must match the URL in [dependencies] verbatim.
-#
-# The `version = "0.9.0"` on the dependency line still applies as `^0.9.0`, so
-# the local crate must stay 0.9.x for this patch to take effect. If it is ever
-# bumped to 0.10, bump the dependency line in the same commit — otherwise Cargo
-# quietly falls back to the git source and local edits stop having any effect.
-#
-# Remove this block (and re-pin the dependency to a `rev`) before release.
-[patch."https://github.com/IndigoCarmine/moleucle_3dview_rs.git"]
-moleucle_3dview_rs = { path = "../moleucle_3dview_rs" }
