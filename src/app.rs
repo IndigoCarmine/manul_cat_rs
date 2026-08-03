@@ -14,7 +14,7 @@ use moleucle_3dview_rs::molecule::AtomMeta;
 use moleucle_3dview_rs::{
     AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
     AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
-    PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRender,
+    PeriodicImages, PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRender,
     SelectedAtomRenderState, SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender,
     SphereSetState, ViewPortEvent, ball_stick_radius, default_color_fn,
 };
@@ -354,6 +354,13 @@ struct TrajectoryUiState {
     interp_sub: u32,
 }
 
+/// Most replicas the UI offers on each side of each axis.
+///
+/// The library caps the total image count anyway; this keeps the spinner from
+/// offering a number that would silently be clamped, and 4 already means 729
+/// images -- the library's own ceiling.
+const MAX_PERIODIC_REPLICAS: u32 = 4;
+
 /// Default color for the base structure's own dot surface.
 const BASE_SURFACE_COLOR: [f32; 3] = [0.35, 0.72, 0.95];
 
@@ -556,10 +563,13 @@ pub struct KuromameApp {
     /// view preference (not per-layer); mirrored into the viewport's
     /// [`AxesState`] whenever it changes.
     axis_visible: bool,
-    /// Edge lengths of the active layer's simulation box, in nm; `(0, 0, 0)`
-    /// when there is none. Kept here because the axis triad is sized from it,
-    /// and the two overlay states have to be written together.
-    sim_cell: (f32, f32, f32),
+    /// The active layer's simulation box as three cell vectors, in nm; all-zero
+    /// when there is none. Kept here because the axis triad and the periodic
+    /// images are both derived from it, and their states have to be written
+    /// together.
+    sim_cell: [[f32; 3]; 3],
+    /// Periodic replicas drawn on each side along each cell vector.
+    periodic_counts: [u32; 3],
     /// `false` once `bead_types` matches the current molecule/topology. Lets
     /// `recompute_bead_types` skip its O(atoms) rebuild (which re-expands the whole
     /// topology) on visibility-only viewport rebuilds — bead types depend on the
@@ -745,7 +755,8 @@ impl KuromameApp {
             bead_types_dirty: true,
             martini_visible: true,
             axis_visible: true,
-            sim_cell: (0.0, 0.0, 0.0),
+            sim_cell: [[0.0; 3]; 3],
+            periodic_counts: [0, 0, 0],
             pending_pick: None,
             pending_load: None,
         }
@@ -2189,41 +2200,86 @@ impl KuromameApp {
     /// Restore the simulation-cell box for the active layer from its current
     /// trajectory frame, else its GRO box, else none.
     fn refresh_active_sim_cell(&mut self) {
-        let box_diag = if let Some(frame) = self.trajectory.get(self.traj_ui.current_frame) {
-            (
-                frame.box_matrix[0][0],
-                frame.box_matrix[1][1],
-                frame.box_matrix[2][2],
-            )
+        let vectors = if let Some(frame) = self.trajectory.get(self.traj_ui.current_frame) {
+            frame.box_matrix
         } else if let Some(gro) = self.data.structure_file.as_ref().and_then(|s| s.gro()) {
-            gro.box_line
+            gro.box_vectors
         } else {
-            (0.0, 0.0, 0.0)
+            [[0.0; 3]; 3]
         };
-        self.set_sim_cell(box_diag);
+        self.set_sim_cell(vectors);
     }
 
-    /// Push the simulation box to the viewport, and size the XYZ triad to match
-    /// so each coloured arm runs along the box edge leaving the origin.
+    /// Push the simulation box to the viewport, size the XYZ triad to match, and
+    /// re-derive the periodic images from it.
     ///
-    /// The two states are written together because the axis overlay takes its
-    /// length as an explicit input rather than reading the cell state itself —
-    /// that keeps the two overlays independent in the library.
-    fn set_sim_cell(&mut self, size: (f32, f32, f32)) {
-        self.sim_cell = size;
+    /// These are written together because the axis and periodic-image states
+    /// take the cell as an explicit input rather than reading the cell overlay's
+    /// state themselves — which is what keeps them independent in the library.
+    ///
+    /// The full 3x3 is kept, not just its diagonal: GROMACS stores the rhombic
+    /// dodecahedron and truncated octahedron most solvated systems use as
+    /// triclinic boxes, and squaring one off puts the periodic images in the
+    /// wrong places.
+    fn set_sim_cell(&mut self, vectors: [[f32; 3]; 3]) {
+        self.sim_cell = vectors;
         self.viewport
-            .set_state_by_type(SimulationCellState::new(Vec3::new(size.0, size.1, size.2)));
+            .set_state_by_type(self.simulation_cell_state());
         self.refresh_axes_state();
+        self.refresh_periodic_images();
+    }
+
+    /// The active layer's cell, as the library's state type.
+    fn simulation_cell_state(&self) -> SimulationCellState {
+        SimulationCellState::triclinic(self.sim_cell.map(|v| Vec3::new(v[0], v[1], v[2])))
     }
 
     /// Push the current axis visibility and triad length to the viewport.
     fn refresh_axes_state(&mut self) {
-        let (x, y, z) = self.sim_cell;
-        let length = (x > 0.0 || y > 0.0 || z > 0.0).then(|| Vec3::new(x, y, z));
+        let cell = self.simulation_cell_state();
+        // Size each arm to its own cell vector so the triad reads as the box's
+        // corner even when the box is skewed.
+        let length = (!cell.is_empty()).then(|| {
+            Vec3::new(
+                cell.vectors[0].magnitude(),
+                cell.vectors[1].magnitude(),
+                cell.vectors[2].magnitude(),
+            )
+        });
         self.viewport.set_state_by_type(AxesState {
             visible: self.axis_visible,
             length,
         });
+    }
+
+    /// Whether the active layer has a simulation box at all. Without one there
+    /// is nothing to replicate along, so the PBC controls stay hidden.
+    pub fn has_simulation_cell(&self) -> bool {
+        !self.simulation_cell_state().is_empty()
+    }
+
+    /// Replicas drawn on each side along each cell vector. `[0, 0, 0]` shows
+    /// only the primary cell.
+    pub fn periodic_counts(&self) -> [u32; 3] {
+        self.periodic_counts
+    }
+
+    /// Set how far the cell is replicated for display.
+    ///
+    /// Replication is a draw-time effect in the library -- the same geometry is
+    /// redrawn per image -- so this costs no rebuild and no extra memory, and is
+    /// cheap enough to drive straight from a spinner.
+    pub fn set_periodic_counts(&mut self, counts: [u32; 3]) {
+        let counts = counts.map(|c| c.min(MAX_PERIODIC_REPLICAS));
+        if self.periodic_counts != counts {
+            self.periodic_counts = counts;
+            self.refresh_periodic_images();
+        }
+    }
+
+    fn refresh_periodic_images(&mut self) {
+        let images = PeriodicImages::new(self.simulation_cell_state(), self.periodic_counts);
+        self.viewport.set_periodic_images(Some(images));
     }
 
     /// Rebuild the sphere geometry for every non-active, visible layer and push
@@ -3228,7 +3284,7 @@ impl KuromameApp {
         // molecule straight from the GRO (distance-inferred bonds) instead of
         // handing `generate_molecule_with_gro` an empty bond list.
         if top.expanded_atom_types().is_empty() {
-            let boxsize = gro.box_line;
+            let boxsize = gro.box_vectors;
             let mol = gro.to_molecule_with_metadata(true, None);
             self.interaction_pairs.clear();
             self.surface_dots.clear();
@@ -3255,7 +3311,7 @@ impl KuromameApp {
 
         match top.generate_molecule_with_gro(&gro) {
             Ok((molecule, interaction_pairs)) => {
-                let boxsize = gro.box_line;
+                let boxsize = gro.box_vectors;
                 // Stored in original index space; rebuild_viewport() remaps and
                 // pushes them whenever the visible set changes.
                 self.interaction_pairs = interaction_pairs;
@@ -3521,7 +3577,7 @@ impl KuromameApp {
             .unwrap_or("unknown")
             .to_string();
 
-        let boxsize = gro.box_line;
+        let boxsize = gro.box_vectors;
         self.data.structure_file = Some(StructureFile::Gro(gro));
         self.data.structure_file_path = Some(path);
         self.set_sim_cell(boxsize);
@@ -3705,12 +3761,9 @@ impl KuromameApp {
             return;
         };
 
-        // Update box for simulation cell render
-        let box_diag = (
-            frame.box_matrix[0][0],
-            frame.box_matrix[1][1],
-            frame.box_matrix[2][2],
-        );
+        // Update box for simulation cell render. The whole matrix travels, so a
+        // triclinic cell keeps its shape frame to frame.
+        let box_vectors = frame.box_matrix;
 
         let positions: Vec<Vec3> = frame
             .positions
@@ -3718,7 +3771,7 @@ impl KuromameApp {
             .map(|p| Vec3::new(p[0], p[1], p[2]))
             .collect();
 
-        self.apply_positions(positions, box_diag);
+        self.apply_positions(positions, box_vectors);
         self.traj_ui.current_frame = idx;
         self.traj_ui.interp_sub = 0;
     }
@@ -3741,11 +3794,15 @@ impl KuromameApp {
         }
 
         let lerp = |x: f32, y: f32| x + (y - x) * t;
-        let box_diag = (
-            lerp(a.box_matrix[0][0], b.box_matrix[0][0]),
-            lerp(a.box_matrix[1][1], b.box_matrix[1][1]),
-            lerp(a.box_matrix[2][2], b.box_matrix[2][2]),
-        );
+        // Interpolate the whole box, not just its diagonal, so a triclinic cell
+        // does not snap square between frames.
+        let mut box_vectors = [[0.0f32; 3]; 3];
+        for (row, (from, to)) in box_vectors.iter_mut().zip(a.box_matrix.iter().zip(&b.box_matrix))
+        {
+            for (component, (x, y)) in row.iter_mut().zip(from.iter().zip(to)) {
+                *component = lerp(*x, *y);
+            }
+        }
 
         // Minimum-image (nearest-image) interpolation: when an atom wraps across
         // a periodic boundary between the two frames its raw displacement spans
@@ -3775,14 +3832,14 @@ impl KuromameApp {
             })
             .collect();
 
-        self.apply_positions(positions, box_diag);
+        self.apply_positions(positions, box_vectors);
     }
 
     /// Push a set of atom positions (and simulation-cell box) into the viewport,
     /// reusing the current molecule's bonds/metadata/camera when the atom count
     /// matches. Shared by exact and interpolated frame display.
-    fn apply_positions(&mut self, positions: Vec<Vec3>, box_diag: (f32, f32, f32)) {
-        self.set_sim_cell(box_diag);
+    fn apply_positions(&mut self, positions: Vec<Vec3>, box_vectors: [[f32; 3]; 3]) {
+        self.set_sim_cell(box_vectors);
 
         let same_atom_count = self
             .molecule

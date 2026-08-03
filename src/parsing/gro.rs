@@ -109,6 +109,15 @@ pub struct GroFile {
     pub atom_count_line: String,
     pub atoms: Vec<GroAtomRecord>,
     pub box_line: (f32, f32, f32),
+    /// The three cell vectors, in nanometers.
+    ///
+    /// A GRO box line carries three values for a rectangular box and nine for a
+    /// triclinic one, in GROMACS' order
+    /// `v1(x) v2(y) v3(z) v1(y) v1(z) v2(x) v2(z) v3(x) v3(y)`. The rhombic
+    /// dodecahedron and truncated octahedron most solvated systems use are
+    /// written as triclinic, so the off-diagonal terms are not a rare case --
+    /// dropping them puts the periodic images in the wrong place.
+    pub box_vectors: [[f32; 3]; 3],
 }
 
 impl GroFile {
@@ -119,45 +128,28 @@ impl GroFile {
         let declared_atom_count = atom_count_line.trim().parse::<usize>().unwrap_or(0);
 
         let mut atoms = Vec::with_capacity(declared_atom_count.min(MAX_PREALLOC_ATOMS));
-        let mut box_line = (0.0, 0.0, 0.0);
+        // The last non-atom line is the box; keeping it as text means the
+        // triclinic form survives to `parse_box_line` intact.
+        let mut box_line = String::new();
 
         for line in iter {
-            if box_line == (0.0, 0.0, 0.0) && !line.trim().is_empty() {
-                if let Some(atom) = GroAtomRecord::from_line(line) {
-                    atoms.push(atom);
-                } else {
-                    box_line = line
-                        .split_whitespace()
-                        .filter_map(|s| s.parse::<f32>().ok())
-                        .take(3)
-                        .fold((0.0, 0.0, 0.0), |acc, val| {
-                            (
-                                if acc.0 == 0.0 { val } else { acc.0 },
-                                if acc.1 == 0.0 { val } else { acc.1 },
-                                if acc.2 == 0.0 { val } else { acc.2 },
-                            )
-                        });
-                }
-            } else if !box_line.eq(&(0.0, 0.0, 0.0)) {
-                box_line = line
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<f32>().ok())
-                    .take(3)
-                    .fold(box_line, |acc, val| {
-                        (
-                            if acc.0 == 0.0 { val } else { acc.0 },
-                            if acc.1 == 0.0 { val } else { acc.1 },
-                            if acc.2 == 0.0 { val } else { acc.2 },
-                        )
-                    });
+            if line.trim().is_empty() {
+                continue;
+            }
+            match GroAtomRecord::from_line(line) {
+                Some(atom) if box_line.is_empty() => atoms.push(atom),
+                _ => box_line = line.to_string(),
             }
         }
+
+        let (diagonal, box_vectors) = Self::parse_box_line(&box_line);
 
         Self {
             title,
             atom_count_line,
             atoms,
-            box_line,
+            box_line: diagonal,
+            box_vectors,
         }
     }
 
@@ -170,6 +162,34 @@ impl GroFile {
             vec.first().copied().unwrap_or(0.0),
             vec.get(1).copied().unwrap_or(0.0),
             vec.get(2).copied().unwrap_or(0.0),
+        )
+    }
+
+    /// The numbers on a GRO box line, as three cell vectors.
+    ///
+    /// Three values give an axis-aligned box; nine add the off-diagonal terms
+    /// of a triclinic one. Anything absent is zero, so a truncated line
+    /// degrades to a smaller box rather than failing the load.
+    fn box_vectors_from(values: &[f32]) -> [[f32; 3]; 3] {
+        let at = |i: usize| values.get(i).copied().unwrap_or(0.0);
+        // GROMACS order: v1(x) v2(y) v3(z) v1(y) v1(z) v2(x) v2(z) v3(x) v3(y)
+        [
+            [at(0), at(3), at(4)],
+            [at(5), at(1), at(6)],
+            [at(7), at(8), at(2)],
+        ]
+    }
+
+    /// Parse a whole box line into `(diagonal, vectors)`.
+    fn parse_box_line(line: &str) -> ((f32, f32, f32), [[f32; 3]; 3]) {
+        let values: Vec<f32> = line
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f32>().ok())
+            .take(9)
+            .collect();
+        (
+            Self::vec3_to_box_line(&values),
+            Self::box_vectors_from(&values),
         )
     }
 
@@ -227,17 +247,14 @@ impl GroFile {
                 ));
             }
 
-        let box_values = box_line
-            .split_whitespace()
-            .filter_map(|s| s.parse::<f32>().ok())
-            .take(3)
-            .collect::<Vec<f32>>();
+        let (diagonal, box_vectors) = Self::parse_box_line(&box_line);
 
         Ok(Self {
             title,
             atom_count_line,
             atoms,
-            box_line: Self::vec3_to_box_line(&box_values),
+            box_line: diagonal,
+            box_vectors,
         })
     }
 
@@ -245,6 +262,29 @@ impl GroFile {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         Self::load_from_reader(reader)
+    }
+
+    /// Whether any off-diagonal cell component is non-zero.
+    pub fn is_triclinic(&self) -> bool {
+        let v = self.box_vectors;
+        [v[0][1], v[0][2], v[1][0], v[1][2], v[2][0], v[2][1]]
+            .iter()
+            .any(|c| c.abs() > 0.0)
+    }
+
+    /// The box line as GROMACS writes it: three numbers for a rectangular box,
+    /// nine for a triclinic one, so a load/save round trip does not silently
+    /// square off a dodecahedral cell.
+    fn box_line_text(&self) -> String {
+        let v = self.box_vectors;
+        if self.is_triclinic() {
+            format!(
+                "{} {} {} {} {} {} {} {} {}",
+                v[0][0], v[1][1], v[2][2], v[0][1], v[0][2], v[1][0], v[1][2], v[2][0], v[2][1]
+            )
+        } else {
+            format!("{} {} {}", self.box_line.0, self.box_line.1, self.box_line.2)
+        }
     }
 
     pub fn dump(&self) -> String {
@@ -258,12 +298,7 @@ impl GroFile {
         for atom in &self.atoms {
             writeln!(out, "{}", atom.to_line()).unwrap();
         }
-        writeln!(
-            out,
-            "{} {} {}",
-            self.box_line.0, self.box_line.1, self.box_line.2
-        )
-        .unwrap();
+        writeln!(out, "{}", self.box_line_text()).unwrap();
         out
     }
 
@@ -444,6 +479,47 @@ mod tests {
 
     fn read(content: &str) -> io::Result<GroFile> {
         GroFile::load_from_reader(io::Cursor::new(content.as_bytes()))
+    }
+
+    /// A nine-number box line, in GROMACS' order
+    /// `v1(x) v2(y) v3(z) v1(y) v1(z) v2(x) v2(z) v3(x) v3(y)`. This is how a
+    /// rhombic dodecahedron -- the default for a solvated protein -- is written.
+    const TRICLINIC_BOX: &str =
+        "   6.00000   6.00000   4.24264   0.00000   0.00000   3.00000   0.00000   3.00000   3.00000";
+
+    #[test]
+    fn a_triclinic_box_line_keeps_its_off_diagonal_terms() {
+        let gro = read(&format!(
+            "title\n    1\n{ATOM_A}\n{TRICLINIC_BOX}\n"
+        ))
+        .unwrap();
+
+        assert!(gro.is_triclinic());
+        // Diagonal, for anything that only wants edge lengths.
+        assert_eq!(gro.box_line, (6.0, 6.0, 4.24264));
+        // The three cell vectors, which is what the periodic images follow.
+        assert_eq!(gro.box_vectors[0], [6.0, 0.0, 0.0]);
+        assert_eq!(gro.box_vectors[1], [3.0, 6.0, 0.0]);
+        assert_eq!(gro.box_vectors[2], [3.0, 3.0, 4.24264]);
+    }
+
+    #[test]
+    fn a_rectangular_box_line_yields_axis_aligned_vectors() {
+        let gro = read(&format!("title\n    1\n{ATOM_A}\n{BOX}\n")).unwrap();
+        assert!(!gro.is_triclinic());
+        assert_eq!(gro.box_vectors[0], [1.8206, 0.0, 0.0]);
+        assert_eq!(gro.box_vectors[1], [0.0, 1.8206, 0.0]);
+        assert_eq!(gro.box_vectors[2], [0.0, 0.0, 1.8206]);
+    }
+
+    /// Saving must not silently square off a dodecahedral cell.
+    #[test]
+    fn a_triclinic_box_survives_a_round_trip() {
+        let gro = read(&format!("title\n    1\n{ATOM_A}\n{TRICLINIC_BOX}\n")).unwrap();
+        let reloaded = read(&gro.dump()).unwrap();
+
+        assert!(reloaded.is_triclinic());
+        assert_eq!(reloaded.box_vectors, gro.box_vectors);
     }
 
     #[test]

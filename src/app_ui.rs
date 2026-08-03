@@ -1327,6 +1327,51 @@ fn tab_short_name(name: &str) -> String {
 }
 
 /// Bottom dock: render-style segmented control + trajectory transport.
+/// Per-axis periodic replication spinners.
+///
+/// Only shown once a simulation box is loaded, since there is nothing to
+/// replicate along without one. The counts are replicas *on each side*, so 1
+/// means three cells along that axis.
+fn periodic_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    if !app.has_simulation_cell() {
+        return;
+    }
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    let mut counts = app.periodic_counts();
+    let total: usize = counts.iter().map(|c| (2 * *c as usize) + 1).product();
+
+    ui.label("PBC")
+        .on_hover_text("Repeat the simulation cell along each cell vector");
+
+    let mut changed = false;
+    for (axis, label) in ["a", "b", "c"].iter().enumerate() {
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut counts[axis])
+                    .speed(0.05)
+                    .range(0..=4)
+                    .prefix(format!("{label} ±")),
+            )
+            .on_hover_text(
+                "Replicas drawn on each side along this cell vector. \
+                 The geometry is not duplicated -- each image is one extra draw.",
+            )
+            .changed();
+    }
+
+    if counts != [0, 0, 0] {
+        ui.weak(format!("{total} cells"));
+    }
+
+    if changed {
+        app.set_periodic_counts(counts);
+    }
+}
+
 pub fn render_bottom_dock(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::bottom("bottom_dock")
         .frame(
@@ -1361,6 +1406,8 @@ pub fn render_bottom_dock(app: &mut KuromameApp, ui: &mut egui::Ui) {
                 {
                     app.set_axis_visible(axes);
                 }
+
+                periodic_controls(app, ui);
 
                 ui.add_space(10.0);
                 ui.separator();
