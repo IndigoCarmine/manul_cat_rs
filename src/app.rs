@@ -354,12 +354,12 @@ struct TrajectoryUiState {
     interp_sub: u32,
 }
 
-/// Most replicas the UI offers on each side of each axis.
+/// Most cells the UI offers along one axis.
 ///
 /// The library caps the total image count anyway; this keeps the spinner from
-/// offering a number that would silently be clamped, and 4 already means 729
-/// images -- the library's own ceiling.
-const MAX_PERIODIC_REPLICAS: u32 = 4;
+/// offering a number that would silently be clamped, and 9 cells on each axis
+/// is already 729 images -- the library's own ceiling.
+const MAX_PERIODIC_CELLS: u32 = 9;
 
 /// Default color for the base structure's own dot surface.
 const BASE_SURFACE_COLOR: [f32; 3] = [0.35, 0.72, 0.95];
@@ -568,8 +568,8 @@ pub struct KuromameApp {
     /// images are both derived from it, and their states have to be written
     /// together.
     sim_cell: [[f32; 3]; 3],
-    /// Periodic replicas drawn on each side along each cell vector.
-    periodic_counts: [u32; 3],
+    /// Cells drawn along each cell vector, the primary cell included.
+    periodic_cells: [u32; 3],
     /// `false` once `bead_types` matches the current molecule/topology. Lets
     /// `recompute_bead_types` skip its O(atoms) rebuild (which re-expands the whole
     /// topology) on visibility-only viewport rebuilds — bead types depend on the
@@ -756,7 +756,7 @@ impl KuromameApp {
             martini_visible: true,
             axis_visible: true,
             sim_cell: [[0.0; 3]; 3],
-            periodic_counts: [0, 0, 0],
+            periodic_cells: [1, 1, 1],
             pending_pick: None,
             pending_load: None,
         }
@@ -2258,27 +2258,29 @@ impl KuromameApp {
         !self.simulation_cell_state().is_empty()
     }
 
-    /// Replicas drawn on each side along each cell vector. `[0, 0, 0]` shows
-    /// only the primary cell.
-    pub fn periodic_counts(&self) -> [u32; 3] {
-        self.periodic_counts
+    /// Cells drawn along each cell vector, the primary cell included.
+    /// `[1, 1, 1]` shows only the primary cell.
+    pub fn periodic_cells(&self) -> [u32; 3] {
+        self.periodic_cells
     }
 
-    /// Set how far the cell is replicated for display.
+    /// Set how many cells to draw along each axis.
+    ///
+    /// A total rather than a per-side count, so 2x2x2 is as reachable as 3x3x3.
     ///
     /// Replication is a draw-time effect in the library -- the same geometry is
     /// redrawn per image -- so this costs no rebuild and no extra memory, and is
     /// cheap enough to drive straight from a spinner.
-    pub fn set_periodic_counts(&mut self, counts: [u32; 3]) {
-        let counts = counts.map(|c| c.min(MAX_PERIODIC_REPLICAS));
-        if self.periodic_counts != counts {
-            self.periodic_counts = counts;
+    pub fn set_periodic_cells(&mut self, cells: [u32; 3]) {
+        let cells = cells.map(|c| c.clamp(1, MAX_PERIODIC_CELLS));
+        if self.periodic_cells != cells {
+            self.periodic_cells = cells;
             self.refresh_periodic_images();
         }
     }
 
     fn refresh_periodic_images(&mut self) {
-        let images = PeriodicImages::new(self.simulation_cell_state(), self.periodic_counts);
+        let images = PeriodicImages::new(self.simulation_cell_state(), self.periodic_cells);
         self.viewport.set_periodic_images(Some(images));
     }
 

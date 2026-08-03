@@ -1330,8 +1330,9 @@ fn tab_short_name(name: &str) -> String {
 /// Per-axis periodic replication spinners.
 ///
 /// Only shown once a simulation box is loaded, since there is nothing to
-/// replicate along without one. The counts are replicas *on each side*, so 1
-/// means three cells along that axis.
+/// replicate along without one. Each number is how many cells to draw along
+/// that axis *in total*, so every block size is reachable — 2×2×2 as much as
+/// 3×3×3.
 fn periodic_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
     if !app.has_simulation_cell() {
         return;
@@ -1341,8 +1342,7 @@ fn periodic_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(10.0);
 
-    let mut counts = app.periodic_counts();
-    let total: usize = counts.iter().map(|c| (2 * *c as usize) + 1).product();
+    let mut cells = app.periodic_cells();
 
     ui.label("PBC")
         .on_hover_text("Repeat the simulation cell along each cell vector");
@@ -1351,24 +1351,28 @@ fn periodic_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
     for (axis, label) in ["a", "b", "c"].iter().enumerate() {
         changed |= ui
             .add(
-                egui::DragValue::new(&mut counts[axis])
+                egui::DragValue::new(&mut cells[axis])
                     .speed(0.05)
-                    .range(0..=4)
-                    .prefix(format!("{label} ±")),
+                    .range(1..=9)
+                    .prefix(format!("{label} ×")),
             )
             .on_hover_text(
-                "Replicas drawn on each side along this cell vector. \
-                 The geometry is not duplicated -- each image is one extra draw.",
+                "Cells drawn along this vector, this one included. \
+                 The geometry is not duplicated — each extra cell is one more draw.",
             )
             .changed();
     }
 
-    if counts != [0, 0, 0] {
-        ui.weak(format!("{total} cells"));
+    let total: usize = cells.iter().map(|c| *c as usize).product();
+    if total > 1 {
+        ui.weak(format!(
+            "{}×{}×{} = {total} cells",
+            cells[0], cells[1], cells[2]
+        ));
     }
 
     if changed {
-        app.set_periodic_counts(counts);
+        app.set_periodic_cells(cells);
     }
 }
 
