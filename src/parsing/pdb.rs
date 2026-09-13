@@ -1,4 +1,4 @@
-use crate::view_rs::{AtomMeta, To3dViewMolecule, view_atom};
+use crate::view_rs::{AtomMeta, To3dViewMolecule, push_named_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{ANGSTROM_TO_NM, Molecule, NM_TO_ANGSTROM, molecule::Bond};
 use std::collections::HashMap;
@@ -169,15 +169,15 @@ impl PdbFile {
 
         for (idx, atom) in molecule.atoms.iter().enumerate() {
             let serial = idx + 1;
-            let name = atom
-                .name()
+            let name = molecule
+                .name_of(atom)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| atom.element.to_string());
 
-            let res_name = atom
-                .res_name()
+            let res_name = molecule
+                .res_name_of(atom)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
@@ -202,17 +202,17 @@ impl PdbFile {
                 x: atom.position.x * NM_TO_ANGSTROM,
                 y: atom.position.y * NM_TO_ANGSTROM,
                 z: atom.position.z * NM_TO_ANGSTROM,
-                occupancy: atom.occupancy().unwrap_or(1.0),
-                temp_factor: atom.temp_factor().unwrap_or(0.0),
+                occupancy: molecule.occupancy(idx).unwrap_or(1.0),
+                temp_factor: molecule.temp_factor(idx).unwrap_or(0.0),
                 element,
-                charge: atom.charge().unwrap_or_default().to_string(),
+                charge: molecule.charge(idx).unwrap_or_default().to_string(),
             }));
         }
 
         let mut bonded_by_atom: HashMap<usize, Vec<usize>> = HashMap::new();
         for bond in &molecule.bonds {
-            let a = bond.atom_a + 1;
-            let b = bond.atom_b + 1;
+            let (a, b) = bond.endpoints();
+            let (a, b) = (a + 1, b + 1);
             bonded_by_atom.entry(a).or_default().push(b);
             bonded_by_atom.entry(b).or_default().push(a);
         }
@@ -233,31 +233,34 @@ impl PdbFile {
 
 impl To3dViewMolecule for PdbFile {
     fn to_molecule(&self) -> Molecule {
-        let mut atoms = Vec::new();
+        // The builder owns the molecule's symbol table, so each distinct atom,
+        // residue and charge string is interned once rather than cloned per
+        // atom out of the retained `AtomRecord`s.
+        let mut builder = Molecule::builder();
         let mut bonds = Vec::new();
 
         let mut serial_to_index = HashMap::new();
 
         for (i, record) in self.atoms().enumerate() {
             serial_to_index.insert(record.serial, i);
-            atoms.push(view_atom(
+            push_named_atom(
+                &mut builder,
                 Vec3::new(
                     record.x * ANGSTROM_TO_NM,
                     record.y * ANGSTROM_TO_NM,
                     record.z * ANGSTROM_TO_NM,
                 ),
                 &record.element,
-                i,
-                Some(AtomMeta {
-                    name: Some(record.name.clone()),
-                    res_name: Some(record.res_name.clone()),
+                &AtomMeta {
+                    name: Some(&record.name),
+                    res_name: Some(&record.res_name),
                     chain_id: Some(record.chain_id),
                     res_seq: Some(record.res_seq),
                     occupancy: Some(record.occupancy),
                     temp_factor: Some(record.temp_factor),
-                    charge: Some(record.charge.clone()),
-                }),
-            ));
+                    charge: Some(&record.charge),
+                },
+            );
         }
 
         for line in &self.lines {
@@ -266,17 +269,13 @@ impl To3dViewMolecule for PdbFile {
                     for &bonded_serial in &c.bonded {
                         if let Some(&idx_b) = serial_to_index.get(&bonded_serial)
                             && idx_a < idx_b {
-                                bonds.push(Bond {
-                                    atom_a: idx_a,
-                                    atom_b: idx_b,
-                                    order: 1,
-                                });
+                                bonds.push(Bond::new(idx_a, idx_b, 1));
                             }
                     }
                 }
         }
 
-        Molecule::from_atoms_bonds(atoms, bonds)
+        builder.finish(bonds)
     }
 }
 

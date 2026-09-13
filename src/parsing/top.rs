@@ -524,28 +524,43 @@ impl TopFile {
     ///
     /// Returns an empty vector when the file has no molecule templates/instances
     /// (e.g. a force-field-only `.itp`), in which case there is nothing to align.
-    pub fn expanded_atom_types(&self) -> Vec<String> {
+    /// Visit the atom type of every atom the topology expands to, in order.
+    ///
+    /// A callback rather than a `Vec<String>`: the expansion repeats the same
+    /// handful of type names once per atom, and the caller interns them, so
+    /// materializing a per-atom `String` first would be the very allocation the
+    /// interning exists to avoid.
+    pub fn for_each_expanded_atom_type(&self, mut visit: impl FnMut(&str)) {
         let (templates, instances) = self.parse_layout();
-        let mut out = Vec::new();
+        let mut emitted = 0usize;
         for instance in &instances {
             let Some(template) = templates.iter().find(|t| t.name == instance.name) else {
                 continue;
             };
             // Skip empty templates so a huge `nmols` cannot spin the inner loop
             // billions of times with nothing to append, and stop once the cap is
-            // reached so an absurd count cannot grow `out` until the allocator
-            // aborts. `nmols` is untrusted (read verbatim from `[ molecules ]`).
+            // reached so an absurd count cannot run on forever. `nmols` is
+            // untrusted (read verbatim from `[ molecules ]`).
             if template.atoms.is_empty() {
                 continue;
             }
             for _ in 0..instance.nmols {
-                if out.len().saturating_add(template.atoms.len()) > MAX_EXPANDED_ATOMS {
-                    return out;
+                if emitted.saturating_add(template.atoms.len()) > MAX_EXPANDED_ATOMS {
+                    return;
                 }
-                out.extend(template.atoms.iter().map(|a| a.atom_type.clone()));
+                for atom in &template.atoms {
+                    visit(&atom.atom_type);
+                }
+                emitted += template.atoms.len();
             }
         }
-        out
+    }
+
+    /// How many atoms the topology expands to.
+    pub fn expanded_atom_count(&self) -> usize {
+        let mut count = 0usize;
+        self.for_each_expanded_atom_type(|_| count += 1);
+        count
     }
 }
 
@@ -879,6 +894,6 @@ mod tests {
             top.generate_molecule_with_gro(&GroFile::default())
                 .is_ok()
         );
-        assert_eq!(top.expanded_atom_types().len(), 4);
+        assert_eq!(top.expanded_atom_count(), 4);
     }
 }

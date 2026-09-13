@@ -1,4 +1,4 @@
-use crate::view_rs::{AtomMeta, To3dViewMolecule, view_atom};
+use crate::view_rs::{AtomMeta, To3dViewMolecule, push_named_atom};
 use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{
     Molecule,
@@ -379,11 +379,7 @@ impl GroFile {
                                 let rj = Self::covalent_radius_nm(&atoms[j].element);
                                 let max_bond_distance = ri + rj + EXTRA_TOLERANCE;
                                 if distance <= max_bond_distance * max_bond_distance {
-                                    bonds.push(Bond {
-                                        atom_a: j,
-                                        atom_b: i,
-                                        order: 1,
-                                    });
+                                    bonds.push(Bond::new(j, i, 1));
                                 }
                             }
                         }
@@ -414,25 +410,27 @@ impl GroFile {
         // Viewer molecule coordinates are interpreted in nm.
         // GRO is also nm, so pass through coordinates without scaling.
 
-        let atoms = self
-            .atoms()
-            .enumerate()
-            .map(|(idx, atom)| {
-                let meta = AtomMeta {
-                    name: include_metadata.then(|| atom.atom_name.trimmed().to_string()),
-                    res_name: include_metadata.then(|| atom.res_name.trimmed().to_string()),
+        // Atoms go through the builder rather than a plain `Vec`: it owns the
+        // molecule's symbol table, so the handful of distinct atom and residue
+        // names in a solvated system are each interned once instead of stored
+        // per atom.
+        let mut builder = Molecule::builder_with_capacity(self.atoms.len());
+        for atom in self.atoms() {
+            let atom_name = atom.atom_name.trimmed();
+            push_named_atom(
+                &mut builder,
+                Vec3::new(atom.x, atom.y, atom.z),
+                &Self::infer_element(atom_name),
+                &AtomMeta {
+                    name: include_metadata.then_some(atom_name),
+                    res_name: include_metadata.then_some(atom.res_name.trimmed()),
                     chain_id: Some('A'),
                     res_seq: Some(atom.res_num),
                     ..AtomMeta::default()
-                };
-                view_atom(
-                    Vec3::new(atom.x, atom.y, atom.z),
-                    &Self::infer_element(atom.atom_name.trimmed()),
-                    idx,
-                    Some(meta),
-                )
-            })
-            .collect::<Vec<_>>();
+                },
+            );
+        }
+        let atom_count = builder.len();
 
         let bonds = if let Some(pairs) = override_bonds {
             // Convert 1-based pairs into viewer Bond structs with 0-based indices.
@@ -447,18 +445,15 @@ impl GroFile {
                     // 1-based atom number.
                     let atom_a = a.checked_sub(1)?;
                     let atom_b = b.checked_sub(1)?;
-                    (atom_a < atoms.len() && atom_b < atoms.len()).then_some(Bond {
-                        atom_a,
-                        atom_b,
-                        order: 1,
-                    })
+                    (atom_a < atom_count && atom_b < atom_count)
+                        .then(|| Bond::new(atom_a, atom_b, 1))
                 })
                 .collect()
         } else {
-            Self::infer_single_bonds_from_distance(&atoms)
+            Self::infer_single_bonds_from_distance(builder.atoms())
         };
 
-        Molecule::from_atoms_bonds(atoms, bonds)
+        builder.finish(bonds)
     }
 }
 
@@ -583,10 +578,9 @@ mod tests {
         // A TOP describing a bigger system: only (1,2) is representable here.
         let mol = gro.to_molecule_with_metadata(true, Some(&[(1, 2), (2, 5000), (0, 1)]));
         assert_eq!(mol.bonds.len(), 1);
-        assert!(
-            mol.bonds
-                .iter()
-                .all(|b| b.atom_a < mol.atoms.len() && b.atom_b < mol.atoms.len())
-        );
+        assert!(mol.bonds.iter().all(|bond| {
+            let (a, b) = bond.endpoints();
+            a < mol.atoms.len() && b < mol.atoms.len()
+        }));
     }
 }
