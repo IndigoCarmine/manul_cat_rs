@@ -20,7 +20,7 @@ license = "AGPL-3.0-or-later"
 #   moleucle_3dview_rs = { path = "../moleucle_3dview_rs" }
 # and keep the version above in step with the local crate's, or Cargo falls back
 # to the git source without saying so.
-moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", rev = "4ffd58d85a13785c63db3a2116c8128647f2c972", version = "0.12.0" }
+moleucle_3dview_rs = { git = "https://github.com/IndigoCarmine/moleucle_3dview_rs.git", rev = "d0045a0d95d4ca6dd4eccfdee433b6d6b569b613", version = "0.12.0" }
 
 eframe = "0.35.0"
 egui = "0.35.0"
