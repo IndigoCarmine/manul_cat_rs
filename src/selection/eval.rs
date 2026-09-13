@@ -14,16 +14,32 @@ use super::ast::{CountSpec, Expr, Hybrid, NumRange};
 /// This exists because the pre-existing `KuromameApp::atom_name_at` reaches for
 /// `gro.atoms().nth(i)` / `pdb.atoms().nth(i)`, which is O(n) per atom and makes
 /// any whole-molecule scan O(n²). Every field below is a direct index instead.
+///
+/// The three name columns are interned: a `Vec<String>` per column cost ~92
+/// bytes and three allocations per atom (17.5 MB on a 200k-atom system) to hold
+/// a few dozen distinct strings. They are now `u32` ids into `names`, which
+/// also makes every predicate an integer compare rather than a string compare.
 pub struct AtomTable {
     pub n: usize,
-    /// Uppercased, trimmed residue names. Empty string when the atom has none.
-    res_name: Vec<String>,
-    res_seq: Vec<Option<i32>>,
-    /// Uppercased, trimmed atom names, falling back to the element symbol the
-    /// way `atom_name_at` does.
-    name: Vec<String>,
-    /// Uppercased, trimmed element symbols.
-    element: Vec<String>,
+    /// Every distinct uppercased, trimmed string the three columns below refer
+    /// to, stored once. Shared across the columns, so the same id means the
+    /// same text whichever column it came from.
+    names: Vec<Box<str>>,
+    /// Residue name of each atom, as an index into `names`. Atoms with no
+    /// residue name point at the interned empty string.
+    res_name: Vec<u32>,
+    /// Atom name of each atom, falling back to the element symbol the way
+    /// `atom_name_at` does.
+    name: Vec<u32>,
+    /// Element symbol of each atom.
+    element: Vec<u32>,
+    /// Residue sequence number, or [`NO_RES_SEQ`] where the atom has none.
+    res_seq: Vec<i32>,
+    /// The ids each column actually uses, sorted. Lets `has_res_name` and its
+    /// siblings answer from a handful of entries instead of scanning every atom.
+    res_name_used: Vec<u32>,
+    name_used: Vec<u32>,
+    element_used: Vec<u32>,
     /// Neighbour lists in CSR form: atom `i`'s neighbours are
     /// `adj[adj_start[i]..adj_start[i + 1]]`.
     adj_start: Vec<u32>,
@@ -33,28 +49,68 @@ pub struct AtomTable {
     pub has_bonds: bool,
 }
 
+/// Stored in [`AtomTable::res_seq`] for an atom whose source gave no residue
+/// number. No coordinate format can write `i32::MIN` in a residue field.
+const NO_RES_SEQ: i32 = i32::MIN;
+
+/// Interns uppercased, trimmed strings while the table is being built.
+#[derive(Default)]
+struct Interner {
+    names: Vec<Box<str>>,
+    index: std::collections::HashMap<Box<str>, u32>,
+}
+
+impl Interner {
+    fn intern(&mut self, text: &str) -> u32 {
+        if let Some(&id) = self.index.get(text) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        let boxed: Box<str> = text.into();
+        self.names.push(boxed.clone());
+        self.index.insert(boxed, id);
+        id
+    }
+}
+
+/// The distinct ids in `column`, sorted, for the `has_*` checks.
+fn used_ids(column: &[u32]) -> Vec<u32> {
+    let mut ids = column.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 impl AtomTable {
     pub fn from_molecule(mol: &Molecule) -> Self {
         let n = mol.atoms.len();
+        let mut interner = Interner::default();
         let mut res_name = Vec::with_capacity(n);
         let mut res_seq = Vec::with_capacity(n);
         let mut name = Vec::with_capacity(n);
         let mut element = Vec::with_capacity(n);
 
+        // Scratch reused across atoms so uppercasing does not allocate a fresh
+        // `String` per atom on the way into the interner.
+        let mut scratch = String::new();
+        let mut intern_upper = |interner: &mut Interner, text: &str| -> u32 {
+            scratch.clear();
+            scratch.extend(text.trim().chars().map(|c| c.to_ascii_uppercase()));
+            interner.intern(&scratch)
+        };
+
         for atom in &mol.atoms {
-            let elem = atom.element.trim().to_ascii_uppercase();
-            res_name.push(
-                atom.res_name()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_uppercase(),
-            );
-            res_seq.push(atom.res_seq());
-            let atom_name = atom.name().map(str::trim).unwrap_or("");
+            let elem = intern_upper(&mut interner, atom.element.as_str());
+            res_name.push(intern_upper(
+                &mut interner,
+                mol.res_name_of(atom).unwrap_or(""),
+            ));
+            res_seq.push(atom.res_seq().unwrap_or(NO_RES_SEQ));
+            let atom_name = mol.name_of(atom).map(str::trim).unwrap_or("");
             name.push(if atom_name.is_empty() {
-                elem.clone()
+                elem
             } else {
-                atom_name.to_ascii_uppercase()
+                intern_upper(&mut interner, atom_name)
             });
             element.push(elem);
         }
@@ -65,9 +121,10 @@ impl AtomTable {
         let mut degree = vec![0u32; n];
         let mut usable = 0usize;
         for bond in &mol.bonds {
-            if bond.atom_a < n && bond.atom_b < n && bond.atom_a != bond.atom_b {
-                degree[bond.atom_a] += 1;
-                degree[bond.atom_b] += 1;
+            let (atom_a, atom_b) = bond.endpoints();
+            if atom_a < n && atom_b < n && atom_a != atom_b {
+                degree[atom_a] += 1;
+                degree[atom_b] += 1;
                 usable += 1;
             }
         }
@@ -81,16 +138,21 @@ impl AtomTable {
         let mut cursor = adj_start.clone();
         let mut adj = vec![0u32; running as usize];
         for bond in &mol.bonds {
-            if bond.atom_a < n && bond.atom_b < n && bond.atom_a != bond.atom_b {
-                adj[cursor[bond.atom_a] as usize] = bond.atom_b as u32;
-                cursor[bond.atom_a] += 1;
-                adj[cursor[bond.atom_b] as usize] = bond.atom_a as u32;
-                cursor[bond.atom_b] += 1;
+            let (atom_a, atom_b) = bond.endpoints();
+            if atom_a < n && atom_b < n && atom_a != atom_b {
+                adj[cursor[atom_a] as usize] = atom_b as u32;
+                cursor[atom_a] += 1;
+                adj[cursor[atom_b] as usize] = atom_a as u32;
+                cursor[atom_b] += 1;
             }
         }
 
         Self {
             n,
+            res_name_used: used_ids(&res_name),
+            name_used: used_ids(&name),
+            element_used: used_ids(&element),
+            names: interner.names,
             res_name,
             res_seq,
             name,
@@ -111,24 +173,72 @@ impl AtomTable {
         (self.adj_start[atom + 1] - self.adj_start[atom]) as usize
     }
 
+    /// Residue-name id of every atom, in atom order.
+    pub fn res_name_ids(&self) -> &[u32] {
+        &self.res_name
+    }
+
+    /// Atom-name id of every atom, in atom order.
+    pub fn name_ids(&self) -> &[u32] {
+        &self.name
+    }
+
+    /// Element id of every atom, in atom order.
+    pub fn element_ids(&self) -> &[u32] {
+        &self.element
+    }
+
+    /// Uppercased element symbol of one atom.
+    pub fn element(&self, atom: usize) -> &str {
+        self.text(self.element[atom])
+    }
+
+    /// Residue sequence number of one atom, where its source gave one.
+    pub fn res_seq(&self, atom: usize) -> Option<i32> {
+        self.res_seq
+            .get(atom)
+            .copied()
+            .filter(|seq| *seq != NO_RES_SEQ)
+    }
+
+    fn text(&self, id: u32) -> &str {
+        self.names.get(id as usize).map(|s| &**s).unwrap_or("")
+    }
+
+    /// The id `text` (already uppercased and trimmed) is interned under, or
+    /// `None` when this molecule uses no such string at all.
+    pub fn id_of(&self, text: &str) -> Option<u32> {
+        self.names
+            .iter()
+            .position(|candidate| &**candidate == text)
+            .map(|index| index as u32)
+    }
+
+    /// Ids for each of `words`, skipping the ones this molecule never uses.
+    /// Predicates compare ids, so the string work happens once per query rather
+    /// than once per atom.
+    pub fn ids_of(&self, words: &[String]) -> Vec<u32> {
+        words.iter().filter_map(|w| self.id_of(w)).collect()
+    }
+
     /// Distinct residue names present, uppercased.
     pub fn residue_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.res_name.clone();
-        names.sort_unstable();
-        names.dedup();
-        names
+        self.res_name_used
+            .iter()
+            .map(|&id| self.text(id).to_string())
+            .collect()
     }
 
-    fn has_res_name(&self, needle: &str) -> bool {
-        self.res_name.iter().any(|r| r == needle)
+    fn has_res_name(&self, id: u32) -> bool {
+        self.res_name_used.binary_search(&id).is_ok()
     }
 
-    fn has_element(&self, needle: &str) -> bool {
-        self.element.iter().any(|e| e == needle)
+    fn has_element(&self, id: u32) -> bool {
+        self.element_used.binary_search(&id).is_ok()
     }
 
-    fn has_atom_name(&self, needle: &str) -> bool {
-        self.name.iter().any(|nm| nm == needle)
+    fn has_atom_name(&self, id: u32) -> bool {
+        self.name_used.binary_search(&id).is_ok()
     }
 }
 
@@ -213,26 +323,29 @@ pub fn evaluate(
             }
         }
         Expr::ResName(names) => {
-            let wanted = upper(names);
-            for (slot, value) in set.iter_mut().zip(&ctx.table.res_name).take(n) {
-                *slot = wanted.iter().any(|w| w == value);
+            let wanted = ctx.table.ids_of(&upper(names));
+            for (slot, id) in set.iter_mut().zip(ctx.table.res_name_ids()).take(n) {
+                *slot = wanted.contains(id);
             }
         }
         Expr::Name(names) => {
-            let wanted = upper(names);
-            for (slot, value) in set.iter_mut().zip(&ctx.table.name).take(n) {
-                *slot = wanted.iter().any(|w| w == value);
+            let wanted = ctx.table.ids_of(&upper(names));
+            for (slot, id) in set.iter_mut().zip(ctx.table.name_ids()).take(n) {
+                *slot = wanted.contains(id);
             }
         }
         Expr::Element(names) => {
-            let wanted = upper(names);
-            for (slot, value) in set.iter_mut().zip(&ctx.table.element).take(n) {
-                *slot = wanted.iter().any(|w| w == value);
+            let wanted = ctx.table.ids_of(&upper(names));
+            for (slot, id) in set.iter_mut().zip(ctx.table.element_ids()).take(n) {
+                *slot = wanted.contains(id);
             }
         }
         Expr::ResId(ranges) => {
-            for (slot, seq) in set.iter_mut().zip(&ctx.table.res_seq).take(n) {
-                *slot = seq.is_some_and(|seq| in_ranges(ranges, seq as i64));
+            for (i, slot) in set.iter_mut().enumerate().take(n) {
+                *slot = ctx
+                    .table
+                    .res_seq(i)
+                    .is_some_and(|seq| in_ranges(ranges, seq as i64));
             }
         }
         Expr::Index(ranges) => {
@@ -253,7 +366,7 @@ pub fn evaluate(
                 });
             }
             for (i, slot) in set.iter_mut().enumerate().take(n) {
-                *slot = hybridisation(&ctx.table.element[i], ctx.table.degree(i)) == Some(*h);
+                *slot = hybridisation(ctx.table.element(i), ctx.table.degree(i)) == Some(*h);
             }
         }
         Expr::NumBonds(spec) => {
@@ -343,19 +456,32 @@ fn resolve_ident(word: &str, ctx: &EvalCtx<'_>) -> Result<(IdentKind, Vec<bool>)
         return Ok((IdentKind::Component, set));
     }
 
-    if ctx.table.has_res_name(&upper) {
-        let set = (0..n).map(|i| ctx.table.res_name[i] == upper).collect();
-        return Ok((IdentKind::ResName, set));
-    }
+    // A word this molecule never uses in any column resolves to nothing, so the
+    // three membership checks below are skipped along with it.
+    if let Some(id) = ctx.table.id_of(&upper) {
+        if ctx.table.has_res_name(id) {
+            let set = ctx.table.res_name_ids()[..n]
+                .iter()
+                .map(|v| *v == id)
+                .collect();
+            return Ok((IdentKind::ResName, set));
+        }
 
-    if ctx.table.has_element(&upper) {
-        let set = (0..n).map(|i| ctx.table.element[i] == upper).collect();
-        return Ok((IdentKind::Element, set));
-    }
+        if ctx.table.has_element(id) {
+            let set = ctx.table.element_ids()[..n]
+                .iter()
+                .map(|v| *v == id)
+                .collect();
+            return Ok((IdentKind::Element, set));
+        }
 
-    if ctx.table.has_atom_name(&upper) {
-        let set = (0..n).map(|i| ctx.table.name[i] == upper).collect();
-        return Ok((IdentKind::AtomName, set));
+        if ctx.table.has_atom_name(id) {
+            let set = ctx.table.name_ids()[..n]
+                .iter()
+                .map(|v| *v == id)
+                .collect();
+            return Ok((IdentKind::AtomName, set));
+        }
     }
 
     Err(EvalError::UnknownIdent {
@@ -457,46 +583,41 @@ mod tests {
     use super::*;
     use crate::selection::parser::parse_statement;
     use crate::selection::ast::Statement;
-    use crate::view_rs::{view_atom};
+    use crate::view_rs::push_named_atom;
     use lin_alg::f32::Vec3;
     use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 
     /// Propane, C3H8. Atom 0/1/2 are carbons (1 is the central CH2); 3..=10 are
     /// hydrogens: 3,4,5 on C0; 6,7 on C1; 8,9,10 on C2.
     fn propane() -> moleucle_3dview_rs::Molecule {
-        let meta = |name: &str, res: &str, seq: i32| {
-            Some(AtomMeta {
-                name: Some(name.to_string()),
-                res_name: Some(res.to_string()),
+        fn meta<'a>(name: &'a str, res: &'a str, seq: i32) -> AtomMeta<'a> {
+            AtomMeta {
+                name: Some(name),
+                res_name: Some(res),
                 chain_id: Some('A'),
                 res_seq: Some(seq),
-                occupancy: None,
-                temp_factor: None,
-                charge: None,
-            })
-        };
-        let mut atoms = Vec::new();
+                ..AtomMeta::default()
+            }
+        }
+        let mut builder = Molecule::builder();
         for (i, nm) in ["C1", "C2", "C3"].iter().enumerate() {
-            atoms.push(view_atom(
+            push_named_atom(
+                &mut builder,
                 Vec3::new(i as f32, 0.0, 0.0),
                 "C",
-                i,
-                meta(nm, "PRP", 1),
-            ));
+                &meta(nm, "PRP", 1),
+            );
         }
         for i in 0..8 {
-            atoms.push(view_atom(
+            let name = format!("H{i}");
+            push_named_atom(
+                &mut builder,
                 Vec3::new(i as f32, 1.0, 0.0),
                 "H",
-                3 + i,
-                meta(&format!("H{i}"), "PRP", 1),
-            ));
+                &meta(&name, "PRP", 1),
+            );
         }
-        let bond = |a: usize, b: usize| Bond {
-            atom_a: a,
-            atom_b: b,
-            order: 1,
-        };
+        let bond = |a: usize, b: usize| Bond::new(a, b, 1);
         let bonds = vec![
             bond(0, 1),
             bond(1, 2),
@@ -509,7 +630,7 @@ mod tests {
             bond(2, 9),
             bond(2, 10),
         ];
-        Molecule::from_atoms_bonds(atoms, bonds)
+        builder.finish(bonds)
     }
 
     fn run(mol: &moleucle_3dview_rs::Molecule, src: &str) -> Vec<u32> {
@@ -687,11 +808,7 @@ mod tests {
         // A TOP describing more atoms than the GRO produces exactly this.
         let mol = propane();
         let mut bonds = mol.bonds.clone();
-        bonds.push(Bond {
-            atom_a: 0,
-            atom_b: 9999,
-            order: 1,
-        });
+        bonds.push(Bond::new(0, 9999, 1));
         let patched = Molecule::from_atoms_bonds(mol.atoms.clone(), bonds);
         let table = AtomTable::from_molecule(&patched);
         assert_eq!(table.degree(0), 4, "the bogus bond is dropped, not counted");

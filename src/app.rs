@@ -7,10 +7,9 @@ use crate::parsing::{
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
-use crate::view_rs::{To3dViewMolecule, view_atom};
+use crate::view_rs::{BeadTypes, To3dViewMolecule, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
-use moleucle_3dview_rs::molecule::AtomMeta;
 use moleucle_3dview_rs::{
     AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
     AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
@@ -447,7 +446,7 @@ struct Layer {
     surface_dots: Vec<Vec3>,
     surface_visible: bool,
     martini_ff: Option<MartiniForceField>,
-    bead_types: Vec<String>,
+    bead_types: BeadTypes,
     martini_visible: bool,
     // Per-structure UI state (mirrors the working copies in `UiState`).
     selector_input: String,
@@ -486,7 +485,7 @@ impl Layer {
             surface_dots: Vec::new(),
             surface_visible: true,
             martini_ff: None,
-            bead_types: Vec::new(),
+            bead_types: BeadTypes::default(),
             martini_visible: true,
             selector_input: String::new(),
             ndx_groups: Vec::new(),
@@ -507,7 +506,10 @@ pub struct LoadedFileRow {
 }
 
 pub struct KuromameApp {
-    molecule: Option<Molecule>,
+    /// The molecule lives in `viewport` and is read back through
+    /// [`InteractiveMoleculeViewport::molecule`]. Keeping a second copy here
+    /// doubled the cost of every loaded structure -- 27 MB on a 200k-atom
+    /// system -- for an array the viewer already owns.
     viewport: InteractiveMoleculeViewport,
     pub render_state: Option<egui_wgpu::RenderState>,
     data: LoadedDataState,
@@ -555,7 +557,7 @@ pub struct KuromameApp {
     martini_ff: Option<MartiniForceField>,
     /// Bead type of each atom in `self.molecule` (original-index order), taken
     /// from the topology's `atom_type` or the atom name. Empty when no molecule.
-    bead_types: Vec<String>,
+    bead_types: BeadTypes,
     /// Whether Martini bead spheres are drawn (only has an effect once a Martini
     /// force field is loaded and beads resolve to known types).
     martini_visible: bool,
@@ -587,6 +589,10 @@ pub struct KuromameApp {
     /// `update`/`ui` polls it and applies the finished payload on the UI thread.
     /// `None` when nothing is loading; at most one load runs at a time.
     pending_load: Option<PendingLoad>,
+    /// Scratch for the positions of the frame being displayed, reused across
+    /// frames. Playback used to build a fresh `Vec<Vec3>` per frame — 6 MB
+    /// allocated and freed per frame on a 500k-atom system, at playback rate.
+    frame_positions: Vec<Vec3>,
 }
 
 impl KuromameApp {
@@ -661,7 +667,7 @@ impl KuromameApp {
 
     /// Number of atoms in the currently loaded molecule (0 when none).
     pub fn atom_count(&self) -> usize {
-        self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0)
+        self.viewport.molecule().map(|m| m.atoms.len()).unwrap_or(0)
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -694,7 +700,6 @@ impl KuromameApp {
         });
 
         Self {
-            molecule: None,
             viewport,
             render_state: cc.wgpu_render_state.clone(),
             data: LoadedDataState {
@@ -751,7 +756,7 @@ impl KuromameApp {
             layers: vec![Layer::new("Layer 1".to_string(), LAYER_PALETTE[0])],
             active_layer: 0,
             martini_ff: None,
-            bead_types: Vec::new(),
+            bead_types: BeadTypes::default(),
             bead_types_dirty: true,
             martini_visible: true,
             axis_visible: true,
@@ -759,6 +764,7 @@ impl KuromameApp {
             periodic_cells: [1, 1, 1],
             pending_pick: None,
             pending_load: None,
+            frame_positions: Vec::new(),
         }
     }
 
@@ -1207,7 +1213,7 @@ impl KuromameApp {
 
     /// Open the image-export dialog, queueing a first preview render.
     pub fn open_export_image_dialog(&mut self) {
-        if self.molecule.is_none() {
+        if self.viewport.molecule().is_none() {
             self.set_status("Load a structure before exporting an image");
             return;
         }
@@ -1437,23 +1443,27 @@ impl KuromameApp {
         self.rebuild_viewport(true);
     }
 
-    /// Push the molecule to the viewport and re-derive every index-based render
-    /// state (NDX groups, interaction pairs, bead colours). This is the one
-    /// place geometry is handed to the viewport.
+    /// Re-derive every index-based render state (NDX groups, interaction pairs,
+    /// bead colours) against the molecule the viewport holds.
+    ///
+    /// The viewport owns the molecule, so nothing is handed to it here: an edit
+    /// reaches it through `molecule_mut`, which already bumps the render
+    /// revision. This used to re-`set_molecule` a full clone on every residue
+    /// toggle, which meant copying the whole atom array to say "something about
+    /// the view changed".
     ///
     /// Residue visibility is a mask on the viewport, not a filtered copy of the
     /// molecule, so every index here — selection, NDX groups, interaction pairs,
-    /// picking results — is a plain index into `self.molecule`.
+    /// picking results — is a plain index into the viewport's molecule.
     fn rebuild_viewport(&mut self, focus: bool) {
         // Keep bead types aligned with the current molecule before we (re)derive
         // any index-based render state below.
         self.recompute_bead_types();
 
-        let Some(full) = self.molecule.as_ref() else {
+        if self.viewport.molecule().is_none() {
             return;
-        };
+        }
 
-        self.viewport.set_molecule(full.clone());
         self.refresh_visible_atoms();
 
         if focus {
@@ -1471,7 +1481,7 @@ impl KuromameApp {
     /// Cheap enough to call on every residue toggle: it is one `Vec<bool>` and a
     /// geometry rebuild, with no molecule clone and no index remapping.
     fn refresh_visible_atoms(&mut self) {
-        let Some(full) = self.molecule.as_ref() else {
+        let Some(full) = self.viewport.molecule() else {
             self.viewport.set_visible_atoms(None);
             return;
         };
@@ -1503,25 +1513,25 @@ impl KuromameApp {
             return;
         }
         self.bead_types_dirty = false;
-        let Some(mol) = self.molecule.as_ref() else {
+        let Some(mol) = self.viewport.molecule() else {
             self.bead_types.clear();
             return;
         };
-        let from_top = self
-            .data
-            .top_file
-            .as_ref()
-            .map(|t| t.expanded_atom_types())
-            .filter(|types| types.len() == mol.atoms.len());
-
-        self.bead_types = match from_top {
-            Some(types) => types,
-            None => mol
-                .atoms
-                .iter()
-                .map(|a| a.name().unwrap_or_else(|| a.element.as_str()).to_string())
-                .collect(),
-        };
+        self.bead_types.clear();
+        // Prefer the topology's own `atom_type` column, but only when it
+        // describes exactly this molecule; otherwise fall back to atom names.
+        if let Some(top) = self.data.top_file.as_ref() {
+            let mut from_top = BeadTypes::default();
+            top.for_each_expanded_atom_type(|bead| from_top.push(bead));
+            if from_top.len() == mol.atoms.len() {
+                self.bead_types = from_top;
+                return;
+            }
+        }
+        for atom in &mol.atoms {
+            self.bead_types
+                .push(mol.name_of(atom).unwrap_or_else(|| atom.element.as_str()));
+        }
     }
 
     /// Push the current Martini bead styling to the viewport in viewport-index
@@ -1535,7 +1545,7 @@ impl KuromameApp {
     /// whose bead type is unknown fall back to their element radius/colour.
     fn refresh_martini_bead_state(&mut self) {
         let active =
-            self.martini_visible && self.martini_ff.is_some() && self.molecule.is_some();
+            self.martini_visible && self.martini_ff.is_some() && self.viewport.molecule().is_some();
         if !active {
             self.viewport.set_atom_radii(None);
             self.viewport.set_atom_colors(None);
@@ -1544,7 +1554,7 @@ impl KuromameApp {
 
         let (radii, colors) = {
             let ff = self.martini_ff.as_ref().unwrap();
-            let mol = self.molecule.as_ref().unwrap();
+            let mol = self.viewport.molecule().unwrap();
             // Per-atom overrides are indexed by the full molecule, hidden atoms
             // included -- the viewport masks visibility, it does not renumber.
             let count = mol.atoms.len();
@@ -1631,22 +1641,21 @@ impl KuromameApp {
     /// one-component-per-residue-name layout, which is exactly what the old
     /// `refresh_res_names` produced, so a fresh load looks unchanged.
     fn refresh_components(&mut self) {
-        let Some(mol) = self.molecule.as_ref() else {
+        let Some(mol) = self.viewport.molecule() else {
             return;
         };
         if self.components.matches_atom_count(mol.atoms.len()) && !self.components.is_empty() {
             return;
         }
         let had_components = !self.components.is_empty();
-        let mol = mol.clone();
         let previous_atoms = self.components.atom_count();
-        self.components.rebuild_from_molecule(&mol);
+        let atom_count = mol.atoms.len();
+        self.components.rebuild_from_molecule(mol);
         self.atom_table_dirty = true;
         if had_components {
             self.log_info(format!(
                 "components reset (atom count changed {} -> {})",
-                previous_atoms,
-                mol.atoms.len()
+                previous_atoms, atom_count
             ));
         }
     }
@@ -1682,7 +1691,7 @@ impl KuromameApp {
         if !self.atom_table_dirty && self.atom_table.is_some() {
             return;
         }
-        if let Some(mol) = self.molecule.as_ref() {
+        if let Some(mol) = self.viewport.molecule() {
             self.atom_table = Some(AtomTable::from_molecule(mol));
             self.atom_table_dirty = false;
         }
@@ -1750,7 +1759,7 @@ impl KuromameApp {
 
         // Everything except `list`/`help` needs a structure to talk about.
         let needs_molecule = !matches!(stmt, Statement::List | Statement::Help);
-        if needs_molecule && self.molecule.is_none() {
+        if needs_molecule && self.viewport.molecule().is_none() {
             self.log_error("no molecule loaded");
             self.set_status("No molecule loaded");
             return;
@@ -1778,7 +1787,7 @@ impl KuromameApp {
                     &name,
                     &atoms,
                     Some(line.clone()),
-                    self.molecule.as_ref().expect("checked above"),
+                    self.viewport.molecule().expect("checked above"),
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -1812,7 +1821,7 @@ impl KuromameApp {
                 for name in &names {
                     match self
                         .components
-                        .dissolve(name, self.molecule.as_ref().expect("checked above"))
+                        .dissolve(name, self.viewport.molecule().expect("checked above"))
                     {
                         Ok(count) => moved += count,
                         Err(err) => {
@@ -1854,8 +1863,8 @@ impl KuromameApp {
             }
 
             Statement::Reset => {
-                let mol = self.molecule.clone().expect("checked above");
-                self.components.rebuild_from_molecule(&mol);
+                let mol = self.viewport.molecule().expect("checked above");
+                self.components.rebuild_from_molecule(mol);
                 let msg = format!("reset to {} residue components", self.components.len());
                 self.log_info(format!("  {msg}"));
                 self.set_status(msg);
@@ -1956,7 +1965,7 @@ impl KuromameApp {
         // resurrect the old molecule from `base_molecule`, so drop a trajectory
         // that no longer matches. One whose atom count still fits (the same
         // system reloaded) is kept so a reload does not throw it away.
-        if let Some(mol) = self.molecule.as_ref() {
+        if let Some(mol) = self.viewport.molecule() {
             let atom_count = mol.atoms.len();
             let stale = self
                 .trajectory
@@ -2120,7 +2129,7 @@ impl KuromameApp {
     /// are untouched (they never live in the working fields).
     fn save_active_layer(&mut self) {
         let a = self.active_layer;
-        self.layers[a].molecule = self.molecule.take();
+        self.layers[a].molecule = self.viewport.take_molecule();
         self.layers[a].base_molecule = self.base_molecule.take();
         self.layers[a].data = std::mem::take(&mut self.data);
         self.layers[a].selection = std::mem::take(&mut self.selection);
@@ -2146,7 +2155,12 @@ impl KuromameApp {
     /// caller is responsible for refreshing the view afterwards.
     fn load_active_layer(&mut self, idx: usize) {
         self.active_layer = idx;
-        self.molecule = self.layers[idx].molecule.take();
+        match self.layers[idx].molecule.take() {
+            Some(mol) => self.viewport.set_molecule(mol),
+            None => {
+                self.viewport.take_molecule();
+            }
+        }
         self.base_molecule = self.layers[idx].base_molecule.take();
         self.data = std::mem::take(&mut self.layers[idx].data);
         self.selection = std::mem::take(&mut self.layers[idx].selection);
@@ -2176,7 +2190,7 @@ impl KuromameApp {
     /// when the layer is empty), restore its simulation cell, and redraw the
     /// non-active layers as spheres. Call after any active-layer swap.
     fn refresh_active_view(&mut self, focus: bool) {
-        if self.molecule.is_some() {
+        if self.viewport.molecule().is_some() {
             self.rebuild_viewport(focus);
         } else {
             // Empty layer: clear the main molecule and its index-based overlays.
@@ -2431,7 +2445,7 @@ impl KuromameApp {
     /// from the parked slot otherwise.
     pub fn layer_atom_count(&self, idx: usize) -> usize {
         if idx == self.active_layer {
-            self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0)
+            self.viewport.molecule().map(|m| m.atoms.len()).unwrap_or(0)
         } else {
             self.layers
                 .get(idx)
@@ -2548,7 +2562,7 @@ impl KuromameApp {
         if self.ui.ndx_visible
             && let Some(ndx) = self.data.ndx_file.as_ref()
         {
-            let atom_count = self.molecule.as_ref().map(|m| m.atoms.len()).unwrap_or(0);
+            let atom_count = self.viewport.molecule().map(|m| m.atoms.len()).unwrap_or(0);
             for (idx, group) in ndx.groups.iter().enumerate() {
                 if !self.ui.ndx_groups.get(idx).is_some_and(|g| g.enabled) {
                     continue;
@@ -2860,9 +2874,9 @@ impl KuromameApp {
     }
 
     fn atom_name_at(&self, atom_index: usize) -> Option<String> {
-        if let Some(mol) = &self.molecule
+        if let Some(mol) = self.viewport.molecule()
             && let Some(atom) = mol.atoms.get(atom_index) {
-                if let Some(name) = atom.name() {
+                if let Some(name) = mol.name_of(atom) {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         return Some(trimmed.to_ascii_uppercase());
@@ -2935,7 +2949,7 @@ impl KuromameApp {
             return;
         }
 
-        let Some(mol) = self.molecule.as_ref() else {
+        let Some(mol) = self.viewport.molecule() else {
             self.set_status("No molecule loaded");
             return;
         };
@@ -3061,9 +3075,9 @@ impl KuromameApp {
         let mut atom_name: Option<String> = None;
         let mut res_name: Option<String> = None;
 
-        if let Some(mol) = &self.molecule
+        if let Some(mol) = self.viewport.molecule()
             && let Some(atom) = mol.atoms.get(atom_index) {
-                if let Some(name) = atom.name() {
+                if let Some(name) = mol.name_of(atom) {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         atom_name = Some(trimmed.to_string());
@@ -3074,7 +3088,7 @@ impl KuromameApp {
                     atom_name = Some(atom.element.trim().to_string());
                 }
 
-                if let Some(name) = atom.res_name() {
+                if let Some(name) = mol.res_name_of(atom) {
                     let trimmed = name.trim();
                     if !trimmed.is_empty() {
                         res_name = Some(trimmed.to_string());
@@ -3135,8 +3149,8 @@ impl KuromameApp {
         // selections, so any rewrite here invalidates the cached atom table.
         self.atom_table_dirty = true;
         let viewer_atom_count = self
-            .molecule
-            .as_ref()
+            .viewport
+            .molecule()
             .map(|mol| mol.atoms.len())
             .unwrap_or(0);
 
@@ -3182,14 +3196,10 @@ impl KuromameApp {
             return;
         }
 
-        if let Some(mol) = &mut self.molecule {
-            for (atom, name) in mol.atoms.iter_mut().zip(resnames) {
-                atom.meta
-                    .get_or_insert_with(|| Box::new(AtomMeta::default()))
-                    .res_name = Some(name);
-            }
-            self.sync_viewer_molecule();
+        if let Some(mol) = self.viewport.molecule_mut() {
+            let _ = mol.set_res_names(&resnames);
         }
+        self.sync_viewer_molecule();
     }
 
     fn toggle_selected_atom(&mut self, atom_index: usize) -> bool {
@@ -3206,7 +3216,7 @@ impl KuromameApp {
     }
 
     fn add_connected_hydrogens(&mut self, atom_index: usize) {
-        let Some(mol) = &self.molecule else {
+        let Some(mol) = self.viewport.molecule() else {
             return;
         };
 
@@ -3285,7 +3295,7 @@ impl KuromameApp {
         // molecule template, so there is no connectivity to apply — build the
         // molecule straight from the GRO (distance-inferred bonds) instead of
         // handing `generate_molecule_with_gro` an empty bond list.
-        if top.expanded_atom_types().is_empty() {
+        if top.expanded_atom_count() == 0 {
             let boxsize = gro.box_vectors;
             let mol = gro.to_molecule_with_metadata(true, None);
             self.interaction_pairs.clear();
@@ -3301,7 +3311,7 @@ impl KuromameApp {
         // the atom list short). Refuse the pair with a message rather than
         // building a molecule whose bonds index atoms that do not exist — the
         // same contract the XTC path already applies.
-        let top_atom_count = top.expanded_atom_types().len();
+        let top_atom_count = top.expanded_atom_count();
         if top_atom_count != gro.atoms.len() {
             self.set_status(format!(
                 "TOP atom count ({}) does not match GRO atom count ({})",
@@ -3684,7 +3694,7 @@ impl KuromameApp {
                 dropped
             ));
         }
-        self.molecule = Some(molecule);
+        self.viewport.set_molecule(molecule);
         // A new molecule (different atoms) invalidates the cached bead types.
         self.bead_types_dirty = true;
         // Syncing to the viewport is handled by post_load_cleanup() — callers are responsible.
@@ -3698,7 +3708,10 @@ impl KuromameApp {
         let dropped = molecule.invalid_bonds().count();
         if dropped > 0 {
             let n = molecule.atoms.len();
-            molecule.bonds.retain(|b| b.atom_a < n && b.atom_b < n);
+            molecule.bonds.retain(|b| {
+                let (a, b) = b.endpoints();
+                a < n && b < n
+            });
         }
         dropped
     }
@@ -3730,7 +3743,7 @@ impl KuromameApp {
         }
 
         // Validate atom count against current molecule
-        if let Some(mol) = &self.molecule {
+        if let Some(mol) = self.viewport.molecule() {
             if mol.atoms.len() != xtc.natoms {
                 self.set_status(format!(
                     "XTC atom count ({}) does not match loaded structure ({})",
@@ -3739,11 +3752,15 @@ impl KuromameApp {
                 ));
                 return;
             }
-            self.base_molecule = Some(mol.clone());
+            // The loaded structure already has exactly these atoms, so every
+            // frame updates it in place and there is nothing to re-seed from.
+            // Cloning it here (as this did) kept a second full copy of the
+            // system alive for the whole session.
+            self.base_molecule = None;
         } else {
             // No reference structure: create minimal atoms (positions only, no bonds/names)
             let atoms = (0..xtc.natoms)
-                .map(|i| view_atom(Vec3::new(0.0, 0.0, 0.0), "C", i, None))
+                .map(|_| view_atom(Vec3::new(0.0, 0.0, 0.0), "C"))
                 .collect();
             self.base_molecule = Some(Molecule::from_atoms_bonds(atoms, Vec::new()));
         }
@@ -3767,13 +3784,12 @@ impl KuromameApp {
         // triclinic cell keeps its shape frame to frame.
         let box_vectors = frame.box_matrix;
 
-        let positions: Vec<Vec3> = frame
-            .positions
-            .iter()
-            .map(|p| Vec3::new(p[0], p[1], p[2]))
-            .collect();
+        let mut positions = std::mem::take(&mut self.frame_positions);
+        positions.clear();
+        positions.extend(frame.positions.iter().map(|p| Vec3::new(p[0], p[1], p[2])));
 
-        self.apply_positions(positions, box_vectors);
+        self.apply_positions(&positions, box_vectors);
+        self.frame_positions = positions;
         self.traj_ui.current_frame = idx;
         self.traj_ui.interp_sub = 0;
     }
@@ -3821,31 +3837,29 @@ impl KuromameApp {
             }
             pa + d * t
         };
-        let positions: Vec<Vec3> = a
-            .positions
-            .iter()
-            .zip(b.positions.iter())
-            .map(|(pa, pb)| {
-                Vec3::new(
-                    min_image(pa[0], pb[0], box_len[0]),
-                    min_image(pa[1], pb[1], box_len[1]),
-                    min_image(pa[2], pb[2], box_len[2]),
-                )
-            })
-            .collect();
+        let mut positions = std::mem::take(&mut self.frame_positions);
+        positions.clear();
+        positions.extend(a.positions.iter().zip(b.positions.iter()).map(|(pa, pb)| {
+            Vec3::new(
+                min_image(pa[0], pb[0], box_len[0]),
+                min_image(pa[1], pb[1], box_len[1]),
+                min_image(pa[2], pb[2], box_len[2]),
+            )
+        }));
 
-        self.apply_positions(positions, box_vectors);
+        self.apply_positions(&positions, box_vectors);
+        self.frame_positions = positions;
     }
 
     /// Push a set of atom positions (and simulation-cell box) into the viewport,
     /// reusing the current molecule's bonds/metadata/camera when the atom count
     /// matches. Shared by exact and interpolated frame display.
-    fn apply_positions(&mut self, positions: Vec<Vec3>, box_vectors: [[f32; 3]; 3]) {
+    fn apply_positions(&mut self, positions: &[Vec3], box_vectors: [[f32; 3]; 3]) {
         self.set_sim_cell(box_vectors);
 
         let same_atom_count = self
-            .molecule
-            .as_ref()
+            .viewport
+            .molecule()
             .map(|mol| mol.atoms.len() == positions.len())
             .unwrap_or(false);
 
@@ -3853,22 +3867,18 @@ impl KuromameApp {
             // Smooth playback: move atoms in place, keeping bonds, metadata and the
             // user's camera. moleucle_3dview_rs 0.6 updates the GPU buffers without
             // rebuilding the molecule.
-            if let Some(mol) = &mut self.molecule {
-                for (atom, &pos) in mol.atoms.iter_mut().zip(positions.iter()) {
-                    atom.position = pos;
-                }
-            }
-            // The viewport holds the whole molecule and masks visibility, so the
-            // positions go across as-is -- no re-gather per frame.
-            let _ = self.viewport.update_positions(&positions);
+            // `update_positions` writes straight into the molecule the
+            // viewport owns and bumps the render revision, so there is no
+            // second array to keep in step.
+            let _ = self.viewport.update_positions(positions);
         } else if let Some(base) = self.base_molecule.clone() {
             // First frame (or the molecule was swapped): establish the molecule and
             // fit the camera once.
             let mut mol = base;
-            for (atom, &pos) in mol.atoms.iter_mut().zip(positions.iter()) {
+            for (atom, &pos) in mol.atoms.iter_mut().zip(positions) {
                 atom.position = pos;
             }
-            self.molecule = Some(mol);
+            self.viewport.set_molecule(mol);
             // The base molecule was swapped in; its bead types may differ.
             self.bead_types_dirty = true;
             self.atom_table_dirty = true;
@@ -4040,7 +4050,7 @@ impl KuromameApp {
     }
 
     fn select_shortest_path(&mut self, start: usize, end: usize) {
-        let Some(mol) = &self.molecule else {
+        let Some(mol) = self.viewport.molecule() else {
             return;
         };
 
@@ -4073,8 +4083,9 @@ impl KuromameApp {
             std::collections::HashMap::new();
 
         for bond in &mol.bonds {
-            adj.entry(bond.atom_a).or_default().insert(bond.atom_b);
-            adj.entry(bond.atom_b).or_default().insert(bond.atom_a);
+            let (a, b) = bond.endpoints();
+            adj.entry(a).or_default().insert(b);
+            adj.entry(b).or_default().insert(a);
         }
 
         // 2. Breadth-first search for the shortest path, recording each atom's
@@ -4135,10 +4146,11 @@ impl KuromameApp {
     fn collect_connected_hydrogens(atom_idx: usize, mol: &Molecule) -> Vec<usize> {
         let mut hydrogens = Vec::new();
         for bond in &mol.bonds {
-            let neighbor = if bond.atom_a == atom_idx {
-                Some(bond.atom_b)
-            } else if bond.atom_b == atom_idx {
-                Some(bond.atom_a)
+            let (a, b) = bond.endpoints();
+            let neighbor = if a == atom_idx {
+                Some(b)
+            } else if b == atom_idx {
+                Some(a)
             } else {
                 None
             };
@@ -4206,8 +4218,8 @@ impl KuromameApp {
         // split or merged anything by hand, their grouping wins — silently
         // throwing it away would be worse than leaving it stale, so say so.
         if self.components.is_default_partition() {
-            if let Some(mol) = self.molecule.clone() {
-                self.components.rebuild_from_molecule(&mol);
+            if let Some(mol) = self.viewport.molecule() {
+                self.components.rebuild_from_molecule(mol);
             }
         } else {
             self.log_info(
@@ -4224,7 +4236,7 @@ impl KuromameApp {
 
     fn export_structure(&mut self) {
         if self.data.top_file.is_none() && self.data.structure_file.is_none()
-            && let Some(mol) = &self.molecule {
+            && let Some(mol) = self.viewport.molecule() {
                 self.data.structure_file = Some(StructureFile::Pdb(PdbFile::from_molecule(mol)));
             }
 
@@ -4445,15 +4457,11 @@ mod tests {
     /// Build a chain-free molecule of `n` atoms plus the given bonds.
     fn test_molecule(n: usize, bonds: &[(usize, usize)]) -> Molecule {
         let atoms = (0..n)
-            .map(|i| view_atom(Vec3::new(i as f32, 0.0, 0.0), "C", i, None))
+            .map(|i| view_atom(Vec3::new(i as f32, 0.0, 0.0), "C"))
             .collect();
         let bonds = bonds
             .iter()
-            .map(|&(a, b)| Bond {
-                atom_a: a,
-                atom_b: b,
-                order: 1,
-            })
+            .map(|&(a, b)| Bond::new(a, b, 1))
             .collect();
         Molecule::from_atoms_bonds(atoms, bonds)
     }
@@ -4467,7 +4475,7 @@ mod tests {
 
         assert_eq!(dropped, 2, "both bonds reaching past atom 1 are dropped");
         assert_eq!(mol.bonds.len(), 1);
-        assert_eq!((mol.bonds[0].atom_a, mol.bonds[0].atom_b), (0, 1));
+        assert_eq!(mol.bonds[0].endpoints(), (0, 1));
     }
 
     #[test]

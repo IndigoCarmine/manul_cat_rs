@@ -197,8 +197,6 @@ impl To3dViewMolecule for Mol2File {
                     record.z * ANGSTROM_TO_NM,
                 ),
                 &element,
-                i,
-                None,
             ));
         }
 
@@ -212,11 +210,7 @@ impl To3dViewMolecule for Mol2File {
                     "3" => 3,
                     _ => 1,
                 };
-                bonds.push(Bond {
-                    atom_a: idx_a,
-                    atom_b: idx_b,
-                    order,
-                });
+                bonds.push(Bond::new(idx_a, idx_b, order));
             }
         }
 

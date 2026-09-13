@@ -20,7 +20,8 @@
 //! `KuromameApp::molecule` and `SelectionState::selected_atom_indices`, before
 //! `VisibilityState::to_view` projects into the viewport.
 
-use moleucle_3dview_rs::Molecule;
+use moleucle_3dview_rs::{Molecule, SymbolId};
+use std::collections::{HashMap, HashSet};
 
 /// One display group.
 #[derive(Clone, Debug)]
@@ -170,24 +171,40 @@ impl ComponentState {
                 .map(|(_, v)| *v)
         };
 
-        let mut names: Vec<String> = mol.atoms.iter().map(residue_key).collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
+        // Residue names are interned by the molecule, so the partition is
+        // derived from name *ids*: one pass to collect the distinct ids, then
+        // one `u32` per atom. Building a `Vec<String>` per atom and cloning it
+        // to sort (as this did) cost two allocations per atom — 22 MB of
+        // transient peak on a 200k-atom system, for a few dozen residue names.
+        let mut seen: HashSet<SymbolId> = HashSet::new();
+        let mut distinct: Vec<(SymbolId, &str)> = Vec::new();
+        for atom in &mol.atoms {
+            let id = atom.res_name_id();
+            if seen.insert(id) {
+                distinct.push((id, residue_key(mol, atom)));
+            }
+        }
+        distinct.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
 
-        self.components = sorted
+        self.components = distinct
             .iter()
-            .map(|name| Component {
-                name: name.clone(),
+            .map(|(_, name)| Component {
+                name: (*name).to_string(),
                 atoms: Vec::new(),
                 visible: was_visible(name).unwrap_or(true),
                 source: None,
             })
             .collect();
 
-        self.owner = names
-            .drain(..)
-            .map(|name| sorted.binary_search(&name).unwrap_or(0) as u32)
+        let slot_of: HashMap<SymbolId, u32> = distinct
+            .iter()
+            .enumerate()
+            .map(|(slot, (id, _))| (*id, slot as u32))
+            .collect();
+        self.owner = mol
+            .atoms
+            .iter()
+            .map(|atom| slot_of.get(&atom.res_name_id()).copied().unwrap_or(0))
             .collect();
 
         self.recompute();
@@ -257,8 +274,9 @@ impl ComponentState {
             .filter(|&&a| {
                 mol.atoms
                     .get(a as usize)
-                    .map(residue_key)
-                    .is_some_and(|key| key.eq_ignore_ascii_case(name.trim()))
+                    .is_some_and(|atom| {
+                        residue_key(mol, atom).eq_ignore_ascii_case(name.trim())
+                    })
             })
             .count();
         if homeless > 0 {
@@ -360,13 +378,13 @@ impl ComponentState {
         let key = mol
             .atoms
             .get(atom as usize)
-            .map(residue_key)
+            .map(|atom| residue_key(mol, atom))
             .unwrap_or_default();
-        if let Some(slot) = self.find(&key) {
+        if let Some(slot) = self.find(key) {
             return slot as u32;
         }
         self.components.push(Component {
-            name: key,
+            name: key.to_string(),
             atoms: Vec::new(),
             visible: true,
             source: None,
@@ -432,14 +450,14 @@ impl ComponentState {
 /// The name a residue contributes to the default partition: trimmed, kept in
 /// the file's own case. An atom with no residue metadata lands in `""`, which
 /// the panel renders as "(no residue)" exactly as it did before.
-fn residue_key(atom: &moleucle_3dview_rs::Atom) -> String {
-    atom.res_name().unwrap_or("").trim().to_string()
+fn residue_key<'a>(mol: &'a Molecule, atom: &'a moleucle_3dview_rs::Atom) -> &'a str {
+    mol.res_name_of(atom).unwrap_or("").trim()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view_rs::{view_atom};
+    use crate::view_rs::push_named_atom;
     use lin_alg::f32::Vec3;
     use moleucle_3dview_rs::molecule::AtomMeta;
 
@@ -453,27 +471,23 @@ mod tests {
             ("SOL", 5),
             ("NA", 6),
         ];
-        let atoms = spec
-            .iter()
-            .enumerate()
-            .map(|(i, (res, seq))| {
-                view_atom(
-                    Vec3::new(i as f32, 0.0, 0.0),
-                    "C",
-                    i,
-                    Some(AtomMeta {
-                        name: Some(format!("A{i}")),
-                        res_name: Some(res.to_string()),
-                        chain_id: Some('A'),
-                        res_seq: Some(*seq),
-                        occupancy: None,
-                        temp_factor: None,
-                        charge: None,
-                    }),
-                )
-            })
-            .collect();
-        Molecule::from_atoms_bonds(atoms, Vec::new())
+        let mut builder = Molecule::builder();
+        for (i, (res, seq)) in spec.iter().enumerate() {
+            let name = format!("A{i}");
+            push_named_atom(
+                &mut builder,
+                Vec3::new(i as f32, 0.0, 0.0),
+                "C",
+                &AtomMeta {
+                    name: Some(&name),
+                    res_name: Some(res),
+                    chain_id: Some('A'),
+                    res_seq: Some(*seq),
+                    ..AtomMeta::default()
+                },
+            );
+        }
+        builder.finish(Vec::new())
     }
 
     fn state() -> (ComponentState, Molecule) {
@@ -662,68 +676,60 @@ mod tests {
 mod command_flow {
     use super::*;
     use crate::selection::{AtomTable, EvalCtx, Statement, evaluate, parse_statement, to_indices};
-    use crate::view_rs::{view_atom};
+    use crate::view_rs::push_named_atom;
     use lin_alg::f32::Vec3;
+    use moleucle_3dview_rs::MoleculeBuilder;
     use moleucle_3dview_rs::molecule::{AtomMeta, Bond};
 
     /// Two propane molecules in residue `PRP` (res_seq 1 and 2) plus three
     /// waters in `SOL` (res_seq 3..5). 22 propane atoms + 9 water atoms.
     fn system() -> Molecule {
-        let mut atoms = Vec::new();
+        let mut builder = Molecule::builder();
         let mut bonds = Vec::new();
-        let meta = |name: &str, res: &str, seq: i32| {
-            Some(AtomMeta {
-                name: Some(name.to_string()),
-                res_name: Some(res.to_string()),
-                chain_id: Some('A'),
-                res_seq: Some(seq),
-                occupancy: None,
-                temp_factor: None,
-                charge: None,
-            })
-        };
-        let push = |atoms: &mut Vec<_>, el: &str, name: &str, res: &str, seq: i32| {
-            let id = atoms.len();
-            atoms.push(view_atom(
+        let push = |builder: &mut MoleculeBuilder, el: &str, name: &str, res: &str, seq: i32| {
+            let id = builder.len();
+            push_named_atom(
+                builder,
                 Vec3::new(id as f32, 0.0, 0.0),
                 el,
-                id,
-                meta(name, res, seq),
-            ));
+                &AtomMeta {
+                    name: Some(name),
+                    res_name: Some(res),
+                    chain_id: Some('A'),
+                    res_seq: Some(seq),
+                    ..AtomMeta::default()
+                },
+            );
             id
         };
         let mut bond = |a: usize, b: usize| {
-            bonds.push(Bond {
-                atom_a: a,
-                atom_b: b,
-                order: 1,
-            })
+            bonds.push(Bond::new(a, b, 1))
         };
 
         for copy in 0..2 {
             let seq = copy + 1;
             let c: Vec<usize> = (0..3)
-                .map(|i| push(&mut atoms, "C", &format!("C{}", i + 1), "PRP", seq))
+                .map(|i| push(&mut builder, "C", &format!("C{}", i + 1), "PRP", seq))
                 .collect();
             bond(c[0], c[1]);
             bond(c[1], c[2]);
             // 3 H on each end carbon, 2 on the middle one.
             for (ci, count) in [(0usize, 3), (1, 2), (2, 3)] {
                 for h in 0..count {
-                    let hid = push(&mut atoms, "H", &format!("H{h}"), "PRP", seq);
+                    let hid = push(&mut builder, "H", &format!("H{h}"), "PRP", seq);
                     bond(c[ci], hid);
                 }
             }
         }
         for w in 0..3 {
             let seq = 3 + w;
-            let o = push(&mut atoms, "O", "OW", "SOL", seq);
+            let o = push(&mut builder, "O", "OW", "SOL", seq);
             for h in 0..2 {
-                let hid = push(&mut atoms, "H", &format!("HW{h}"), "SOL", seq);
+                let hid = push(&mut builder, "H", &format!("HW{h}"), "SOL", seq);
                 bond(o, hid);
             }
         }
-        Molecule::from_atoms_bonds(atoms, bonds)
+        builder.finish(bonds)
     }
 
     /// Everything `run_command` does for one line, minus the logging.
