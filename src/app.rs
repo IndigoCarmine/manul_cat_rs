@@ -1,4 +1,5 @@
 use crate::component::ComponentState;
+use crate::ffmpeg::{self, is_frame_file_name};
 use crate::image_export::{self, ExportSettings};
 use crate::parsing::{
     AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
@@ -7,6 +8,7 @@ use crate::parsing::{
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
+use crate::video_export::VideoSettings;
 use crate::view_rs::{BeadTypes, To3dViewMolecule, view_atom};
 use eframe::egui::{self};
 use lin_alg::f32::Vec3;
@@ -310,6 +312,94 @@ struct ExportUiState {
     error: Option<String>,
 }
 
+/// One frame handed to the writer thread.
+///
+/// The RGBA buffer is moved, not copied: at 1280x720 it is 3.5 MB and the pump
+/// produces one every UI frame.
+struct FrameWrite {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// What a running video export is currently doing.
+enum VideoStage {
+    /// Rendering trajectory frames, one per UI frame, so the window keeps
+    /// repainting and Cancel stays live.
+    Rendering,
+    /// ffmpeg is running on a worker thread; the receiver carries its verdict.
+    Encoding(Receiver<Result<(), String>>),
+}
+
+/// A video export in flight.
+///
+/// Rendering has to happen on the UI thread — it needs the viewport and the
+/// `RenderState` — so it is pumped one frame per repaint rather than run in a
+/// loop that would freeze the window for minutes. PNG encoding and the ffmpeg
+/// run are the parts that *can* move off, and do.
+struct VideoJob {
+    settings: VideoSettings,
+    /// Where the finished `.mp4` goes.
+    output: PathBuf,
+    /// Directory holding the PNG sequence, created by this job.
+    frames_dir: PathBuf,
+    /// Trajectory frame indices to render, in order.
+    plan: Vec<usize>,
+    /// How many of `plan` have been rendered and queued for writing.
+    rendered: usize,
+    /// Render size, fixed for the whole sequence so the encoder gets a
+    /// consistent stream.
+    size: (u32, u32),
+    /// Viewport size the export was planned against.
+    ///
+    /// `render_image` projects with the camera's *current* aspect, which
+    /// `show` rewrites from the widget on every frame — so resizing the window
+    /// mid-export would stretch the remaining frames against a size that is
+    /// already fixed. Checked per frame rather than corrected, because the
+    /// viewer does not expose the camera to set the aspect back.
+    view: (u32, u32),
+    stage: VideoStage,
+    /// Bounded, so a slow disk applies backpressure instead of letting
+    /// half a gigabyte of frames pile up in memory.
+    writer: Option<std::sync::mpsc::SyncSender<FrameWrite>>,
+    writer_result: Receiver<Result<(), String>>,
+    /// Trajectory frame and playback state to put back afterwards.
+    restore_frame: usize,
+    restore_playing: bool,
+}
+
+impl VideoJob {
+    fn total(&self) -> usize {
+        self.plan.len()
+    }
+}
+
+/// State behind the video-export dialog and any export running from it.
+#[derive(Default)]
+struct VideoUiState {
+    open: bool,
+    settings: VideoSettings,
+    /// Destination picked by the Export button, consumed on the next frame.
+    pending_start: Option<PathBuf>,
+    /// The running export, if any.
+    job: Option<VideoJob>,
+    /// Set by the Cancel button; the pump stops at the next frame boundary.
+    cancel_requested: bool,
+    /// Last failure, shown in the dialog.
+    error: Option<String>,
+    /// Where ffmpeg was found, cached for the session. `None` until probed.
+    ffmpeg: Option<PathBuf>,
+    /// True once we have looked, so a missing ffmpeg is not re-probed on every
+    /// repaint (each probe spawns a process).
+    ffmpeg_probed: bool,
+    /// Set when the consent dialog for installing ffmpeg is up.
+    install_prompt: bool,
+    /// An install running on a worker thread.
+    install_result: Option<Receiver<Result<(), String>>>,
+    install_running: bool,
+}
+
 struct UiState {
     status_msg: String,
     show_edit_dialog: bool,
@@ -527,6 +617,8 @@ pub struct KuromameApp {
     /// Image-export dialog state. Global, not per layer — it describes the
     /// camera framing, which the viewport owns, not the structure.
     export_ui: ExportUiState,
+    /// Video-export dialog state, and any export currently running.
+    video_ui: VideoUiState,
     /// Per-atom lookup tables for the command language, rebuilt lazily whenever
     /// the molecule itself changes (not on visibility-only rebuilds). Guarded by
     /// `atom_table_dirty`, mirroring the `bead_types_dirty` pattern.
@@ -748,6 +840,7 @@ impl KuromameApp {
             },
             components: ComponentState::default(),
             export_ui: ExportUiState::default(),
+            video_ui: VideoUiState::default(),
             atom_table: None,
             atom_table_dirty: true,
             interaction_pairs: Vec::new(),
@@ -1413,6 +1506,561 @@ impl KuromameApp {
                 }
             }
         }
+    }
+
+    // --- Video export -----------------------------------------------------
+
+    pub fn video_dialog_open(&self) -> bool {
+        self.video_ui.open
+    }
+
+    /// Open the video-export dialog, refusing when there is nothing to animate.
+    pub fn open_export_video_dialog(&mut self) {
+        if self.viewport.molecule().is_none() {
+            self.set_status("Load a structure before exporting a video");
+            return;
+        }
+        if self.trajectory.is_empty() {
+            self.set_status("Load a trajectory (.xtc) before exporting a video");
+            return;
+        }
+        self.video_ui.open = true;
+        self.video_ui.error = None;
+        self.probe_ffmpeg();
+    }
+
+    pub fn close_export_video_dialog(&mut self) {
+        // Leave a running export alone; the dialog is its only progress and
+        // cancel surface.
+        if self.video_ui.job.is_none() {
+            self.video_ui.open = false;
+        }
+    }
+
+    pub fn video_settings(&self) -> VideoSettings {
+        self.video_ui.settings
+    }
+
+    pub fn edit_video_settings(&mut self, edit: impl FnOnce(&mut VideoSettings)) {
+        edit(&mut self.video_ui.settings);
+    }
+
+    pub fn video_error(&self) -> Option<&str> {
+        self.video_ui.error.as_deref()
+    }
+
+    /// `(rendered, total)` for a running export, or `None` when idle.
+    pub fn video_progress(&self) -> Option<(usize, usize)> {
+        self.video_ui
+            .job
+            .as_ref()
+            .map(|job| (job.rendered, job.total()))
+    }
+
+    /// Whether the running export has finished rendering and is now encoding.
+    pub fn video_encoding(&self) -> bool {
+        matches!(
+            self.video_ui.job.as_ref().map(|job| &job.stage),
+            Some(VideoStage::Encoding(_))
+        )
+    }
+
+    pub fn video_is_running(&self) -> bool {
+        self.video_ui.job.is_some()
+    }
+
+    pub fn request_cancel_video(&mut self) {
+        self.video_ui.cancel_requested = true;
+    }
+
+    /// Where ffmpeg was found, if it was.
+    pub fn ffmpeg_path(&self) -> Option<&Path> {
+        self.video_ui.ffmpeg.as_deref()
+    }
+
+    /// Look for ffmpeg once per session. Each probe spawns a process, so this
+    /// must not run on every repaint.
+    fn probe_ffmpeg(&mut self) {
+        if self.video_ui.ffmpeg_probed {
+            return;
+        }
+        self.video_ui.ffmpeg_probed = true;
+        self.video_ui.ffmpeg = ffmpeg::locate();
+    }
+
+    /// Forget the probe result so the next open looks again — used after an
+    /// install so a freshly added ffmpeg is picked up.
+    fn reprobe_ffmpeg(&mut self) {
+        self.video_ui.ffmpeg_probed = false;
+        self.video_ui.ffmpeg = None;
+        self.probe_ffmpeg();
+    }
+
+    pub fn ffmpeg_install_route(&self) -> ffmpeg::InstallRoute {
+        ffmpeg::install_route()
+    }
+
+    /// Whether this platform can install ffmpeg on the user's behalf.
+    pub fn ffmpeg_install_is_managed(&self) -> bool {
+        matches!(
+            ffmpeg::install_route(),
+            ffmpeg::InstallRoute::Managed { .. }
+        )
+    }
+
+    pub fn ffmpeg_install_prompt_open(&self) -> bool {
+        self.video_ui.install_prompt
+    }
+
+    pub fn open_ffmpeg_install_prompt(&mut self) {
+        self.video_ui.install_prompt = true;
+    }
+
+    pub fn close_ffmpeg_install_prompt(&mut self) {
+        self.video_ui.install_prompt = false;
+    }
+
+    pub fn ffmpeg_install_running(&self) -> bool {
+        self.video_ui.install_running
+    }
+
+    /// Run the platform's package manager on a worker thread. The caller must
+    /// have shown the exact command and had the user agree to it.
+    pub fn start_ffmpeg_install(&mut self) {
+        if self.video_ui.install_running {
+            return;
+        }
+        let route = ffmpeg::install_route();
+        if !matches!(route, ffmpeg::InstallRoute::Managed { .. }) {
+            return;
+        }
+        self.video_ui.install_prompt = false;
+        self.video_ui.install_running = true;
+        self.video_ui.error = None;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ffmpeg::run_install(&route));
+        });
+        self.video_ui.install_result = Some(rx);
+        self.set_status("Installing ffmpeg…");
+    }
+
+    /// Queue an export to `path`, started on the next frame.
+    pub fn request_export_video(&mut self, path: PathBuf) {
+        self.video_ui.pending_start = Some(path);
+    }
+
+    /// Ask for a destination, defaulting the extension to `.mp4`.
+    pub fn pick_export_video_path(&self) -> Option<PathBuf> {
+        FileDialog::new()
+            .add_filter("MP4 video", &["mp4"])
+            .set_file_name("trajectory.mp4")
+            .save_file()
+            .map(|path| {
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+                {
+                    path
+                } else {
+                    path.with_extension("mp4")
+                }
+            })
+    }
+
+    /// Drive a video export: poll the installer, start a queued export, render
+    /// one frame, or collect the encoder's verdict.
+    ///
+    /// Runs in the same slot as the image export and for the same reason:
+    /// `render_image` resizes the shared colour target, so it has to happen
+    /// before the viewport draws itself.
+    fn process_pending_video_export(&mut self, ctx: &egui::Context) {
+        self.poll_ffmpeg_install();
+
+        if let Some(path) = self.video_ui.pending_start.take() {
+            self.start_video_export(path);
+        }
+
+        if self.video_ui.job.is_none() {
+            return;
+        }
+
+        // An export renders one frame per repaint; ask for the next one.
+        ctx.request_repaint();
+
+        if self.video_ui.cancel_requested {
+            if self.video_encoding() {
+                // ffmpeg is already writing the file; dropping the job here
+                // would leave a truncated video behind. Let it finish.
+                self.video_ui.cancel_requested = false;
+            } else {
+                self.finish_video_export(Some("Video export cancelled".to_string()), true);
+                return;
+            }
+        }
+
+        match self.video_ui.job.as_ref().map(|job| &job.stage) {
+            Some(VideoStage::Rendering) => self.render_one_video_frame(),
+            Some(VideoStage::Encoding(_)) => self.poll_video_encode(),
+            None => {}
+        }
+    }
+
+    fn poll_ffmpeg_install(&mut self) {
+        let Some(rx) = self.video_ui.install_result.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.video_ui.install_result = None;
+                self.video_ui.install_running = false;
+                match result {
+                    Ok(()) => {
+                        self.reprobe_ffmpeg();
+                        if self.video_ui.ffmpeg.is_some() {
+                            self.set_status("ffmpeg installed");
+                        } else {
+                            // The manager reported success but we still cannot
+                            // see it — usually a PATH that only a new process
+                            // will inherit.
+                            self.video_ui.error = Some(
+                                "ffmpeg was installed but is not visible yet. Restart Manul and \
+                                 try again."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        self.set_status("ffmpeg install failed");
+                        self.video_ui.error = Some(err);
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.video_ui.install_result = None;
+                self.video_ui.install_running = false;
+                self.video_ui.error = Some("the ffmpeg installer stopped unexpectedly".to_string());
+            }
+        }
+    }
+
+    fn start_video_export(&mut self, output: PathBuf) {
+        self.video_ui.error = None;
+        self.video_ui.cancel_requested = false;
+
+        if self.render_state.is_none() {
+            self.video_ui.error = Some("the renderer is not ready yet".to_string());
+            return;
+        }
+        let view = self.viewport.viewport_size();
+        if view.0 == 0 || view.1 == 0 {
+            self.video_ui.error = Some("the 3D view has not been laid out yet".to_string());
+            return;
+        }
+
+        let settings = self.video_ui.settings;
+        let plan = settings.frame_indices(self.trajectory.len());
+        if plan.is_empty() {
+            self.video_ui.error = Some("the trajectory has no frames to export".to_string());
+            return;
+        }
+
+        let frames_dir = Self::frames_dir_for(&output);
+        if let Err(err) = std::fs::create_dir_all(&frames_dir) {
+            self.video_ui.error = Some(format!("could not create {}: {err}", frames_dir.display()));
+            return;
+        }
+        // A shorter export into a directory that still holds a longer one would
+        // otherwise be spliced onto: ffmpeg reads `frame_%06d.png` from 0 until
+        // the first gap, so leftovers past this export's last frame would be
+        // encoded as if they belonged to it.
+        Self::clear_frame_sequence(&frames_dir);
+
+        // One writer thread, with a short queue: the UI thread stays on the GPU
+        // work and blocks only if the disk falls behind.
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameWrite>(2);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut outcome = Ok(());
+            for frame in frame_rx {
+                if outcome.is_err() {
+                    // Drain without writing so the sender never blocks on a
+                    // queue nobody is reading.
+                    continue;
+                }
+                outcome =
+                    image_export::write_png(&frame.path, frame.width, frame.height, frame.rgba);
+            }
+            let _ = result_tx.send(outcome);
+        });
+
+        self.video_ui.job = Some(VideoJob {
+            settings,
+            output,
+            frames_dir,
+            plan,
+            rendered: 0,
+            size: settings.output_size(view),
+            view,
+            stage: VideoStage::Rendering,
+            writer: Some(frame_tx),
+            writer_result: result_rx,
+            restore_frame: self.traj_ui.current_frame,
+            restore_playing: self.traj_ui.is_playing,
+        });
+        // Playback would fight the exporter for the frame index.
+        self.traj_ui.is_playing = false;
+        self.set_status("Exporting video…");
+    }
+
+    /// Directory the PNG sequence goes into: a sibling of the video named after
+    /// it, so "keep frames" leaves something obvious next to the result.
+    fn frames_dir_for(output: &Path) -> PathBuf {
+        let stem = output
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "video".to_string());
+        output
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{stem}_frames"))
+    }
+
+    /// Render the next planned trajectory frame and hand it to the writer.
+    fn render_one_video_frame(&mut self) {
+        let Some(render_state) = self.render_state.clone() else {
+            self.finish_video_export(Some("the renderer went away".to_string()), true);
+            return;
+        };
+        let Some(job) = self.video_ui.job.as_ref() else {
+            return;
+        };
+
+        if job.rendered >= job.plan.len() {
+            self.begin_video_encode();
+            return;
+        }
+
+        let view = self.viewport.viewport_size();
+        if view != job.view {
+            self.finish_video_export(
+                Some(
+                    "the window was resized during the export, which would stretch the \
+                     remaining frames. The frames rendered so far were kept."
+                        .to_string(),
+                ),
+                true,
+            );
+            return;
+        }
+
+        let index = job.plan[job.rendered];
+        let size = job.size;
+        let clear_color = job.settings.clear_color();
+        let supersample = job.settings.supersample;
+        let path = job.frames_dir.join(ffmpeg::frame_file_name(job.rendered));
+
+        // Move the trajectory to the frame being captured. This is the same
+        // path playback uses, so overlays, the simulation cell and the periodic
+        // images all follow.
+        self.apply_trajectory_frame(index);
+
+        let request = ImageExportRequest {
+            width: size.0,
+            height: size.1,
+            // The whole view: a trajectory movie shows what is on screen.
+            region: None,
+            clear_color,
+            supersample,
+            // Deliberately not forced up as the still export does. A movie is
+            // hundreds of renders, and rebuilding the sphere and cylinder
+            // meshes twice per frame would dominate the export.
+            mesh_resolution: None,
+        };
+
+        match self.viewport.render_image(&render_state, &request) {
+            Ok(image) => {
+                let write = FrameWrite {
+                    path,
+                    width: image.width,
+                    height: image.height,
+                    rgba: image.rgba,
+                };
+                let sent = self
+                    .video_ui
+                    .job
+                    .as_ref()
+                    .and_then(|job| job.writer.as_ref())
+                    .map(|writer| writer.send(write).is_ok())
+                    .unwrap_or(false);
+                if !sent {
+                    self.finish_video_export(
+                        Some("the frame writer stopped unexpectedly".to_string()),
+                        true,
+                    );
+                    return;
+                }
+                if let Some(job) = self.video_ui.job.as_mut() {
+                    job.rendered += 1;
+                }
+            }
+            Err(err) => {
+                self.finish_video_export(Some(format!("frame {index} failed: {err}")), true);
+            }
+        }
+    }
+
+    /// Close the frame queue, wait for the writer, then start ffmpeg.
+    fn begin_video_encode(&mut self) {
+        let Some(job) = self.video_ui.job.as_mut() else {
+            return;
+        };
+
+        // Dropping the sender ends the writer's loop and makes it report.
+        job.writer = None;
+        match job.writer_result.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.finish_video_export(Some(err), true);
+                return;
+            }
+            Err(_) => {
+                self.finish_video_export(
+                    Some("the frame writer stopped unexpectedly".to_string()),
+                    true,
+                );
+                return;
+            }
+        }
+
+        let Some(ffmpeg_path) = self.video_ui.ffmpeg.clone() else {
+            // No encoder: the frames are the deliverable, so this is a finish,
+            // not a failure -- and they are kept regardless of the checkbox,
+            // because deleting them would leave the export with no output.
+            let dir = self
+                .video_ui
+                .job
+                .as_ref()
+                .map(|job| job.frames_dir.clone())
+                .unwrap_or_default();
+            self.finish_video_export(None, true);
+            self.set_status(format!("Wrote the frame sequence to {}", dir.display()));
+            return;
+        };
+
+        let Some(job) = self.video_ui.job.as_mut() else {
+            return;
+        };
+        let frames_dir = job.frames_dir.clone();
+        let output = job.output.clone();
+        let fps = job.settings.fps;
+        let quality = job.settings.quality;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ffmpeg::encode(
+                &ffmpeg_path,
+                &frames_dir,
+                fps,
+                quality,
+                &output,
+            ));
+        });
+        job.stage = VideoStage::Encoding(rx);
+        self.set_status("Encoding video…");
+    }
+
+    fn poll_video_encode(&mut self) {
+        let received = match self.video_ui.job.as_ref().map(|job| &job.stage) {
+            Some(VideoStage::Encoding(rx)) => rx.try_recv(),
+            _ => return,
+        };
+        match received {
+            Ok(Ok(())) => {
+                let output = self
+                    .video_ui
+                    .job
+                    .as_ref()
+                    .map(|job| job.output.clone())
+                    .unwrap_or_default();
+                self.finish_video_export(None, false);
+                self.set_status(format!(
+                    "Saved video to {}",
+                    output
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+            }
+            Ok(Err(err)) => self.finish_video_export(Some(err), true),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.finish_video_export(Some("the encoder stopped unexpectedly".to_string()), true)
+            }
+        }
+    }
+
+    /// End the export: restore playback, tidy the frame directory, and report.
+    ///
+    /// `keep_frames_regardless` is set when the export did not produce a video,
+    /// so the frames that *were* rendered are never thrown away on a failure or
+    /// a cancel — they are all the user has left.
+    fn finish_video_export(&mut self, error: Option<String>, keep_frames_regardless: bool) {
+        let Some(job) = self.video_ui.job.take() else {
+            return;
+        };
+        self.video_ui.cancel_requested = false;
+
+        // Restore what the exporter moved.
+        self.apply_trajectory_frame(job.restore_frame);
+        self.traj_ui.is_playing = job.restore_playing;
+
+        let keep = job.settings.keep_frames || keep_frames_regardless;
+        if !keep {
+            Self::remove_frame_sequence(&job.frames_dir, job.plan.len());
+        }
+
+        if let Some(err) = error {
+            self.set_status("Video export failed");
+            self.video_ui.error = Some(err);
+        } else {
+            self.video_ui.error = None;
+        }
+    }
+
+    /// Delete every `frame_NNNNNN.png` in `dir`, leaving anything else alone.
+    ///
+    /// Only files matching the exact name this exporter generates are touched:
+    /// the directory sits next to a user-chosen destination and may well hold
+    /// something that is not ours.
+    fn clear_frame_sequence(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if is_frame_file_name(name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Delete the PNGs this export wrote, then the directory.
+    ///
+    /// Deliberately narrow: it removes only the exact frame names it generated
+    /// and then relies on `remove_dir` failing on a non-empty directory. The
+    /// destination is user-chosen, so a blanket recursive delete here could take
+    /// out files that were never ours.
+    fn remove_frame_sequence(dir: &Path, count: usize) {
+        for index in 0..count {
+            let _ = std::fs::remove_file(dir.join(ffmpeg::frame_file_name(index)));
+        }
+        let _ = std::fs::remove_dir(dir);
     }
 
     /// Ask the UI to put keyboard focus in the command bar next frame.
@@ -4302,6 +4950,7 @@ impl eframe::App for KuromameApp {
         // resizes the shared color target, and `viewport.show` below is what
         // puts it back to the on-screen size.
         self.process_pending_image_export(&ctx);
+        self.process_pending_video_export(&ctx);
 
         // egui 0.35: panels are shown into the root `ui`, not the context.
         app_ui::render_menu_bar(self, ui);
@@ -4314,6 +4963,7 @@ impl eframe::App for KuromameApp {
         app_ui::render_bottom_dock(self, ui);
         app_ui::render_edit_dialog(self, &ctx);
         app_ui::render_export_dialog(self, &ctx);
+        app_ui::render_video_dialog(self, &ctx);
 
         // Top-left overlay text: filename · frame.
         let overlay_label = if self.trajectory_frame_count() > 0 {
