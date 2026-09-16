@@ -2,6 +2,8 @@ use eframe::egui;
 use material_icons::{Icon as MaterialIcon, icon_to_char};
 use moleucle_3dview_rs::RenderStyle;
 
+use crate::{ffmpeg, video_export};
+
 use super::KuromameApp;
 
 /// Color palette for the "Viewer UI" dark design. Shared with `app.rs` so the
@@ -440,6 +442,302 @@ pub fn render_export_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
     }
 }
 
+/// The video-export dialog: settings while idle, progress while running.
+///
+/// Deferred actions are collected into locals and applied after the window
+/// closure, the same way [`render_export_dialog`] does, because the closure
+/// already borrows `app`.
+pub fn render_video_dialog(app: &mut KuromameApp, ctx: &egui::Context) {
+    render_ffmpeg_install_prompt(app, ctx);
+
+    if !app.video_dialog_open() {
+        return;
+    }
+    let running = app.video_is_running();
+    let mut open = true;
+    let mut close_requested = false;
+    let mut export_requested = false;
+    let mut cancel_requested = false;
+    let mut install_requested = false;
+
+    egui::Window::new("Export Video")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            let frames = app.trajectory_frame_count();
+
+            if running {
+                render_video_progress(app, ui, &mut cancel_requested);
+                return;
+            }
+
+            let mut settings = app.video_settings();
+            let mut changed = false;
+
+            egui::Grid::new("video_export_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Resolution");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut settings.long_edge)
+                                .range(video_export::MIN_LONG_EDGE..=video_export::MAX_LONG_EDGE)
+                                .speed(16.0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text("Long edge; the other follows the view's aspect")
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Frame rate");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut settings.fps)
+                                .range(video_export::MIN_FPS..=video_export::MAX_FPS)
+                                .suffix(" fps"),
+                        )
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Use every");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut settings.frame_step)
+                                .range(1..=100usize)
+                                .suffix(" frame(s)"),
+                        )
+                        .on_hover_text("Skip frames to shorten a long trajectory")
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Anti-aliasing");
+                    egui::ComboBox::from_id_salt("video_supersample")
+                        .selected_text(format!("{}x", settings.supersample))
+                        .show_ui(ui, |ui| {
+                            for factor in [1u32, 2, 3] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut settings.supersample,
+                                        factor,
+                                        format!("{factor}x"),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Quality");
+                    egui::ComboBox::from_id_salt("video_quality")
+                        .selected_text(settings.quality.label())
+                        .show_ui(ui, |ui| {
+                            for quality in ffmpeg::Quality::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut settings.quality,
+                                        quality,
+                                        quality.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Background");
+                    changed |= ui
+                        .color_edit_button_rgb(&mut settings.background)
+                        .on_hover_text("A video has no alpha channel, so this is always painted")
+                        .changed();
+                    ui.end_row();
+                });
+
+            ui.add_space(4.0);
+            changed |= ui
+                .checkbox(&mut settings.keep_frames, "Keep the PNG sequence")
+                .on_hover_text(
+                    "Leave the rendered frames next to the video instead of deleting them",
+                )
+                .changed();
+
+            if changed {
+                app.edit_video_settings(|current| *current = settings);
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // ---- what this will produce ------------------------------------
+            let view = app.viewport_pixel_size();
+            let (out_w, out_h) = settings.output_size(view);
+            let planned = settings.frame_indices(frames).len();
+            let duration = settings.duration_secs(frames);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{out_w} x {out_h} px  ·  {planned} of {frames} frames  ·  {duration:.1} s"
+                ))
+                .weak(),
+            );
+
+            // ---- encoder status --------------------------------------------
+            ui.add_space(6.0);
+            match app.ffmpeg_path() {
+                Some(path) => {
+                    ui.label(
+                        egui::RichText::new(format!("Encoder: {}", path.display()))
+                            .weak()
+                            .small(),
+                    );
+                }
+                None => {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "ffmpeg was not found — the export will write the PNG sequence only.",
+                    );
+                    if app.ffmpeg_install_running() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Installing ffmpeg…");
+                        });
+                    } else if app.ffmpeg_install_is_managed() {
+                        if ui.button("Install ffmpeg…").clicked() {
+                            install_requested = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Install it with:\n{}",
+                                app.ffmpeg_install_route().display_command()
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+            }
+
+            if let Some(error) = app.video_error() {
+                ui.add_space(6.0);
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let label = if app.ffmpeg_path().is_some() {
+                    "Export MP4…"
+                } else {
+                    "Export frames…"
+                };
+                if ui.button(label).clicked() {
+                    export_requested = true;
+                }
+                if ui.button("Close").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+
+    if export_requested && let Some(path) = app.pick_export_video_path() {
+        app.request_export_video(path);
+    }
+    if install_requested {
+        app.open_ffmpeg_install_prompt();
+    }
+    if cancel_requested {
+        app.request_cancel_video();
+    }
+    // The window's own close button is ignored while an export runs: the dialog
+    // is the only place the progress and the cancel button live.
+    if close_requested || (!open && !running) {
+        app.close_export_video_dialog();
+    }
+}
+
+fn render_video_progress(app: &KuromameApp, ui: &mut egui::Ui, cancel: &mut bool) {
+    let (done, total) = app.video_progress().unwrap_or((0, 0));
+    let encoding = app.video_encoding();
+
+    ui.label(if encoding {
+        "Encoding the video…".to_string()
+    } else {
+        format!("Rendering frame {done} of {total}")
+    });
+    ui.add_space(6.0);
+
+    let bar = if encoding {
+        egui::ProgressBar::new(1.0).animate(true).text("ffmpeg")
+    } else {
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            done as f32 / total as f32
+        };
+        egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0))
+    };
+    ui.add(bar);
+
+    ui.add_space(8.0);
+    // Cancelling during the encode would leave a half-written file, so the
+    // button is only live while frames are still being rendered.
+    ui.add_enabled_ui(!encoding, |ui| {
+        if ui.button("Cancel").clicked() {
+            *cancel = true;
+        }
+    });
+}
+
+/// Consent dialog shown before the app runs the platform's package manager.
+///
+/// The exact command is on screen: nothing runs that the user has not read.
+fn render_ffmpeg_install_prompt(app: &mut KuromameApp, ctx: &egui::Context) {
+    if !app.ffmpeg_install_prompt_open() {
+        return;
+    }
+    let mut confirm = false;
+    let mut cancel = false;
+
+    egui::Window::new("Install ffmpeg")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label(
+                "Manul does not bundle a video encoder. It can install one for you through \
+                 your system's package manager.",
+            );
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("This will run:").strong());
+            ui.add_space(2.0);
+            ui.code(app.ffmpeg_install_route().display_command());
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "The download is roughly 100 MB and is handled by the package manager, \
+                     not by Manul.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Install").clicked() {
+                    confirm = true;
+                }
+                if ui.button("Not now").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if confirm {
+        app.start_ffmpeg_install();
+    } else if cancel {
+        app.close_ffmpeg_install_prompt();
+    }
+}
+
 pub fn render_menu_bar(app: &mut KuromameApp, ui: &mut egui::Ui) {
     egui::Panel::top("menu_bar")
         .frame(
@@ -559,6 +857,14 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             .clicked()
         {
             app.open_export_image_dialog();
+            ui.close();
+        }
+        if ui
+            .button(format!("{} Export Video…", mi(MaterialIcon::Movie)))
+            .on_hover_text("Render the loaded trajectory to an MP4")
+            .clicked()
+        {
+            app.open_export_video_dialog();
             ui.close();
         }
         ui.separator();

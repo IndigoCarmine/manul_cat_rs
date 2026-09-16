@@ -36,6 +36,12 @@ and
 * **Cross-validation** with `.gro` / `.pdb` structure files.
 * **XTC trajectory playback** — play / step / seek, adjustable FPS, and
   frame interpolation (smoothing) between recorded frames.
+* **Video export** — render the loaded trajectory to an MP4. Manul does not
+  bundle an encoder: it renders a PNG sequence itself and hands it to an
+  `ffmpeg` on your machine. If none is found the frames are still written, and
+  on Windows the app can install one for you through `winget` after showing you
+  the exact command. Elsewhere it points you at `apt` / `dnf` / `flatpak` /
+  `brew`.
 * **Surface (dot) mesh view** from `gmx sasa` PDBs, plus multiple **overlay
   surfaces** loaded from separate files, each with its own colour.
 * **Document layers** — load several structures at once to compare them; each
