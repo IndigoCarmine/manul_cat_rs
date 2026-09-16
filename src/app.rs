@@ -13,9 +13,9 @@ use lin_alg::f32::Vec3;
 use moleucle_3dview_rs::{
     AtomGroup, AtomGroupRender, AtomGroupState, AtomPairRender, AtomPairState, AxesRender,
     AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
-    PeriodicImages, PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRender,
-    SelectedAtomRenderState, SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender,
-    SphereSetState, ViewPortEvent, ball_stick_radius, default_color_fn,
+    PeriodicImages, PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRenderState,
+    SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender, SphereSetState,
+    ViewPortEvent, ball_stick_radius, default_color_fn,
 };
 use rfd::FileDialog;
 use std::collections::HashSet;
@@ -684,8 +684,10 @@ impl KuromameApp {
         }
         cc.egui_ctx.set_fonts(fonts);
         Self::apply_visual_theme(&cc.egui_ctx);
+        // `InteractiveMoleculeViewport::new` already registers a
+        // `SelectedAtomRender`; registering a second one built, uploaded and
+        // drew every selected atom's sphere twice per frame.
         let mut viewport = InteractiveMoleculeViewport::new();
-        viewport.add_additional_render_box(Box::new(SelectedAtomRender::new()));
         viewport.add_additional_render_box(Box::new(AtomPairRender::new()));
         viewport.add_additional_render_box(Box::new(AtomGroupRender::new()));
         viewport.add_additional_render_box(Box::new(SimulationCellRender::new()));

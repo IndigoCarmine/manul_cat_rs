@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "manul_cat_rs"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2045,8 +2045,8 @@ dependencies = [
 
 [[package]]
 name = "moleucle_3dview_rs"
-version = "0.12.0"
-source = "git+https://github.com/IndigoCarmine/moleucle_3dview_rs.git?rev=4ffd58d85a13785c63db3a2116c8128647f2c972#4ffd58d85a13785c63db3a2116c8128647f2c972"
+version = "0.13.0"
+source = "git+https://github.com/IndigoCarmine/moleucle_3dview_rs.git?rev=e05f66ba75b4eb9665f9af28ec72f0adb195eb2a#e05f66ba75b4eb9665f9af28ec72f0adb195eb2a"
 dependencies = [
  "bytemuck",
  "eframe",
