@@ -531,6 +531,16 @@ impl TopFile {
     /// materializing a per-atom `String` first would be the very allocation the
     /// interning exists to avoid.
     pub fn for_each_expanded_atom_type(&self, mut visit: impl FnMut(&str)) {
+        self.for_each_expanded_atom(|atom| visit(&atom.atom_type));
+    }
+
+    /// Visit every atom of the fully expanded system, in system order.
+    ///
+    /// `[ molecules ]` names each template and how many copies of it the system
+    /// holds, so the records here are the templates' repeated as many times as
+    /// the system repeats them -- the order a `.gro` or a PLUMED serial counts
+    /// in.
+    pub fn for_each_expanded_atom(&self, mut visit: impl FnMut(&TopAtomRecord)) {
         let (templates, instances) = self.parse_layout();
         let mut emitted = 0usize;
         for instance in &instances {
@@ -549,14 +559,13 @@ impl TopFile {
                     return;
                 }
                 for atom in &template.atoms {
-                    visit(&atom.atom_type);
+                    visit(atom);
                 }
                 emitted += template.atoms.len();
             }
         }
     }
 
-    /// How many atoms the topology expands to.
     pub fn expanded_atom_count(&self) -> usize {
         let mut count = 0usize;
         self.for_each_expanded_atom_type(|_| count += 1);
