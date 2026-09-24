@@ -4,6 +4,11 @@ name: Release
 # them as a GitHub Release. Pull requests to master and `workflow_dispatch`
 # build the same artifacts without releasing (the publish job below is gated to
 # tags), so packaging breakage is caught before it reaches a release.
+#
+# Every action below is pinned to a major that runs on Node 24. GitHub is
+# forcing Node 20 actions onto the Node 24 runtime and warning about it on every
+# run; once the fallback goes away, a Node 20 action stops working outright.
+# These majors need a runner of at least v2.327.1, which the hosted ones are.
 on:
   push:
     tags:
@@ -24,7 +29,7 @@ jobs:
     name: Windows installer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -56,7 +61,7 @@ jobs:
           cp "target/release/${BIN_NAME}.exe" "out/${APP_NAME}-${{ steps.version.outputs.value }}-windows-x64.exe"
           cp dist/*.exe out/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: out/*
@@ -67,7 +72,7 @@ jobs:
     name: macOS installer
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -144,7 +149,7 @@ jobs:
           mv "${APP_NAME}-${VERSION}-macos-universal.dmg" out/
           cp "${APP}/Contents/MacOS/${BIN_NAME}" "out/${APP_NAME}-${VERSION}-macos-universal"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: out/*
@@ -155,7 +160,7 @@ jobs:
     name: Linux installers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -246,7 +251,7 @@ jobs:
           cp target/debian/*.deb out/
           cp "target/release/${BIN_NAME}" "out/${APP_NAME}-${VERSION}-linux-x86_64"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: out/*
@@ -263,7 +268,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # v8 errors on an artifact digest mismatch rather than warning. That is
+      # the behaviour we want for something that becomes a published binary.
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -271,7 +278,7 @@ jobs:
       - name: List artifacts
         run: ls -lh artifacts
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*
           generate_release_notes: true
