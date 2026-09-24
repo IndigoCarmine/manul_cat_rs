@@ -52,6 +52,13 @@ and
   `ARG=` to the CVs it reads. A serial the structure does not have is an error
   on that line, not a silently dropped atom — which is the misconfiguration the
   view exists to catch. The file is never written.
+* **XYZ slice** — a cut plane per world axis with a slider, in the lower half of
+  the right panel. Tick an axis and an atom is drawn only when its coordinate is
+  on the chosen side of the plane; the three combine, so you can peel a face or
+  a corner off a solvated box and look at the core. The cut follows into image
+  and video export and into the other layers' overlay spheres, and it holds
+  still in space while a trajectory plays through it. It is a view state only —
+  structure export still writes the whole structure.
 * **Surface (dot) mesh view** from `gmx sasa` PDBs, plus multiple **overlay
   surfaces** loaded from separate files, each with its own colour.
 * **Document layers** — load several structures at once to compare them; each
