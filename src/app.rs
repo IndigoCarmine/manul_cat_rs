@@ -2,9 +2,14 @@ use crate::component::ComponentState;
 use crate::ffmpeg::{self, is_frame_file_name};
 use crate::image_export::{self, ExportSettings};
 use crate::parsing::{
-    AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, SURFACE_RES_NAME, TopFile,
-    XtcFile, XtcFrame,
+    AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, PlumedFile,
+    SURFACE_RES_NAME, TopFile, XtcFile, XtcFrame,
 };
+use crate::plumed_overlay::{
+    ARROW_RADIUS, MARKER_RADIUS, PlumedArrow, PlumedAtomGroup, PlumedMarker, PlumedOverlayRender,
+    PlumedOverlayState,
+};
+use crate::plumed_view::{self, PlumedEntry};
 use crate::selection::{
     AtomTable, EvalCtx, HELP_TEXT, Statement, Targets, evaluate, parse_statement, to_indices,
 };
@@ -46,6 +51,8 @@ enum PickKind {
     Gro,
     /// NDX index groups.
     Ndx,
+    /// PLUMED input file.
+    Plumed,
     /// XTC trajectory.
     Xtc,
     /// Overlay dot-surface PDB.
@@ -55,6 +62,74 @@ enum PickKind {
     /// A TOP + GRO pair (paths ordered `[top, gro]`) for resname sync.
     TopGroPair,
 }
+
+/// Which view the left panel is showing.
+///
+/// The PLUMED tab only exists while a script is open, so the rest of the app
+/// never has to think about it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LeftPanelTab {
+    #[default]
+    Structure,
+    Plumed,
+}
+
+/// The open PLUMED script and how the viewer is showing it.
+///
+/// `entries` is derived: it is re-resolved from `file` against the current
+/// molecule every time the overlay refreshes, because marker and vector
+/// positions are absolute and a trajectory frame invalidates all of them.
+#[derive(Default)]
+struct PlumedState {
+    file: Option<PlumedFile>,
+    path: Option<PathBuf>,
+    entries: Vec<PlumedEntry>,
+    /// Index into `file.actions` of the line being inspected.
+    selected: Option<usize>,
+    visible: bool,
+    show_arrows: bool,
+    show_markers: bool,
+    /// Set when the selection moved by keyboard or the Prev/Next buttons, so
+    /// the line list scrolls the new row into view. Cleared once the list has
+    /// acted on it.
+    scroll_to_selection: bool,
+    /// Per-atom masses from the topology, or `None` when there is no topology
+    /// describing exactly this molecule. Cached because the overlay refreshes
+    /// on every trajectory frame and deriving these re-expands the whole
+    /// topology; invalidated by `rebuild_viewport`, which is where the molecule
+    /// or the topology can have changed.
+    masses: Option<Vec<f32>>,
+    masses_dirty: bool,
+    /// The (script, atom count) the resolve errors were last reported for, so a
+    /// script dropped alongside its structure still reports once the structure
+    /// arrives -- and playback, which changes neither, stays quiet.
+    logged: Option<(PathBuf, usize)>,
+}
+
+/// Highlight colours for the atom groups one PLUMED line names, in the order
+/// the line named them -- so a `GROUPA`/`GROUPB` pair reads as two sides.
+/// Deliberately off the CPK palette: a nitrogen-rich core is already blue and a
+/// sulphur-rich one already yellow, so a highlight in either would be lost in
+/// the structure it is meant to pick out.
+const PLUMED_GROUP_PALETTE: [[f32; 3]; 4] = [
+    [0.72, 0.45, 1.00], // violet -- the line's own atoms
+    [0.98, 0.72, 0.25], // amber  -- the second group (GROUPB)
+    [0.35, 0.90, 0.60], // green
+    [0.25, 0.85, 0.95], // cyan
+];
+/// Virtual atoms (`CENTER` / `COM`) -- deliberately unlike any element colour,
+/// because these points are not atoms.
+const PLUMED_MARKER_COLOR: [f32; 3] = [1.00, 0.35, 0.70];
+/// A measured vector, and the central bond a `TORSION` turns around.
+const PLUMED_ARROW_COLOR: [f32; 3] = [0.35, 0.90, 0.60];
+const PLUMED_AXIS_COLOR: [f32; 3] = [0.98, 0.72, 0.25];
+/// Alpha of the halo drawn on a highlighted atom: solid enough to find, sheer
+/// enough to still show the atom underneath.
+const PLUMED_ATOM_ALPHA: f32 = 0.55;
+/// Geometry reached by following `ARG=` rather than named on the line is drawn
+/// at this fraction of the alpha, so "this line reads that CV" stays visibly
+/// weaker than "this line names those atoms".
+const PLUMED_INDIRECT_FADE: f32 = 0.5;
 
 /// Result handed back from a background file-picker thread. `paths` is empty
 /// when the user cancelled the dialog.
@@ -151,6 +226,7 @@ enum LoadPayload {
         gro: GroFile,
     },
     Ndx(NdxFile),
+    Plumed(PlumedFile),
     Xtc(XtcFile),
     Overlay(Vec<Vec3>), // surface dots
 }
@@ -426,6 +502,7 @@ struct UiState {
     /// NDX colouring (and vice versa).
     ndx_opacity: f32,
     ndx_selected_atom_count: usize,
+    left_tab: LeftPanelTab,
 }
 
 #[derive(Default)]
@@ -681,6 +758,10 @@ pub struct KuromameApp {
     /// `update`/`ui` polls it and applies the finished payload on the UI thread.
     /// `None` when nothing is loading; at most one load runs at a time.
     pending_load: Option<PendingLoad>,
+    /// The PLUMED script being inspected, if one is open. Global rather than
+    /// per-layer: a PLUMED input describes one simulation system, not a
+    /// decoration of whichever structure happens to be active.
+    plumed: PlumedState,
     /// Scratch for the positions of the frame being displayed, reused across
     /// frames. Playback used to build a fresh `Vec<Vec3>` per frame — 6 MB
     /// allocated and freed per frame on a 500k-atom system, at playback rate.
@@ -786,6 +867,7 @@ impl KuromameApp {
         viewport.add_additional_render_box(Box::new(PointCloudRender::new()));
         viewport.add_additional_render_box(Box::new(SphereSetRender::new()));
         viewport.add_additional_render_box(Box::new(AxesRender::new()));
+        viewport.add_additional_render_box(Box::new(PlumedOverlayRender::new()));
         // Show the XYZ orientation triad by default so the coordinate frame is
         // always visible; the user can hide it from the view options.
         viewport.set_state_by_type(AxesState {
@@ -826,6 +908,7 @@ impl KuromameApp {
                 ndx_visible: true,
                 ndx_opacity: 1.0,
                 ndx_selected_atom_count: 0,
+                left_tab: LeftPanelTab::default(),
             },
             trajectory: Vec::new(),
             trajectory_path: None,
@@ -859,6 +942,7 @@ impl KuromameApp {
             periodic_cells: [1, 1, 1],
             pending_pick: None,
             pending_load: None,
+            plumed: PlumedState::default(),
             frame_positions: Vec::new(),
         }
     }
@@ -1010,6 +1094,7 @@ impl KuromameApp {
             PickKind::Top => Self::parse_top(first()?, progress),
             PickKind::Gro => Self::parse_gro(first()?, progress),
             PickKind::Ndx => Self::parse_ndx(first()?, progress),
+            PickKind::Plumed => Self::parse_plumed(first()?, progress),
             PickKind::Xtc => Self::parse_xtc(first()?, progress),
             PickKind::OverlaySurface => Self::parse_overlay(first()?, progress),
             PickKind::TopGroPair => {
@@ -1121,6 +1206,14 @@ impl KuromameApp {
             .map_err(|_| "Failed to read NDX file".to_string())?;
         let ndx = NdxFile::parse(&content).map_err(|err| format!("NDX parse failed: {err}"))?;
         Ok(LoadPayload::Ndx(ndx))
+    }
+
+    fn parse_plumed(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| "Failed to read PLUMED file".to_string())?;
+        let plumed =
+            PlumedFile::parse(&content).map_err(|err| format!("PLUMED parse failed: {err}"))?;
+        Ok(LoadPayload::Plumed(plumed))
     }
 
     fn parse_overlay(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
@@ -1237,6 +1330,11 @@ impl KuromameApp {
             LoadPayload::Ndx(ndx) => {
                 if let Some(path) = paths.next() {
                     self.apply_ndx(ndx, path);
+                }
+            }
+            LoadPayload::Plumed(plumed) => {
+                if let Some(path) = paths.next() {
+                    self.apply_plumed(plumed, path);
                 }
             }
             LoadPayload::Xtc(xtc) => {
@@ -2124,6 +2222,9 @@ impl KuromameApp {
         self.refresh_interaction_pairs();
         self.refresh_martini_bead_state();
         self.sync_selection_to_viewport();
+        // The molecule or the topology may have changed under the script.
+        self.plumed.masses_dirty = true;
+        self.refresh_plumed_overlay();
     }
 
     /// Push the COMPONENTS partition's current visibility to the viewport.
@@ -3244,6 +3345,398 @@ impl KuromameApp {
         });
     }
 
+    // --- PLUMED -----------------------------------------------------------
+
+    pub fn open_plumed_file(&mut self) {
+        self.spawn_pick(PickKind::Plumed, || {
+            FileDialog::new()
+                .add_filter("PLUMED input", &["dat"])
+                .set_title("Import PLUMED input")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
+    }
+
+    /// Synchronous PLUMED load (drag-and-drop / reload / CLI). The file-dialog
+    /// path loads through the async worker instead; both funnel into
+    /// [`Self::apply_plumed`].
+    fn load_plumed_file(&mut self, path: PathBuf) {
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_plumed(&path, &progress) {
+            Ok(LoadPayload::Plumed(plumed)) => self.apply_plumed(plumed, path),
+            Ok(_) => unreachable!("parse_plumed only yields Plumed"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
+
+    /// Apply a parsed PLUMED file: show the panel, select its first action, and
+    /// report any line that does not resolve against the loaded structure.
+    fn apply_plumed(&mut self, plumed: PlumedFile, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let action_count = plumed.actions.len();
+
+        // Reloading the same file keeps the line the user was standing on.
+        let keep = self
+            .plumed
+            .selected
+            .filter(|_| self.plumed.path.as_ref() == Some(&path))
+            .filter(|idx| *idx < action_count);
+
+        self.plumed.selected = keep.or(if action_count > 0 { Some(0) } else { None });
+        self.plumed.file = Some(plumed);
+        self.plumed.path = Some(path);
+        self.plumed.visible = true;
+        self.plumed.show_arrows = true;
+        self.plumed.show_markers = true;
+        self.plumed.scroll_to_selection = true;
+        // A new script has not been reported against anything yet, and a
+        // structure loaded before it never triggered a mass lookup.
+        self.plumed.logged = None;
+        self.plumed.masses_dirty = true;
+        self.ui.left_tab = LeftPanelTab::Plumed;
+        self.refresh_plumed_overlay();
+
+        let error_count = self.plumed_error_count();
+        if error_count > 0 {
+            self.set_status(format!(
+                "Loaded PLUMED input {file_name} ({action_count} actions, {error_count} with errors)"
+            ));
+        } else {
+            self.set_status(format!(
+                "Loaded PLUMED input {file_name} ({action_count} actions)"
+            ));
+        }
+    }
+
+    /// Per-atom masses in molecule order, when a topology describes exactly this
+    /// molecule. `COM` (and `CENTER MASS`) weight by these; without them the
+    /// centre falls back to the geometric one and the detail box says so.
+    fn refresh_plumed_masses(&mut self) {
+        if !self.plumed.masses_dirty {
+            return;
+        }
+        self.plumed.masses_dirty = false;
+        self.plumed.masses = (|| {
+            let atom_count = self.viewport.molecule()?.atoms.len();
+            let top = self.data.top_file.as_ref()?;
+            let mut masses = Vec::with_capacity(atom_count);
+            top.for_each_expanded_atom(|atom| masses.push(atom.mass));
+            (masses.len() == atom_count).then_some(masses)
+        })();
+    }
+
+    /// Report every line that does not resolve against the structure, once per
+    /// (script, structure) pair.
+    ///
+    /// The log rather than the status bar: a script can have several bad lines,
+    /// and a single overwriting status line would show only the last.
+    fn log_plumed_errors_if_new(&mut self) {
+        let Some(path) = self.plumed.path.clone() else {
+            return;
+        };
+        let atom_count = self
+            .viewport
+            .molecule()
+            .map(|molecule| molecule.atoms.len())
+            .unwrap_or(0);
+        // Nothing to check against yet -- a script dropped together with its
+        // structure resolves before the structure has finished loading.
+        if atom_count == 0 {
+            return;
+        }
+
+        let key = (path, atom_count);
+        if self.plumed.logged.as_ref() == Some(&key) {
+            return;
+        }
+        self.plumed.logged = Some(key);
+
+        let file_name = self
+            .plumed_file_name()
+            .unwrap_or_else(|| "plumed.dat".to_string());
+        let errors: Vec<String> = self
+            .plumed
+            .file
+            .as_ref()
+            .map(|file| {
+                file.actions
+                    .iter()
+                    .zip(&self.plumed.entries)
+                    .filter_map(|(action, entry)| {
+                        entry
+                            .error
+                            .as_ref()
+                            .map(|err| format!("{file_name} line {}: {err}", action.line))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for error in errors {
+            self.log_error(error);
+        }
+    }
+
+    /// Re-resolve the open script against the current molecule and push the
+    /// selected line's geometry to the viewport.
+    ///
+    /// Resolution is redone from scratch rather than cached: markers and vectors
+    /// are absolute positions, so every trajectory frame invalidates them, and a
+    /// few thousand index lookups with memoised centroids is cheaper than the
+    /// bookkeeping needed to keep a cache honest.
+    fn refresh_plumed_overlay(&mut self) {
+        self.refresh_plumed_masses();
+        let entries = {
+            let Some(file) = self.plumed.file.as_ref() else {
+                self.plumed.entries.clear();
+                self.viewport
+                    .set_state_by_type(PlumedOverlayState::default());
+                return;
+            };
+            match self.viewport.molecule() {
+                Some(molecule) => {
+                    plumed_view::resolve(file, molecule, self.plumed.masses.as_deref())
+                }
+                None => plumed_view::describe_only(file),
+            }
+        };
+        self.plumed.entries = entries;
+
+        let state = self.plumed_overlay_state();
+        self.viewport.set_state_by_type(state);
+        self.log_plumed_errors_if_new();
+    }
+
+    /// Turn the selected line's resolved geometry into what the overlay draws.
+    fn plumed_overlay_state(&self) -> PlumedOverlayState {
+        let mut state = PlumedOverlayState {
+            visible: self.plumed.visible,
+            ..Default::default()
+        };
+        if !self.plumed.visible {
+            return state;
+        }
+        let Some(entry) = self
+            .plumed
+            .selected
+            .and_then(|idx| self.plumed.entries.get(idx))
+        else {
+            return state;
+        };
+
+        let fade = if entry.indirect {
+            PLUMED_INDIRECT_FADE
+        } else {
+            1.0
+        };
+        let rgba = |[r, g, b]: [f32; 3], alpha: f32| (r, g, b, alpha * fade);
+
+        // Later groups win an atom both claim, mirroring the NDX overlap rule:
+        // two highlight spheres on one position would only z-fight.
+        let mut claimed: HashSet<usize> = HashSet::new();
+        for (idx, group) in entry.atom_groups.iter().enumerate().rev() {
+            let atom_indices: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|atom| claimed.insert(*atom))
+                .collect();
+            if atom_indices.is_empty() {
+                continue;
+            }
+            state.atom_groups.push(PlumedAtomGroup {
+                atom_indices,
+                color: rgba(
+                    PLUMED_GROUP_PALETTE[idx % PLUMED_GROUP_PALETTE.len()],
+                    PLUMED_ATOM_ALPHA,
+                ),
+            });
+        }
+
+        if self.plumed.show_markers {
+            state.markers = entry
+                .markers
+                .iter()
+                .map(|position| PlumedMarker {
+                    position: *position,
+                    radius: MARKER_RADIUS,
+                    color: rgba(PLUMED_MARKER_COLOR, 1.0),
+                })
+                .collect();
+        }
+
+        if self.plumed.show_arrows {
+            state.arrows = entry
+                .arrows
+                .iter()
+                .map(|vector| PlumedArrow {
+                    start: vector.start,
+                    end: vector.end,
+                    radius: ARROW_RADIUS,
+                    color: rgba(
+                        if vector.axis {
+                            PLUMED_AXIS_COLOR
+                        } else {
+                            PLUMED_ARROW_COLOR
+                        },
+                        1.0,
+                    ),
+                })
+                .collect();
+        }
+
+        state
+    }
+
+    // --- PLUMED panel accessors -------------------------------------------
+
+    pub fn plumed_is_loaded(&self) -> bool {
+        self.plumed.file.is_some()
+    }
+
+    pub fn plumed_file_name(&self) -> Option<String> {
+        self.plumed
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    }
+
+    pub fn plumed_action_count(&self) -> usize {
+        self.plumed
+            .file
+            .as_ref()
+            .map(|file| file.actions.len())
+            .unwrap_or(0)
+    }
+
+    pub fn plumed_error_count(&self) -> usize {
+        self.plumed
+            .entries
+            .iter()
+            .filter(|entry| entry.error.is_some())
+            .count()
+    }
+
+    /// The script's source lines, for the text view.
+    pub fn plumed_lines(&self) -> &[String] {
+        self.plumed
+            .file
+            .as_ref()
+            .map(|file| file.lines.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Which action, if any, owns each physical line. A `...` block owns every
+    /// line it spans, so clicking any of them selects the whole statement.
+    pub fn plumed_line_owners(&self) -> Vec<Option<usize>> {
+        let mut owners = vec![None; self.plumed_lines().len()];
+        let Some(file) = self.plumed.file.as_ref() else {
+            return owners;
+        };
+        for (idx, action) in file.actions.iter().enumerate() {
+            for line in action.line..=action.end_line {
+                if let Some(slot) = owners.get_mut(line.saturating_sub(1)) {
+                    *slot = Some(idx);
+                }
+            }
+        }
+        owners
+    }
+
+    pub fn plumed_action_has_error(&self, idx: usize) -> bool {
+        self.plumed
+            .entries
+            .get(idx)
+            .is_some_and(|entry| entry.error.is_some())
+    }
+
+    pub fn plumed_selected(&self) -> Option<usize> {
+        self.plumed.selected
+    }
+
+    pub fn set_plumed_selected(&mut self, idx: Option<usize>) {
+        let idx = idx.filter(|i| *i < self.plumed_action_count());
+        if self.plumed.selected == idx {
+            return;
+        }
+        self.plumed.selected = idx;
+        self.plumed.scroll_to_selection = true;
+        self.refresh_plumed_overlay();
+    }
+
+    /// Move the selection by `delta` actions, clamped to the file.
+    pub fn step_plumed_selection(&mut self, delta: isize) {
+        let count = self.plumed_action_count();
+        if count == 0 {
+            return;
+        }
+        let current = self.plumed.selected.unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, count as isize - 1) as usize;
+        self.set_plumed_selected(Some(next));
+    }
+
+    /// Whether the line list should scroll the selected row into view, cleared
+    /// by asking.
+    pub fn take_plumed_scroll_request(&mut self) -> bool {
+        std::mem::take(&mut self.plumed.scroll_to_selection)
+    }
+
+    /// The selected action's first line (1-based), so the list can scroll to it.
+    pub fn plumed_selected_line(&self) -> Option<usize> {
+        let idx = self.plumed.selected?;
+        Some(self.plumed.file.as_ref()?.actions.get(idx)?.line)
+    }
+
+    /// Everything the detail box shows about the line the user is standing on.
+    pub fn plumed_selected_detail(&self) -> Option<PlumedDetail> {
+        let idx = self.plumed.selected?;
+        let action = self.plumed.file.as_ref()?.actions.get(idx)?;
+        let entry = self.plumed.entries.get(idx)?;
+        Some(PlumedDetail {
+            name: action.name.clone(),
+            label: action.label.clone(),
+            line: action.line,
+            summary: entry.summary.clone(),
+            error: entry.error.clone(),
+            atom_count: entry.atom_count(),
+            marker_count: entry.markers.len(),
+            arrow_count: entry.arrows.len(),
+            indirect: entry.indirect,
+        })
+    }
+
+    pub fn plumed_visible(&self) -> bool {
+        self.plumed.visible
+    }
+
+    pub fn set_plumed_visible(&mut self, visible: bool) {
+        self.plumed.visible = visible;
+        self.refresh_plumed_overlay();
+    }
+
+    pub fn plumed_show_arrows(&self) -> bool {
+        self.plumed.show_arrows
+    }
+
+    pub fn set_plumed_show_arrows(&mut self, show: bool) {
+        self.plumed.show_arrows = show;
+        self.refresh_plumed_overlay();
+    }
+
+    pub fn plumed_show_markers(&self) -> bool {
+        self.plumed.show_markers
+    }
+
+    pub fn set_plumed_show_markers(&mut self, show: bool) {
+        self.plumed.show_markers = show;
+        self.refresh_plumed_overlay();
+    }
+
     pub fn open_ndx_file(&mut self) {
         self.spawn_pick(PickKind::Ndx, || {
             FileDialog::new()
@@ -3290,6 +3783,11 @@ impl KuromameApp {
 
         if let Some(path) = ndx_path {
             self.load_ndx_file(path);
+            reloaded_any = true;
+        }
+
+        if let Some(path) = self.plumed.path.clone() {
+            self.load_plumed_file(path);
             reloaded_any = true;
         }
 
@@ -3679,6 +4177,27 @@ impl KuromameApp {
                 ctrl && !shift && i.key_pressed(egui::Key::E),
             )
         });
+
+        // Arrow keys walk the PLUMED script, but only while that tab is up and
+        // nothing has keyboard focus -- the command bar recalls its history
+        // with the same keys.
+        if self.ui.left_tab == LeftPanelTab::Plumed
+            && self.plumed_is_loaded()
+            && !ctx.memory(|mem| mem.focused().is_some())
+        {
+            let (up, down) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                )
+            });
+            if down {
+                self.step_plumed_selection(1);
+            }
+            if up {
+                self.step_plumed_selection(-1);
+            }
+        }
 
         if shortcuts.0 {
             self.open_file();
@@ -4087,6 +4606,14 @@ impl KuromameApp {
                 badge: "XTC",
                 name,
                 detail: format!("{} frames", self.trajectory.len()),
+            });
+        }
+
+        if let Some(name) = file_name(&self.plumed.path) {
+            rows.push(LoadedFileRow {
+                badge: "PLUMED",
+                name,
+                detail: format!("{} actions", self.plumed_action_count()),
             });
         }
 
@@ -4521,6 +5048,9 @@ impl KuromameApp {
             // viewport owns and bumps the render revision, so there is no
             // second array to keep in step.
             let _ = self.viewport.update_positions(positions);
+            // Virtual-atom markers and CV vectors are absolute positions, so
+            // they have to follow the frame the atoms just moved to.
+            self.refresh_plumed_overlay();
         } else if let Some(base) = self.base_molecule.clone() {
             // First frame (or the molecule was swapped): establish the molecule and
             // fit the camera once.
@@ -4648,6 +5178,7 @@ impl KuromameApp {
         let mut gro_path: Option<PathBuf> = None;
         let mut ndx_path: Option<PathBuf> = None;
         let mut xtc_path: Option<PathBuf> = None;
+        let mut plumed_path: Option<PathBuf> = None;
         let mut other_path: Option<PathBuf> = None;
 
         for path in &paths {
@@ -4657,9 +5188,17 @@ impl KuromameApp {
                     "gro" => gro_path = Some(path.clone()),
                     "ndx" => ndx_path = Some(path.clone()),
                     "xtc" => xtc_path = Some(path.clone()),
+                    "dat" => plumed_path = Some(path.clone()),
                     _ => other_path = Some(path.clone()),
                 }
             }
+        }
+
+        // A PLUMED script is a few KB of text, so it is read here on the spot
+        // rather than queued: only one async load runs at a time, and dropping
+        // a structure together with its `plumed.dat` should load both.
+        if let Some(path) = plumed_path {
+            self.load_plumed_file(path);
         }
 
         // Route through the async worker (same as the file-dialog path) so a big
@@ -4912,6 +5451,19 @@ impl KuromameApp {
             }
         }
     }
+}
+
+/// What the PLUMED panel shows about the line the user is standing on.
+pub struct PlumedDetail {
+    pub name: String,
+    pub label: Option<String>,
+    pub line: usize,
+    pub summary: String,
+    pub error: Option<String>,
+    pub atom_count: usize,
+    pub marker_count: usize,
+    pub arrow_count: usize,
+    pub indirect: bool,
 }
 
 impl eframe::App for KuromameApp {

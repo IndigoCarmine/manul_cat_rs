@@ -4,7 +4,7 @@ use moleucle_3dview_rs::RenderStyle;
 
 use crate::{ffmpeg, video_export};
 
-use super::KuromameApp;
+use super::{KuromameApp, LeftPanelTab};
 
 /// Color palette for the "Viewer UI" dark design. Shared with `app.rs` so the
 /// global theme and the per-panel frames stay in sync.
@@ -827,6 +827,14 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             ui.close();
         }
         if ui
+            .button(format!("{} Import PLUMED", mi(MaterialIcon::Rule)))
+            .on_hover_text("Inspect a PLUMED input file against the loaded structure")
+            .clicked()
+        {
+            app.open_plumed_file();
+            ui.close();
+        }
+        if ui
             .button(format!("{} Add Overlay Surface", mi(MaterialIcon::Layers)))
             .on_hover_text("Overlay a PDB dot surface on top of the current structure")
             .clicked()
@@ -949,10 +957,24 @@ fn help_menu(ui: &mut egui::Ui) {
 }
 
 pub fn render_left_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
-    egui::Panel::left("left_panel")
+    let on_plumed = app.ui.left_tab == LeftPanelTab::Plumed && app.plumed_is_loaded();
+
+    // The two tabs get two panel *ids*, because egui remembers a panel's
+    // dragged width per id and a stored width always beats `default_size`.
+    // That is what lets the PLUMED reading view open at half the window while
+    // the structure tab keeps its narrow 264 -- and lets the user drag either
+    // one without the other forgetting.
+    let (id, default_size, min_size) = if on_plumed {
+        let half = ui.ctx().content_rect().width() * 0.5;
+        ("left_panel_plumed", half.max(360.0), 320.0)
+    } else {
+        ("left_panel", 264.0, 200.0)
+    };
+
+    egui::Panel::left(id)
         .resizable(true)
-        .default_size(264.0)
-        .min_size(200.0)
+        .default_size(default_size)
+        .min_size(min_size)
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
@@ -960,6 +982,15 @@ pub fn render_left_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(16, 16)),
         )
         .show(ui, |ui| {
+            if left_panel_tabs(app, ui) {
+                ui.add_space(12.0);
+            }
+
+            if on_plumed {
+                plumed_section(app, ui);
+                return;
+            }
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 file_header(app, ui);
                 ui.add_space(14.0);
@@ -971,6 +1002,436 @@ pub fn render_left_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
                 components_section(app, ui);
             });
         });
+}
+
+/// The STRUCTURE / PLUMED tab strip. Only drawn once a script is open, so the
+/// panel looks exactly as it always did until there is a second thing to show.
+/// Returns whether anything was drawn.
+fn left_panel_tabs(app: &mut KuromameApp, ui: &mut egui::Ui) -> bool {
+    if !app.plumed_is_loaded() {
+        return false;
+    }
+
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        for (tab, label) in [
+            (LeftPanelTab::Structure, "STRUCTURE"),
+            (LeftPanelTab::Plumed, "PLUMED"),
+        ] {
+            let active = app.ui.left_tab == tab;
+            let button = egui::Button::new(
+                egui::RichText::new(label)
+                    .size(11.0)
+                    .strong()
+                    .color(if active { theme::ACCENT_FG } else { theme::MUTED }),
+            )
+            .fill(if active { theme::ACCENT } else { theme::HOVER_BG })
+            .stroke(egui::Stroke::new(
+                1.0,
+                if active { theme::ACCENT } else { theme::BORDER2 },
+            ))
+            .corner_radius(egui::CornerRadius::same(7))
+            .min_size(egui::vec2(0.0, 26.0));
+
+            if ui.add(button).clicked() {
+                picked = Some(tab);
+            }
+        }
+
+        let errors = app.plumed_error_count();
+        if errors > 0 {
+            ui.label(
+                egui::RichText::new(format!("{errors} error{}", if errors == 1 { "" } else { "s" }))
+                    .size(11.0)
+                    .color(theme::AMBER)
+                    .strong(),
+            );
+        }
+    });
+
+    if let Some(tab) = picked {
+        app.ui.left_tab = tab;
+    }
+    true
+}
+
+/// Height kept below the line list for the detail box. Fixed rather than
+/// measured so the list does not jump every time the selected line's
+/// description changes length.
+const PLUMED_DETAIL_HEIGHT: f32 = 150.0;
+
+/// The PLUMED reading view: the script on the left of the window, the line the
+/// user is standing on highlighted in the 3D view on the right.
+fn plumed_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    plumed_header(app, ui);
+    ui.add_space(10.0);
+    plumed_controls(app, ui);
+    ui.add_space(8.0);
+
+    let list_height = (ui.available_height() - PLUMED_DETAIL_HEIGHT).max(120.0);
+    plumed_line_list(app, ui, list_height);
+    ui.add_space(8.0);
+    plumed_detail(app, ui);
+}
+
+fn plumed_header(app: &KuromameApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        type_badge(ui, "PLUMED");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(app.plumed_file_name().unwrap_or_else(|| "plumed.dat".into()))
+                .color(theme::TEXT)
+                .size(13.0)
+                .strong(),
+        );
+        count_badge(ui, app.plumed_action_count());
+    });
+
+    let position = match (app.plumed_selected(), app.plumed_action_count()) {
+        (Some(idx), total) if total > 0 => format!("action {} of {total}", idx + 1),
+        (_, total) => format!("{total} actions"),
+    };
+    ui.label(
+        egui::RichText::new(position)
+            .color(theme::MUTED2)
+            .size(11.0),
+    );
+}
+
+fn plumed_controls(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    let mut visible = app.plumed_visible();
+    let mut arrows = app.plumed_show_arrows();
+    let mut markers = app.plumed_show_markers();
+
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut visible, "Highlight").changed() {
+            app.set_plumed_visible(visible);
+        }
+        if ui.checkbox(&mut arrows, "Vectors").changed() {
+            app.set_plumed_show_arrows(arrows);
+        }
+        if ui.checkbox(&mut markers, "Centres").changed() {
+            app.set_plumed_show_markers(markers);
+        }
+    });
+
+    ui.add_space(4.0);
+    // Buttons as well as the arrow keys: the 3D view takes keyboard focus as
+    // soon as the pointer is over it, and stepping the script is the whole
+    // point of this panel.
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 8.0) * 0.5;
+        if ui
+            .add_sized(
+                egui::vec2(width, 28.0),
+                egui::Button::new(egui::RichText::new("◀ Prev").color(theme::TEXT).size(12.5))
+                    .fill(theme::HOVER_BG)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER2))
+                    .corner_radius(egui::CornerRadius::same(7)),
+            )
+            .on_hover_text("Previous action (Up arrow)")
+            .clicked()
+        {
+            app.step_plumed_selection(-1);
+        }
+        if ui
+            .add_sized(
+                egui::vec2(width, 28.0),
+                egui::Button::new(egui::RichText::new("Next ▶").color(theme::TEXT).size(12.5))
+                    .fill(theme::HOVER_BG)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER2))
+                    .corner_radius(egui::CornerRadius::same(7)),
+            )
+            .on_hover_text("Next action (Down arrow)")
+            .clicked()
+        {
+            app.step_plumed_selection(1);
+        }
+    });
+}
+
+/// The script, one row per physical line. A `...` block is several rows that
+/// all select the same action.
+fn plumed_line_list(app: &mut KuromameApp, ui: &mut egui::Ui, height: f32) {
+    let owners = app.plumed_line_owners();
+    let selected = app.plumed_selected();
+    let scroll_to = app.take_plumed_scroll_request();
+    let gutter = gutter_width(app.plumed_lines().len());
+
+    let mut picked: Option<usize> = None;
+
+    egui::Frame::new()
+        .fill(theme::INPUT_BG)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(2, 6))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("plumed_lines")
+                .max_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    let width = ui.available_width();
+                    for (index, line) in app.plumed_lines().iter().enumerate() {
+                        let owner = owners.get(index).copied().flatten();
+                        let is_selected = owner.is_some() && owner == selected;
+                        let is_error = owner.is_some_and(|idx| app.plumed_action_has_error(idx));
+
+                        // Sized to its content, not to a fixed row height: a
+                        // `CENTER` over a whole rosette is a 700-character
+                        // ATOMS list, and wrapping it is what makes the panel
+                        // readable at half the window instead of needing a
+                        // horizontal scrollbar nobody would find.
+                        let response = ui.add(
+                            egui::Button::new(plumed_line_text(line, index + 1, gutter, width))
+                                .min_size(egui::vec2(width, 16.0))
+                                .fill(if is_selected {
+                                    theme::HOVER_BG
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(egui::CornerRadius::ZERO),
+                        );
+
+                        // A bar in the left margin, rather than a tinted row:
+                        // it marks selection and error without fighting the
+                        // syntax colours for the text itself.
+                        let bar = if is_error {
+                            Some(egui::Color32::from_rgb(0xe5, 0x53, 0x4b))
+                        } else if is_selected {
+                            Some(theme::ACCENT)
+                        } else {
+                            None
+                        };
+                        if let Some(color) = bar {
+                            let rect = response.rect;
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    rect.left_top(),
+                                    egui::vec2(2.5, rect.height()),
+                                ),
+                                egui::CornerRadius::ZERO,
+                                color,
+                            );
+                        }
+
+                        if response.clicked()
+                            && let Some(idx) = owner
+                        {
+                            picked = Some(idx);
+                        }
+                        if is_selected && scroll_to {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                        }
+                    }
+                });
+        });
+
+    if let Some(idx) = picked {
+        app.set_plumed_selected(Some(idx));
+    }
+}
+
+/// What the selected line means, in words.
+fn plumed_detail(app: &KuromameApp, ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(theme::CARD_BG)
+        .stroke(egui::Stroke::new(1.0, theme::CARD_BORDER))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let Some(detail) = app.plumed_selected_detail() else {
+                ui.label(
+                    egui::RichText::new("Pick a line to see what it sets up")
+                        .color(theme::MUTED2)
+                        .size(12.0),
+                );
+                return;
+            };
+
+            egui::ScrollArea::vertical()
+                .id_salt("plumed_detail")
+                .max_height(PLUMED_DETAIL_HEIGHT - 20.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        type_badge(ui, &detail.name);
+                        ui.add_space(4.0);
+                        if let Some(label) = &detail.label {
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::ACCENT),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("line {}", detail.line))
+                                .size(11.0)
+                                .color(theme::MUTED2),
+                        );
+                    });
+                    ui.add_space(4.0);
+
+                    ui.label(
+                        egui::RichText::new(&detail.summary)
+                            .color(theme::TEXT)
+                            .size(12.0),
+                    );
+
+                    if let Some(error) = &detail.error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(error)
+                                .color(egui::Color32::from_rgb(0xff, 0x7b, 0x72))
+                                .size(12.0),
+                        );
+                    } else if detail.atom_count + detail.marker_count + detail.arrow_count == 0 {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(if app.atom_count() == 0 {
+                                "Load a structure to resolve this line's atoms"
+                            } else {
+                                "Nothing to draw for this line"
+                            })
+                            .color(theme::MUTED2)
+                            .size(11.5),
+                        );
+                    } else {
+                        ui.add_space(4.0);
+                        let drawn = format!(
+                            "drawing {} atom{}, {} centre{}, {} vector{}{}",
+                            detail.atom_count,
+                            plural(detail.atom_count),
+                            detail.marker_count,
+                            plural(detail.marker_count),
+                            detail.arrow_count,
+                            plural(detail.arrow_count),
+                            if detail.indirect {
+                                " (inherited through ARG=)"
+                            } else {
+                                ""
+                            },
+                        );
+                        ui.label(
+                            egui::RichText::new(drawn)
+                                .color(theme::MUTED2)
+                                .size(11.5),
+                        );
+                    }
+                });
+        });
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Digits reserved for the line-number gutter, so the code all starts in the
+/// same column.
+fn gutter_width(lines: usize) -> usize {
+    lines.max(1).to_string().len()
+}
+
+/// One source line, syntax-coloured: comments grey, the label blue, the action
+/// name bright, keys amber and their values plain.
+fn plumed_line_text(
+    line: &str,
+    number: usize,
+    gutter: usize,
+    width: f32,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let font = egui::FontId::monospace(11.5);
+    let mut job = LayoutJob::default();
+    // Wrapped at the row width rather than clipped: the point of the panel is
+    // to read the atom lists, and a clipped `ATOMS=` hides exactly the numbers
+    // the user came to check. One source line is still one clickable row.
+    job.wrap.max_width = width;
+    // Those lists are one long comma-separated token, so breaking only at
+    // whitespace would not wrap them at all.
+    job.wrap.break_anywhere = true;
+
+    let mut push = |text: &str, color: egui::Color32| {
+        job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+    };
+
+    push(&format!("{number:>gutter$} │ "), theme::MUTED2);
+
+    // Everything from an unbraced `#` is a comment, whole-line or trailing.
+    let (code, comment) = split_comment(line);
+
+    let mut seen_action = false;
+    for (token, is_space) in tokens_with_gaps(code) {
+        if is_space {
+            push(token, theme::MUTED2);
+            continue;
+        }
+
+        if token == "..." {
+            push(token, theme::MUTED2);
+        } else if !seen_action && token.ends_with(':') {
+            push(token, theme::ACCENT);
+        } else if !seen_action && !token.contains('=') {
+            seen_action = true;
+            push(token, theme::TEXT);
+        } else if let Some((key, value)) = token.split_once('=') {
+            seen_action = true;
+            push(key, theme::AMBER);
+            push("=", theme::MUTED2);
+            push(value, theme::MUTED);
+        } else {
+            push(token, theme::MUTED);
+        }
+    }
+
+    if !comment.is_empty() {
+        push(comment, theme::MUTED2);
+    }
+
+    job
+}
+
+/// Split a source line into its code and its trailing comment. `#` inside
+/// braces is part of a `FUNC={...}`, not a comment -- the same rule the parser
+/// applies.
+fn split_comment(line: &str) -> (&str, &str) {
+    let mut depth = 0i32;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            '#' if depth <= 0 => return line.split_at(idx),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// Walk a line as alternating whitespace and non-whitespace runs, so the
+/// original spacing survives into the coloured output.
+fn tokens_with_gaps(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_space = text.starts_with(char::is_whitespace);
+
+    for (idx, ch) in text.char_indices() {
+        let is_space = ch.is_whitespace();
+        if is_space != in_space {
+            out.push((&text[start..idx], in_space));
+            start = idx;
+            in_space = is_space;
+        }
+    }
+    if start < text.len() {
+        out.push((&text[start..], in_space));
+    }
+    out
 }
 
 fn file_header(app: &mut KuromameApp, ui: &mut egui::Ui) {

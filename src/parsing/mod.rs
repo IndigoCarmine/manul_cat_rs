@@ -5,6 +5,7 @@ mod martini;
 mod mol2;
 mod ndx;
 mod pdb;
+mod plumed;
 mod top;
 mod xtc;
 
@@ -13,5 +14,8 @@ pub use martini::MartiniForceField;
 pub use mol2::{Mol2AtomRecord, Mol2BondRecord, Mol2File, Mol2Line};
 pub use ndx::{NdxFile, NdxGroup, ParseNdxError};
 pub use pdb::{ConectRecord, PdbFile, PdbLine, SURFACE_RES_NAME};
+pub use plumed::{
+    AtomToken, ParsePlumedError, PlumedAction, PlumedFile, PlumedKeyword, parse_atom_list,
+};
 pub use top::{TopAtomRecord, TopBondRecord, TopFile, TopGroComparison, TopLine};
 pub use xtc::{XtcFile, XtcFrame};

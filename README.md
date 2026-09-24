@@ -21,6 +21,7 @@ and
 * `.top` / `.itp` : topology files (GROMACS `#include` expansion supported)
 * `.ndx` : index files
 * `.xtc` : trajectory files
+* `.dat` : PLUMED input files (read-only inspection)
 
 ---
 
@@ -42,6 +43,15 @@ and
   on Windows the app can install one for you through `winget` after showing you
   the exact command. Elsewhere it points you at `apt` / `dnf` / `flatpak` /
   `brew`.
+* **PLUMED input inspection** (`plumed.dat`) — open a PLUMED script and the left
+  panel gains a PLUMED tab holding it as a syntax-coloured line list. Step
+  through the lines with the arrow keys or the Prev/Next buttons and the line
+  you are on lights up in the 3D view: its atoms haloed, a marker sphere on
+  every virtual atom (`CENTER` / `COM`), and arrows for the vectors the
+  collective variable measures. A bias or function is followed through its
+  `ARG=` to the CVs it reads. A serial the structure does not have is an error
+  on that line, not a silently dropped atom — which is the misconfiguration the
+  view exists to catch. The file is never written.
 * **Surface (dot) mesh view** from `gmx sasa` PDBs, plus multiple **overlay
   surfaces** loaded from separate files, each with its own colour.
 * **Document layers** — load several structures at once to compare them; each
