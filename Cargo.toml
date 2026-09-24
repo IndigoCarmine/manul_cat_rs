@@ -1,8 +1,7 @@
 [package]
 name = "manul_cat_rs"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
-# Raised from edition 2024's 1.85 by the egui-winit fork in [patch.crates-io].
 rust-version = "1.92"
 description = "Manul - a cross-platform molecular viewer for GROMACS"
 authors = ["Yuhei Yamada (Indigo Carmine)"]
