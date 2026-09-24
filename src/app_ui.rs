@@ -30,6 +30,11 @@ pub mod theme {
     /// Count-badge pill background / text.
     pub const BADGE_BG: Color32 = Color32::from_rgb(0x1c, 0x25, 0x31);
     pub const BADGE_FG: Color32 = Color32::from_rgb(0xad, 0xba, 0xc7);
+    /// The X/Y/Z triad's colours, so a slice axis reads against the same
+    /// convention the orientation arrows in the view already use.
+    pub const AXIS_X: Color32 = Color32::from_rgb(0xe6, 0x33, 0x33);
+    pub const AXIS_Y: Color32 = Color32::from_rgb(0x33, 0xbf, 0x40);
+    pub const AXIS_Z: Color32 = Color32::from_rgb(0x40, 0x73, 0xf2);
 }
 
 /// A small rounded count pill (e.g. the `2` next to a `LAYERS` header).
@@ -1785,6 +1790,37 @@ pub fn render_overlay_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
                 .inner_margin(egui::Margin::symmetric(16, 16)),
         )
         .show(ui, |ui| {
+            // Shown before the rest so it claims its half of the panel, rather
+            // than being whatever the layers list happens to leave over.
+            egui::Panel::bottom("slice_panel")
+                .resizable(true)
+                // Roughly the lower half of the window, bounded so a short
+                // window still leaves the layers list room and a tall one does
+                // not hand the sliders more space than they can use. Sized from
+                // the context rather than `ui`: inside a side panel's closure
+                // `max_rect` is not yet the panel's full height.
+                .default_size((ui.ctx().content_rect().height() * 0.45).clamp(200.0, 420.0))
+                .min_size(120.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        // The enclosing panel already insets horizontally;
+                        // repeating it here would double the gutter.
+                        .inner_margin(egui::Margin::symmetric(0, 10)),
+                )
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("slice_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| slice_section(app, ui));
+                });
+
+            // Scrolled, because the slice dock takes half the height and the
+            // layers list plus the overlay block do not fit in what is left.
+            egui::ScrollArea::vertical()
+                .id_salt("overlay_panel_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
             render_layers_section(app, ui);
 
             ui.add_space(16.0);
@@ -1872,7 +1908,165 @@ pub fn render_overlay_panel(app: &mut KuromameApp, ui: &mut egui::Ui) {
                     }
                 }
             }
+                });
         });
+}
+
+/// SLICE: one half-space per world axis, intersected.
+///
+/// `if (a > atom.x) show(atom)`, with `a` on a slider -- the cheapest way to
+/// see inside a solvated box or a fibre whose near face hides its core.
+fn slice_section(app: &mut KuromameApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        section_label(ui, "SLICE");
+        let (drawn, total) = app.drawn_atom_counts();
+        if total > 0 {
+            ui.label(
+                egui::RichText::new(format!("{drawn} / {total} atoms"))
+                    .size(11.0)
+                    .color(if drawn < total {
+                        theme::ACCENT
+                    } else {
+                        theme::MUTED2
+                    }),
+            );
+        }
+    });
+    ui.add_space(6.0);
+
+    if app.atom_count() == 0 {
+        ui.label(
+            egui::RichText::new("Load a structure to slice it.")
+                .color(theme::MUTED2)
+                .size(12.0),
+        );
+        return;
+    }
+
+    // Collected and applied after the rows, so a row can read `app` freely.
+    let mut edit: Option<(usize, bool, f32, bool)> = None;
+
+    for (axis, (letter, color)) in [
+        ("X", theme::AXIS_X),
+        ("Y", theme::AXIS_Y),
+        ("Z", theme::AXIS_Z),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut enabled = app.slice_axis_enabled(axis);
+        let mut at = app.slice_axis_at(axis);
+        let mut keep_above = app.slice_axis_keep_above(axis);
+        let (lo, hi) = app.slice_axis_range(axis);
+
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut enabled, "")
+                .on_hover_text(format!("Slice along {letter}"))
+                .changed()
+            {
+                edit = Some((axis, enabled, at, keep_above));
+            }
+            ui.label(
+                egui::RichText::new(letter)
+                    .size(12.0)
+                    .color(if enabled { color } else { theme::MUTED2 })
+                    .strong(),
+            );
+
+            // `>` and `<` rather than the mathematically right glyphs: the
+            // bundled fonts have no U+2265/U+2264 and would draw tofu.
+            ui.add_space(4.0);
+            if direction_segment(ui, enabled, &mut keep_above, letter) {
+                edit = Some((axis, enabled, at, keep_above));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{at:.2} nm"))
+                        .size(11.0)
+                        .color(if enabled { theme::MUTED } else { theme::MUTED2 }),
+                );
+            });
+        });
+
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.spacing_mut().slider_width = ui.available_width().max(60.0);
+            if ui
+                .add(egui::Slider::new(&mut at, lo..=hi).show_value(false))
+                .changed()
+            {
+                edit = Some((axis, enabled, at, keep_above));
+            }
+        });
+        ui.add_space(8.0);
+    }
+
+    if let Some((axis, enabled, at, keep_above)) = edit {
+        app.set_slice_axis(axis, enabled, at, keep_above);
+    }
+
+    ui.add_space(2.0);
+    if secondary_button(ui, "Show all".to_string(), app.slice_active())
+        .on_hover_text("Switch every slice plane off")
+        .clicked()
+    {
+        app.clear_slice();
+    }
+}
+
+/// A two-segment `>` / `<` picker for which side of the plane is kept. Returns
+/// whether it changed.
+fn direction_segment(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    keep_above: &mut bool,
+    letter: &str,
+) -> bool {
+    let mut changed = false;
+    egui::Frame::new()
+        .fill(theme::HOVER_BG)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for (above, glyph) in [(true, ">"), (false, "<")] {
+                    let active = *keep_above == above;
+                    let fill = if active && enabled {
+                        theme::ACCENT
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let fg = if active && enabled {
+                        theme::ACCENT_FG
+                    } else if active {
+                        theme::MUTED
+                    } else {
+                        theme::MUTED2
+                    };
+                    let button = egui::Button::new(
+                        egui::RichText::new(glyph).size(12.0).color(fg).strong(),
+                    )
+                    .fill(fill)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .min_size(egui::vec2(22.0, 18.0));
+
+                    let hint = if above {
+                        format!("Keep atoms with {letter} above the plane")
+                    } else {
+                        format!("Keep atoms with {letter} below the plane")
+                    };
+                    if ui.add(button).on_hover_text(hint).clicked() && !active {
+                        *keep_above = above;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    changed
 }
 
 /// LAYERS list: each row selects the active layer (drawn as the full main

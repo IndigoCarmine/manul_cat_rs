@@ -63,6 +63,106 @@ enum PickKind {
     TopGroPair,
 }
 
+/// One axis of the slice: a plane at `at`, and which side of it is kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SliceAxis {
+    enabled: bool,
+    /// Threshold in nm. The same frame the atom coordinates are in, with no
+    /// offset to undo -- nothing in this app centres or translates a molecule.
+    at: f32,
+    /// `true` keeps `coord >= at`, `false` keeps `coord <= at`.
+    keep_above: bool,
+}
+
+/// The xyz slice: up to three half-spaces, intersected.
+///
+/// Global rather than per-layer. The slice also cuts the *other* layers'
+/// overlay spheres, and a per-layer plane leaves "which layer's slice cuts
+/// layer 3?" with no answer. It is a cut through the world, like the axis
+/// triad and the periodic images, which are global for the same reason.
+#[derive(Debug, Clone, Default)]
+struct SliceState {
+    axes: [SliceAxis; 3],
+    /// Per-axis slider bounds in nm. Derived from the structure and used only
+    /// to size the sliders -- never the source of truth for where a plane is,
+    /// which is why a trajectory drifting past them cannot move the cut.
+    range: [(f32, f32); 3],
+}
+
+impl SliceState {
+    fn active(&self) -> bool {
+        self.axes.iter().any(|axis| axis.enabled)
+    }
+
+    /// Whether an atom at `position` survives every enabled axis.
+    fn keeps(&self, position: Vec3) -> bool {
+        let coords = [position.x, position.y, position.z];
+        self.axes
+            .iter()
+            .zip(coords)
+            .all(|(axis, coord)| !axis.enabled || axis.keeps(coord))
+    }
+
+    /// Recompute the slider bounds from a structure, and pull the thresholds
+    /// into them. For a molecule that just changed.
+    fn reset_range(&mut self, positions: impl Iterator<Item = Vec3>) {
+        let mut bounds: Option<[(f32, f32); 3]> = None;
+        for position in positions {
+            let coords = [position.x, position.y, position.z];
+            match &mut bounds {
+                None => bounds = Some([(coords[0], coords[0]), (coords[1], coords[1]), (coords[2], coords[2])]),
+                Some(range) => {
+                    for (slot, coord) in range.iter_mut().zip(coords) {
+                        slot.0 = slot.0.min(coord);
+                        slot.1 = slot.1.max(coord);
+                    }
+                }
+            }
+        }
+
+        // A little air at each end so the extremes are reachable, and a floor
+        // on the span so a flat or single-atom structure still gives the slider
+        // something to travel along.
+        self.range = bounds.unwrap_or([(0.0, 1.0); 3]).map(|(lo, hi)| {
+            let pad = ((hi - lo) * 0.02).max(0.05);
+            (lo - pad, hi + pad)
+        });
+
+        for (axis, (lo, hi)) in self.axes.iter_mut().zip(self.range) {
+            axis.at = if axis.enabled {
+                axis.at.clamp(lo, hi)
+            } else {
+                // Park an unused plane in the middle, so switching an axis on
+                // cuts the structure in half rather than showing all or nothing.
+                (lo + hi) * 0.5
+            };
+        }
+    }
+
+    /// Widen the bounds to reach `position`, never narrowing.
+    ///
+    /// Playback only grows them: re-deriving the range each frame would make
+    /// the slider endpoints breathe while the cut itself stood still, which
+    /// reads as the control drifting under the hand.
+    fn grow_range(&mut self, position: Vec3) {
+        let coords = [position.x, position.y, position.z];
+        for (slot, coord) in self.range.iter_mut().zip(coords) {
+            slot.0 = slot.0.min(coord);
+            slot.1 = slot.1.max(coord);
+        }
+    }
+}
+
+impl SliceAxis {
+    fn keeps(&self, coord: f32) -> bool {
+        if self.keep_above {
+            coord >= self.at
+        } else {
+            coord <= self.at
+        }
+    }
+}
+
 /// Which view the left panel is showing.
 ///
 /// The PLUMED tab only exists while a script is open, so the rest of the app
@@ -758,6 +858,12 @@ pub struct KuromameApp {
     /// `update`/`ui` polls it and applies the finished payload on the UI thread.
     /// `None` when nothing is loading; at most one load runs at a time.
     pending_load: Option<PendingLoad>,
+    /// The xyz slice planes. Global, not per layer -- see [`SliceState`].
+    slice: SliceState,
+    /// How many atoms the COMPONENTS filter and the slice currently leave
+    /// drawn. Recorded while the mask is built so the slice panel can report it
+    /// without re-testing every atom on each repaint.
+    drawn_atom_count: usize,
     /// The PLUMED script being inspected, if one is open. Global rather than
     /// per-layer: a PLUMED input describes one simulation system, not a
     /// decoration of whichever structure happens to be active.
@@ -942,6 +1048,8 @@ impl KuromameApp {
             periodic_cells: [1, 1, 1],
             pending_pick: None,
             pending_load: None,
+            slice: SliceState::default(),
+            drawn_atom_count: 0,
             plumed: PlumedState::default(),
             frame_positions: Vec::new(),
         }
@@ -2212,6 +2320,7 @@ impl KuromameApp {
             return;
         }
 
+        self.refresh_slice_range();
         self.refresh_visible_atoms();
 
         if focus {
@@ -2233,23 +2342,156 @@ impl KuromameApp {
     /// geometry rebuild, with no molecule clone and no index remapping.
     fn refresh_visible_atoms(&mut self) {
         let Some(full) = self.viewport.molecule() else {
+            self.drawn_atom_count = 0;
             self.viewport.set_visible_atoms(None);
             return;
         };
 
-        if !self.components.any_hidden() {
+        if !self.components.any_hidden() && !self.slice.active() {
+            self.drawn_atom_count = full.atoms.len();
             self.viewport.set_visible_atoms(None);
             return;
         }
 
-        let mask: Vec<bool> = (0..full.atoms.len())
-            .map(|orig| self.components.is_atom_visible(orig))
+        let mask: Vec<bool> = full
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(orig, atom)| {
+                self.components.is_atom_visible(orig) && self.slice.keeps(atom.position)
+            })
             .collect();
+        self.drawn_atom_count = mask.iter().filter(|drawn| **drawn).count();
         self.viewport.set_visible_atoms(Some(mask));
     }
 
+    /// Whether atom `orig` of the active molecule is currently drawn: the
+    /// COMPONENTS partition and the slice together.
+    ///
+    /// The single predicate every index-based overlay filters on. None of the
+    /// viewer's overlays consult the visibility mask themselves -- they draw
+    /// whatever indices they are handed -- so an overlay that skips this leaves
+    /// highlight spheres and interaction cylinders hanging in the empty space
+    /// where a hidden atom used to be.
+    fn is_atom_drawn(&self, orig: usize) -> bool {
+        if !self.components.is_atom_visible(orig) {
+            return false;
+        }
+        if !self.slice.active() {
+            return true;
+        }
+        self.viewport
+            .molecule()
+            .and_then(|molecule| molecule.atoms.get(orig))
+            .is_none_or(|atom| self.slice.keeps(atom.position))
+    }
+
+    /// Re-derive the slider bounds from the active molecule.
+    ///
+    /// Only for a molecule that changed; playback widens the bounds instead of
+    /// recomputing them, so the endpoints hold still under the hand.
+    fn refresh_slice_range(&mut self) {
+        let Some(molecule) = self.viewport.molecule() else {
+            return;
+        };
+        let positions: Vec<Vec3> = molecule.atoms.iter().map(|atom| atom.position).collect();
+        self.slice.reset_range(positions.into_iter());
+    }
+
+    // --- slice panel accessors --------------------------------------------
+
+    pub fn slice_active(&self) -> bool {
+        self.slice.active()
+    }
+
+    pub fn slice_axis_enabled(&self, axis: usize) -> bool {
+        self.slice.axes.get(axis).is_some_and(|a| a.enabled)
+    }
+
+    pub fn slice_axis_at(&self, axis: usize) -> f32 {
+        self.slice.axes.get(axis).map(|a| a.at).unwrap_or(0.0)
+    }
+
+    /// Whether this axis keeps the high side (`coord >= at`).
+    pub fn slice_axis_keep_above(&self, axis: usize) -> bool {
+        self.slice.axes.get(axis).is_some_and(|a| a.keep_above)
+    }
+
+    /// The slider bounds for this axis, in nm.
+    pub fn slice_axis_range(&self, axis: usize) -> (f32, f32) {
+        self.slice.range.get(axis).copied().unwrap_or((0.0, 1.0))
+    }
+
+    /// Set one axis whole.
+    ///
+    /// Taking all three fields at once is what lets the change guard compare
+    /// them in one go: a dragged slider fires every mouse move, and each write
+    /// costs a full geometry rebuild, so a value that resolves to the same
+    /// `f32` must not reach the viewport.
+    pub fn set_slice_axis(&mut self, axis: usize, enabled: bool, at: f32, keep_above: bool) {
+        let next = SliceAxis {
+            enabled,
+            at,
+            keep_above,
+        };
+        let Some(slot) = self.slice.axes.get_mut(axis) else {
+            return;
+        };
+        if *slot == next {
+            return;
+        }
+        *slot = next;
+        self.refresh_slice();
+    }
+
+    /// Switch every plane off, showing the whole structure again.
+    pub fn clear_slice(&mut self) {
+        if !self.slice.active() {
+            return;
+        }
+        for axis in &mut self.slice.axes {
+            axis.enabled = false;
+        }
+        self.refresh_slice();
+    }
+
+    /// Atoms currently drawn, and atoms in the structure.
+    pub fn drawn_atom_counts(&self) -> (usize, usize) {
+        (self.drawn_atom_count, self.atom_count())
+    }
+
+    /// Re-push everything a moved slice plane changes.
+    ///
+    /// The mask itself, plus every overlay built from atom indices, plus the
+    /// other layers' spheres -- which are drawn from their own geometry and
+    /// never see the mask at all.
+    fn refresh_slice(&mut self) {
+        self.refresh_visible_atoms();
+        self.refresh_ndx_selection_state();
+        self.refresh_interaction_pairs();
+        self.sync_selection_to_viewport();
+        self.refresh_layer_overlays();
+    }
+
+    /// The same set, minus the layer overlays: only the active layer's atoms
+    /// move on a trajectory frame, so re-deriving every other layer's spheres
+    /// each frame would be pure waste.
+    fn refresh_slice_for_frame(&mut self) {
+        self.refresh_visible_atoms();
+        self.refresh_ndx_selection_state();
+        self.refresh_interaction_pairs();
+        self.sync_selection_to_viewport();
+    }
+
     fn refresh_interaction_pairs(&mut self) {
-        let pairs = self.interaction_pairs.clone();
+        // A cylinder needs both ends: keeping a pair with one endpoint sliced
+        // away would draw an interaction reaching into nothing.
+        let pairs: Vec<(usize, usize)> = self
+            .interaction_pairs
+            .iter()
+            .copied()
+            .filter(|(a, b)| self.is_atom_drawn(*a) && self.is_atom_drawn(*b))
+            .collect();
         self.viewport.set_state_by_type(AtomPairState { pairs });
     }
 
@@ -3066,7 +3308,12 @@ impl KuromameApp {
                 .atoms
                 .iter()
                 .enumerate()
-                .filter(|(orig, _)| !filtered || layer.components.is_atom_visible(*orig))
+                // The slice cuts every layer, not just the active one, or the
+                // cut face would show one structure sliced and the rest whole.
+                .filter(|(orig, a)| {
+                    (!filtered || layer.components.is_atom_visible(*orig))
+                        && self.slice.keeps(a.position)
+                })
                 .map(|(_, a)| {
                     let (r, g, b, _) = default_color_fn(a, false);
                     OverlaySphere {
@@ -3319,7 +3566,12 @@ impl KuromameApp {
                     continue;
                 }
                 group_indices.push(idx);
-                atoms_per_group.push(Self::normalized_ndx_indices(&group.entries, atom_count));
+                let mut atoms = Self::normalized_ndx_indices(&group.entries, atom_count);
+                // What the doc comment above has always promised, and until the
+                // slice landed did not do: a highlight sphere over an atom that
+                // is not drawn is a marker floating in empty space.
+                atoms.retain(|orig| self.is_atom_drawn(*orig));
+                atoms_per_group.push(atoms);
             }
         }
 
@@ -3981,8 +4233,17 @@ impl KuromameApp {
     /// every selection path (click, selector expression, "Select Between",
     /// clear) stays visually consistent.
     fn sync_selection_to_viewport(&mut self) {
-        let selected_atoms: Vec<usize> =
-            self.selection.selected_atom_indices.to_vec();
+        // `SelectedAtomRender` draws every index it is given without consulting
+        // the visibility mask, so the filtering has to happen here. Under the
+        // component filter that hardly showed -- you can only click what you can
+        // see -- but a slice plane sweeps over atoms that are already picked.
+        let selected_atoms: Vec<usize> = self
+            .selection
+            .selected_atom_indices
+            .iter()
+            .copied()
+            .filter(|orig| self.is_atom_drawn(*orig))
+            .collect();
         self.viewport.set_state_by_type(SelectedAtomRenderState {
             selected_atoms,
             color: [1.0, 0.0, 0.0, 1.0],
@@ -5051,6 +5312,16 @@ impl KuromameApp {
             // Virtual-atom markers and CV vectors are absolute positions, so
             // they have to follow the frame the atoms just moved to.
             self.refresh_plumed_overlay();
+            // So does the slice: the component filter is index-derived and
+            // frame-invariant, which is why this function never refreshed the
+            // mask before, but a plane in world space has to be re-applied to
+            // atoms that just moved through it.
+            if self.slice.active() {
+                for position in positions {
+                    self.slice.grow_range(*position);
+                }
+                self.refresh_slice_for_frame();
+            }
         } else if let Some(base) = self.base_molecule.clone() {
             // First frame (or the molecule was swapped): establish the molecule and
             // fit the camera once.
@@ -5613,6 +5884,152 @@ impl eframe::App for KuromameApp {
 mod tests {
     use super::*;
     use moleucle_3dview_rs::molecule::Bond;
+
+    /// A slice with `axis` on, cutting at `at`, keeping the side `keep_above`
+    /// names. Other axes off.
+    fn one_axis(axis: usize, at: f32, keep_above: bool) -> SliceState {
+        let mut slice = SliceState::default();
+        slice.axes[axis] = SliceAxis {
+            enabled: true,
+            at,
+            keep_above,
+        };
+        slice
+    }
+
+    #[test]
+    fn an_inactive_slice_keeps_everything() {
+        let slice = SliceState::default();
+        assert!(!slice.active());
+        assert!(slice.keeps(Vec3::new(-100.0, 0.0, 100.0)));
+    }
+
+    #[test]
+    fn one_axis_keeps_the_side_it_was_pointed_at() {
+        let above = one_axis(0, 1.0, true);
+        assert!(above.active());
+        assert!(above.keeps(Vec3::new(2.0, 0.0, 0.0)));
+        assert!(!above.keeps(Vec3::new(0.0, 0.0, 0.0)));
+
+        let below = one_axis(0, 1.0, false);
+        assert!(below.keeps(Vec3::new(0.0, 0.0, 0.0)));
+        assert!(!below.keeps(Vec3::new(2.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn an_atom_exactly_on_the_plane_is_kept_either_way() {
+        let on_plane = Vec3::new(1.0, 0.0, 0.0);
+        assert!(one_axis(0, 1.0, true).keeps(on_plane));
+        assert!(one_axis(0, 1.0, false).keeps(on_plane));
+    }
+
+    #[test]
+    fn each_axis_tests_its_own_coordinate() {
+        // Slicing on Y must not care where the atom is in x or z.
+        let slice = one_axis(1, 5.0, true);
+        assert!(slice.keeps(Vec3::new(-99.0, 6.0, 99.0)));
+        assert!(!slice.keeps(Vec3::new(0.0, 4.0, 0.0)));
+    }
+
+    #[test]
+    fn several_axes_intersect_rather_than_union() {
+        let mut slice = SliceState::default();
+        slice.axes[0] = SliceAxis {
+            enabled: true,
+            at: 0.0,
+            keep_above: true,
+        };
+        slice.axes[2] = SliceAxis {
+            enabled: true,
+            at: 0.0,
+            keep_above: true,
+        };
+
+        assert!(slice.keeps(Vec3::new(1.0, 0.0, 1.0)), "inside both half-spaces");
+        assert!(
+            !slice.keeps(Vec3::new(1.0, 0.0, -1.0)),
+            "satisfying only X is not enough -- a union would have kept this"
+        );
+        assert!(!slice.keeps(Vec3::new(-1.0, 0.0, -1.0)));
+    }
+
+    #[test]
+    fn resetting_the_range_covers_every_position() {
+        let mut slice = SliceState::default();
+        slice.reset_range(
+            [
+                Vec3::new(-1.0, 0.0, 2.0),
+                Vec3::new(3.0, 5.0, -4.0),
+            ]
+            .into_iter(),
+        );
+
+        // Padded outwards, so the extremes stay reachable on the slider.
+        assert!(slice.range[0].0 < -1.0 && slice.range[0].1 > 3.0);
+        assert!(slice.range[1].0 < 0.0 && slice.range[1].1 > 5.0);
+        assert!(slice.range[2].0 < -4.0 && slice.range[2].1 > 2.0);
+    }
+
+    #[test]
+    fn resetting_the_range_parks_an_unused_plane_in_the_middle() {
+        let mut slice = SliceState::default();
+        slice.reset_range([Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)].into_iter());
+        // Switching X on should cut the structure in half, not show all of it.
+        assert!((slice.axes[0].at - 5.0).abs() < 0.01, "{}", slice.axes[0].at);
+    }
+
+    #[test]
+    fn resetting_the_range_pulls_an_enabled_plane_back_into_it() {
+        let mut slice = one_axis(0, 999.0, true);
+        slice.reset_range([Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)].into_iter());
+        assert!(
+            slice.axes[0].at <= slice.range[0].1,
+            "a plane past the new structure would hide all of it"
+        );
+    }
+
+    #[test]
+    fn an_empty_structure_still_leaves_a_usable_range() {
+        let mut slice = SliceState::default();
+        slice.reset_range(std::iter::empty());
+        for (lo, hi) in slice.range {
+            assert!(hi > lo, "a zero-width slider cannot be dragged");
+        }
+    }
+
+    #[test]
+    fn a_flat_structure_still_leaves_a_usable_range() {
+        let mut slice = SliceState::default();
+        // Every atom in one plane: the z span is exactly zero.
+        slice.reset_range([Vec3::new(0.0, 0.0, 1.0), Vec3::new(4.0, 4.0, 1.0)].into_iter());
+        assert!(slice.range[2].1 > slice.range[2].0);
+    }
+
+    #[test]
+    fn growing_the_range_only_widens_it() {
+        let mut slice = SliceState::default();
+        slice.reset_range([Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0)].into_iter());
+        let before = slice.range;
+
+        // A frame that drifts outside must stay reachable...
+        slice.grow_range(Vec3::new(9.0, 0.5, 0.5));
+        assert!(slice.range[0].1 >= 9.0);
+        // ...and one well inside must not pull the endpoints in, or the slider
+        // would breathe frame to frame while the cut stood still.
+        slice.grow_range(Vec3::new(0.5, 0.5, 0.5));
+        assert_eq!(slice.range[1], before[1]);
+        assert_eq!(slice.range[2], before[2]);
+        assert!(slice.range[0].1 >= 9.0);
+    }
+
+    #[test]
+    fn growing_the_range_leaves_the_plane_alone() {
+        let mut slice = one_axis(0, 0.5, true);
+        slice.reset_range([Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0)].into_iter());
+        let at = slice.axes[0].at;
+        slice.grow_range(Vec3::new(50.0, 0.0, 0.0));
+        assert_eq!(slice.axes[0].at, at, "the cut is in absolute nm, not a fraction of the box");
+    }
 
     #[test]
     fn overlapping_ndx_groups_keep_each_atom_in_the_last_group() {
