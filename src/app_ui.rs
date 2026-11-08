@@ -840,6 +840,16 @@ fn file_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
             ui.close();
         }
         if ui
+            .button(format!("{} Import Particle Radii (CSV)", mi(MaterialIcon::Straighten)))
+            .on_hover_text(
+                "Size coarse-grained particles by name: a CSV of `name,radius` rows, radius in nm.                  Matched against the atom name, then the topology atom type.",
+            )
+            .clicked()
+        {
+            app.open_particle_radii_file();
+            ui.close();
+        }
+        if ui
             .button(format!("{} Add Overlay Surface", mi(MaterialIcon::Layers)))
             .on_hover_text("Overlay a PDB dot surface on top of the current structure")
             .clicked()
@@ -899,7 +909,7 @@ fn render_menu(app: &mut KuromameApp, ui: &mut egui::Ui) {
         ui.selectable_value(&mut style, RenderStyle::BallOnly, "Ball only");
         ui.selectable_value(&mut style, RenderStyle::Wireframe, "Wireframe");
         ui.selectable_value(&mut style, RenderStyle::Circles, "Circles");
-        app.viewport.set_render_style(style);
+        app.set_render_style(style);
     });
 }
 
@@ -2362,6 +2372,25 @@ pub fn render_bottom_dock(app: &mut KuromameApp, ui: &mut egui::Ui) {
                     }
                 }
 
+                if app.has_particle_radii() {
+                    ui.add_space(10.0);
+                    let mut custom = app.particle_radii_visible();
+                    if ui
+                        .checkbox(&mut custom, "Custom radii")
+                        .on_hover_text("Draw particles with the radii imported from CSV")
+                        .changed()
+                    {
+                        app.set_particle_radii_visible(custom);
+                    }
+                    if ui
+                        .small_button(mi(MaterialIcon::Close))
+                        .on_hover_text("Forget the imported particle radii")
+                        .clicked()
+                    {
+                        app.clear_particle_radii();
+                    }
+                }
+
                 ui.add_space(10.0);
                 let mut axes = app.axis_visible();
                 if ui
@@ -2422,7 +2451,7 @@ fn style_segment(app: &mut KuromameApp, ui: &mut egui::Ui) {
                     .corner_radius(egui::CornerRadius::same(6))
                     .min_size(egui::vec2(48.0, 24.0));
                     if ui.add(btn).clicked() {
-                        app.viewport.set_render_style(style);
+                        app.set_render_style(style);
                     }
                 }
             });
