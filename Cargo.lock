@@ -2046,7 +2046,7 @@ dependencies = [
 [[package]]
 name = "moleucle_3dview_rs"
 version = "0.13.0"
-source = "git+https://github.com/IndigoCarmine/moleucle_3dview_rs.git?rev=e05f66ba75b4eb9665f9af28ec72f0adb195eb2a#e05f66ba75b4eb9665f9af28ec72f0adb195eb2a"
+source = "git+https://github.com/IndigoCarmine/moleucle_3dview_rs.git?rev=eb9acc5cda8bed843c079292f15103e17889b15c#eb9acc5cda8bed843c079292f15103e17889b15c"
 dependencies = [
  "bytemuck",
  "eframe",
