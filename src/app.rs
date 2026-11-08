@@ -2,7 +2,7 @@ use crate::component::ComponentState;
 use crate::ffmpeg::{self, is_frame_file_name};
 use crate::image_export::{self, ExportSettings};
 use crate::parsing::{
-    AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, PdbFile, PlumedFile,
+    AtomRecord, GroFile, MartiniForceField, Mol2File, NdxFile, ParticleRadii, PdbFile, PlumedFile,
     SURFACE_RES_NAME, TopFile, XtcFile, XtcFrame,
 };
 use crate::plumed_overlay::{
@@ -22,7 +22,7 @@ use moleucle_3dview_rs::{
     AxesState, ImageExportRequest, InteractiveMoleculeViewport, Molecule, OverlaySphere,
     PeriodicImages, PointCloudLayer, PointCloudRender, PointCloudState, SelectedAtomRenderState,
     SimulationCellRender, SimulationCellState, SphereSet, SphereSetRender, SphereSetState,
-    ViewPortEvent, ball_stick_radius, default_color_fn,
+    RenderStyle, ViewPortEvent, ball_stick_radius, default_color_fn, vdw_radius,
 };
 use rfd::FileDialog;
 use std::collections::HashSet;
@@ -53,6 +53,8 @@ enum PickKind {
     Ndx,
     /// PLUMED input file.
     Plumed,
+    /// CSV table of per-particle-name radii.
+    ParticleRadii,
     /// XTC trajectory.
     Xtc,
     /// Overlay dot-surface PDB.
@@ -327,6 +329,7 @@ enum LoadPayload {
     },
     Ndx(NdxFile),
     Plumed(PlumedFile),
+    ParticleRadii(ParticleRadii),
     Xtc(XtcFile),
     Overlay(Vec<Vec3>), // surface dots
 }
@@ -830,6 +833,15 @@ pub struct KuromameApp {
     /// Whether Martini bead spheres are drawn (only has an effect once a Martini
     /// force field is loaded and beads resolve to known types).
     martini_visible: bool,
+    /// User-imported `name,radius` table for coarse-grained particles. A global
+    /// view setting rather than per-layer: one CG model's radii usually apply
+    /// to every structure built from it. Overrides Martini radii where both
+    /// name a particle.
+    particle_radii: Option<ParticleRadii>,
+    /// Source of [`Self::particle_radii`], for reload.
+    particle_radii_path: Option<PathBuf>,
+    /// Whether the imported radii are applied.
+    particle_radii_visible: bool,
     /// Whether the XYZ orientation triad is drawn at the world origin. A global
     /// view preference (not per-layer); mirrored into the viewport's
     /// [`AxesState`] whenever it changes.
@@ -1043,6 +1055,9 @@ impl KuromameApp {
             bead_types: BeadTypes::default(),
             bead_types_dirty: true,
             martini_visible: true,
+            particle_radii: None,
+            particle_radii_path: None,
+            particle_radii_visible: true,
             axis_visible: true,
             sim_cell: [[0.0; 3]; 3],
             periodic_cells: [1, 1, 1],
@@ -1203,6 +1218,7 @@ impl KuromameApp {
             PickKind::Gro => Self::parse_gro(first()?, progress),
             PickKind::Ndx => Self::parse_ndx(first()?, progress),
             PickKind::Plumed => Self::parse_plumed(first()?, progress),
+            PickKind::ParticleRadii => Self::parse_particle_radii(first()?, progress),
             PickKind::Xtc => Self::parse_xtc(first()?, progress),
             PickKind::OverlaySurface => Self::parse_overlay(first()?, progress),
             PickKind::TopGroPair => {
@@ -1314,6 +1330,17 @@ impl KuromameApp {
             .map_err(|_| "Failed to read NDX file".to_string())?;
         let ndx = NdxFile::parse(&content).map_err(|err| format!("NDX parse failed: {err}"))?;
         Ok(LoadPayload::Ndx(ndx))
+    }
+
+    fn parse_particle_radii(
+        path: &Path,
+        progress: &Arc<LoadProgress>,
+    ) -> Result<LoadPayload, String> {
+        let content = Self::read_file_to_string(path, progress)
+            .map_err(|_| "Failed to read particle radius CSV".to_string())?;
+        let radii = ParticleRadii::parse(&content)
+            .map_err(|err| format!("Particle radius CSV parse failed: {err}"))?;
+        Ok(LoadPayload::ParticleRadii(radii))
     }
 
     fn parse_plumed(path: &Path, progress: &Arc<LoadProgress>) -> Result<LoadPayload, String> {
@@ -1443,6 +1470,11 @@ impl KuromameApp {
             LoadPayload::Plumed(plumed) => {
                 if let Some(path) = paths.next() {
                     self.apply_plumed(plumed, path);
+                }
+            }
+            LoadPayload::ParticleRadii(radii) => {
+                if let Some(path) = paths.next() {
+                    self.apply_particle_radii(radii, path);
                 }
             }
             LoadPayload::Xtc(xtc) => {
@@ -2329,7 +2361,7 @@ impl KuromameApp {
 
         self.refresh_ndx_selection_state();
         self.refresh_interaction_pairs();
-        self.refresh_martini_bead_state();
+        self.refresh_atom_overrides();
         self.sync_selection_to_viewport();
         // The molecule or the topology may have changed under the script.
         self.plumed.masses_dirty = true;
@@ -2527,55 +2559,189 @@ impl KuromameApp {
         }
     }
 
-    /// Push the current Martini bead styling to the viewport in viewport-index
-    /// order (matching the possibly-filtered molecule). A no-op display when no
-    /// Martini force field is loaded, so nothing changes for ordinary structures.
-    /// Apply Martini per-bead sizing/colouring as per-atom radius/colour
-    /// overrides on the main molecule (viewport-index order), so beads render as
-    /// the main molecule (shading, picking and opacity included) rather than a
-    /// separate overlay. Clears the overrides — restoring element rendering —
-    /// when no Martini force field is loaded or the bead view is off. Atoms
-    /// whose bead type is unknown fall back to their element radius/colour.
-    fn refresh_martini_bead_state(&mut self) {
-        let active =
-            self.martini_visible && self.martini_ff.is_some() && self.viewport.molecule().is_some();
-        if !active {
+    /// Push per-atom radius/colour overrides to the viewport: Martini bead
+    /// styling and/or the user's imported particle radii.
+    ///
+    /// Overrides go onto the main molecule (full-molecule index order) so the
+    /// particles render through the built-in pipeline -- shading, picking and
+    /// opacity included -- rather than as a separate overlay.
+    ///
+    /// - Radius: the imported table first (atom name, then bead type), then the
+    ///   Martini bead radius, then the current style's own element radius.
+    /// - Colour: Martini bead colours when Martini is active; otherwise colours
+    ///   are left to the normal colour scheme.
+    ///
+    /// Clears both overrides -- restoring plain element rendering -- when
+    /// neither source is active.
+    fn refresh_atom_overrides(&mut self) {
+        let Some(mol) = self.viewport.molecule() else {
+            self.viewport.set_atom_radii(None);
+            self.viewport.set_atom_colors(None);
+            return;
+        };
+        let martini = self.martini_ff.as_ref().filter(|_| self.martini_visible);
+        let custom = self
+            .particle_radii
+            .as_ref()
+            .filter(|_| self.particle_radii_visible);
+        if martini.is_none() && custom.is_none() {
             self.viewport.set_atom_radii(None);
             self.viewport.set_atom_colors(None);
             return;
         }
 
-        let (radii, colors) = {
-            let ff = self.martini_ff.as_ref().unwrap();
-            let mol = self.viewport.molecule().unwrap();
-            // Per-atom overrides are indexed by the full molecule, hidden atoms
-            // included -- the viewport masks visibility, it does not renumber.
-            let count = mol.atoms.len();
-            let mut radii = Vec::with_capacity(count);
-            let mut colors = Vec::with_capacity(count);
-            for orig in 0..count {
-                let atom = &mol.atoms[orig];
-                match self
-                    .bead_types
-                    .get(orig)
-                    .and_then(|bead| ff.radius_nm(bead).map(|r| (bead, r)))
-                {
-                    Some((bead, radius)) => {
+        let style = self.viewport.render_style();
+        let element_radius = |element: &str| match style {
+            RenderStyle::BallStick => ball_stick_radius(element, false),
+            _ => vdw_radius(element),
+        };
+
+        // Per-atom overrides are indexed by the full molecule, hidden atoms
+        // included -- the viewport masks visibility, it does not renumber.
+        let count = mol.atoms.len();
+        let mut radii = Vec::with_capacity(count);
+        let mut colors = martini.map(|_| Vec::with_capacity(count));
+        for orig in 0..count {
+            let atom = &mol.atoms[orig];
+            let bead = self.bead_types.get(orig);
+            let custom_radius = custom.and_then(|table| {
+                mol.name_of(atom)
+                    .and_then(|name| table.radius_nm(name))
+                    .or_else(|| bead.and_then(|bead| table.radius_nm(bead)))
+            });
+            let martini_bead = martini
+                .and_then(|ff| bead.and_then(|bead| ff.radius_nm(bead).map(|r| (bead, r))));
+
+            radii.push(
+                custom_radius
+                    .or(martini_bead.map(|(_, r)| r))
+                    .unwrap_or_else(|| element_radius(&atom.element)),
+            );
+            if let Some(colors) = colors.as_mut() {
+                match martini_bead {
+                    Some((bead, _)) => {
                         let (r, g, b) = MartiniForceField::color(bead);
-                        radii.push(radius);
                         colors.push([r, g, b, 1.0]);
                     }
                     None => {
-                        radii.push(ball_stick_radius(&atom.element, false));
                         let c = default_color_fn(atom, false);
                         colors.push([c.0, c.1, c.2, c.3]);
                     }
                 }
             }
-            (radii, colors)
-        };
+        }
         self.viewport.set_atom_radii(Some(radii));
-        self.viewport.set_atom_colors(Some(colors));
+        self.viewport.set_atom_colors(colors);
+    }
+
+    /// `(matched, total)`: how many atoms of the active molecule the imported
+    /// radius table sizes, for the import status line.
+    fn particle_radii_match_count(&self) -> (usize, usize) {
+        let (Some(mol), Some(table)) = (self.viewport.molecule(), self.particle_radii.as_ref())
+        else {
+            return (0, 0);
+        };
+        let matched = mol
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(orig, atom)| {
+                mol.name_of(atom)
+                    .and_then(|name| table.radius_nm(name))
+                    .or_else(|| {
+                        self.bead_types
+                            .get(*orig)
+                            .and_then(|bead| table.radius_nm(bead))
+                    })
+                    .is_some()
+            })
+            .count();
+        (matched, mol.atoms.len())
+    }
+
+    // --- Particle radius CSV ----------------------------------------------
+
+    pub fn open_particle_radii_file(&mut self) {
+        self.spawn_pick(PickKind::ParticleRadii, || {
+            FileDialog::new()
+                .add_filter("Particle radius CSV", &["csv", "tsv", "txt"])
+                .set_title("Import particle radii (name,radius in nm)")
+                .pick_file()
+                .into_iter()
+                .collect()
+        });
+    }
+
+    /// Synchronous load (drag-and-drop / reload / CLI); the file-dialog path
+    /// goes through the async worker. Both funnel into
+    /// [`Self::apply_particle_radii`].
+    fn load_particle_radii_file(&mut self, path: PathBuf) {
+        let progress = Arc::new(LoadProgress::default());
+        match Self::parse_particle_radii(&path, &progress) {
+            Ok(LoadPayload::ParticleRadii(radii)) => self.apply_particle_radii(radii, path),
+            Ok(_) => unreachable!("parse_particle_radii only yields ParticleRadii"),
+            Err(msg) => self.set_status(msg),
+        }
+    }
+
+    fn apply_particle_radii(&mut self, radii: ParticleRadii, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let entries = radii.len();
+        self.particle_radii = Some(radii);
+        self.particle_radii_path = Some(path);
+        self.particle_radii_visible = true;
+        // Bead types are the fallback match key; make sure they are current.
+        self.recompute_bead_types();
+        self.refresh_atom_overrides();
+
+        let (matched, total) = self.particle_radii_match_count();
+        if total > 0 {
+            self.set_status(format!(
+                "Imported particle radii {file_name} ({entries} names, {matched}/{total} atoms matched)"
+            ));
+        } else {
+            self.set_status(format!(
+                "Imported particle radii {file_name} ({entries} names)"
+            ));
+        }
+    }
+
+    pub fn has_particle_radii(&self) -> bool {
+        self.particle_radii.is_some()
+    }
+
+    pub fn particle_radii_visible(&self) -> bool {
+        self.particle_radii_visible
+    }
+
+    pub fn set_particle_radii_visible(&mut self, visible: bool) {
+        if self.particle_radii_visible != visible {
+            self.particle_radii_visible = visible;
+            self.refresh_atom_overrides();
+        }
+    }
+
+    /// Forget the imported radius table and go back to the default radii.
+    pub fn clear_particle_radii(&mut self) {
+        self.particle_radii = None;
+        self.particle_radii_path = None;
+        self.refresh_atom_overrides();
+        self.set_status("Cleared imported particle radii");
+    }
+
+    /// Change the render style. Unmatched atoms in the per-atom radius
+    /// overrides fall back to the style's own element radius, so the
+    /// overrides are rebuilt when the style changes.
+    pub fn set_render_style(&mut self, style: RenderStyle) {
+        if self.viewport.render_style() == style {
+            return;
+        }
+        self.viewport.set_render_style(style);
+        self.refresh_atom_overrides();
     }
 
     /// Register a Martini force field parsed off-thread (see
@@ -2592,7 +2758,7 @@ impl KuromameApp {
         // per-atom bead types need re-deriving.
         self.bead_types_dirty = true;
         self.recompute_bead_types();
-        self.refresh_martini_bead_state();
+        self.refresh_atom_overrides();
         count
     }
 
@@ -2608,7 +2774,7 @@ impl KuromameApp {
     pub fn set_martini_visible(&mut self, visible: bool) {
         if self.martini_visible != visible {
             self.martini_visible = visible;
-            self.refresh_martini_bead_state();
+            self.refresh_atom_overrides();
         }
     }
 
@@ -3191,7 +3357,7 @@ impl KuromameApp {
                 .set_molecule(Molecule::from_atoms_bonds(Vec::new(), Vec::new()));
             self.refresh_ndx_selection_state();
             self.refresh_interaction_pairs();
-            self.refresh_martini_bead_state();
+            self.refresh_atom_overrides();
             // Empty layer: this also clears any stale highlight, since the
             // freshly loaded layer's selection is what gets projected.
             self.sync_selection_to_viewport();
@@ -4040,6 +4206,11 @@ impl KuromameApp {
 
         if let Some(path) = self.plumed.path.clone() {
             self.load_plumed_file(path);
+            reloaded_any = true;
+        }
+
+        if let Some(path) = self.particle_radii_path.clone() {
+            self.load_particle_radii_file(path);
             reloaded_any = true;
         }
 
@@ -5450,6 +5621,7 @@ impl KuromameApp {
         let mut ndx_path: Option<PathBuf> = None;
         let mut xtc_path: Option<PathBuf> = None;
         let mut plumed_path: Option<PathBuf> = None;
+        let mut radii_path: Option<PathBuf> = None;
         let mut other_path: Option<PathBuf> = None;
 
         for path in &paths {
@@ -5460,6 +5632,7 @@ impl KuromameApp {
                     "ndx" => ndx_path = Some(path.clone()),
                     "xtc" => xtc_path = Some(path.clone()),
                     "dat" => plumed_path = Some(path.clone()),
+                    "csv" => radii_path = Some(path.clone()),
                     _ => other_path = Some(path.clone()),
                 }
             }
@@ -5470,6 +5643,11 @@ impl KuromameApp {
         // a structure together with its `plumed.dat` should load both.
         if let Some(path) = plumed_path {
             self.load_plumed_file(path);
+        }
+        // Likewise a radius table is tiny; loading it on the spot lets it be
+        // dropped together with the structure it sizes.
+        if let Some(path) = radii_path {
+            self.load_particle_radii_file(path);
         }
 
         // Route through the async worker (same as the file-dialog path) so a big

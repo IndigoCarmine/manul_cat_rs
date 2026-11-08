@@ -65,6 +65,10 @@ and
   layer has its own visibility, identity colour and opacity.
 * **Martini coarse-grained bead view** — beads sized from the force field's LJ
   sigma and coloured by bead type, drawn through the main molecule pipeline.
+* **Custom particle radii (CSV)** — *File → Import Particle Radii (CSV)* (or
+  drop a `.csv`) sizes coarse-grained particles of any name from `name,radius`
+  rows (radius in nm; matched by atom name, then topology atom type). Overrides
+  Martini radii; toggle with *Custom radii* in the bottom bar.
 * **Components** — named groups you can show/hide, split and merge from the
   command bar (see below). They start as one component per residue name.
 * **Per-molecule / per-layer opacity**.

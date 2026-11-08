@@ -6,6 +6,7 @@ mod mol2;
 mod ndx;
 mod pdb;
 mod plumed;
+mod radius_csv;
 mod top;
 mod xtc;
 
@@ -17,5 +18,6 @@ pub use pdb::{ConectRecord, PdbFile, PdbLine, SURFACE_RES_NAME};
 pub use plumed::{
     AtomToken, ParsePlumedError, PlumedAction, PlumedFile, PlumedKeyword, parse_atom_list,
 };
+pub use radius_csv::ParticleRadii;
 pub use top::{TopAtomRecord, TopBondRecord, TopFile, TopGroComparison, TopLine};
 pub use xtc::{XtcFile, XtcFrame};
