@@ -25,7 +25,7 @@ use moleucle_3dview_rs::{
     RenderStyle, ViewPortEvent, ball_stick_radius, default_color_fn, vdw_radius,
 };
 use rfd::FileDialog;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// `Copy` so the tag can be handed to a background load worker (and echoed back
 /// on the finished result) without ceremony — it is a fieldless enum.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickKind {
     /// Structure into the active layer via [`KuromameApp::load_file`].
     Structure,
@@ -63,6 +63,76 @@ enum PickKind {
     StructureLayer,
     /// A TOP + GRO pair (paths ordered `[top, gro]`) for resname sync.
     TopGroPair,
+}
+
+/// How a batch of files (a drop, or command-line arguments) is loaded.
+#[derive(Debug, Default, PartialEq)]
+struct LoadPlan {
+    /// Read on the spot: tiny files that do not need the async worker.
+    plumed: Option<PathBuf>,
+    radii: Option<PathBuf>,
+    /// Background loads, run one after another in this order.
+    queue: Vec<(PickKind, Vec<PathBuf>)>,
+    /// Files the batch cannot use: a second file of a kind only one of which
+    /// makes sense (two `.ndx`, two `.xtc`, ...) or an unknown extension.
+    skipped: Vec<PathBuf>,
+}
+
+/// Order a batch of files so each loads after what it depends on.
+///
+/// The structure goes first, because an index file, a trajectory or a PLUMED
+/// script is checked against it: a `.top` + `.gro` pair, else the `.top`, else
+/// the `.gro`, else the first PDB/MOL2. Then the `.ndx`, then the `.xtc`. Any
+/// further structure files open as new layers last, so the index and
+/// trajectory still land on the first one.
+fn plan_load_batch(paths: &[PathBuf]) -> LoadPlan {
+    fn keep_first(slot: &mut Option<PathBuf>, path: &Path, skipped: &mut Vec<PathBuf>) {
+        if slot.is_none() {
+            *slot = Some(path.to_path_buf());
+        } else {
+            skipped.push(path.to_path_buf());
+        }
+    }
+
+    let mut plan = LoadPlan::default();
+    let mut top = None;
+    let mut gro = None;
+    let mut ndx = None;
+    let mut xtc = None;
+    let mut structures = Vec::new();
+
+    for path in paths {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let skipped = &mut plan.skipped;
+        match ext.as_str() {
+            "top" | "itp" => keep_first(&mut top, path, skipped),
+            "gro" => keep_first(&mut gro, path, skipped),
+            "ndx" => keep_first(&mut ndx, path, skipped),
+            "xtc" => keep_first(&mut xtc, path, skipped),
+            "dat" => keep_first(&mut plan.plumed, path, skipped),
+            "csv" => keep_first(&mut plan.radii, path, skipped),
+            "pdb" | "ent" | "mol2" => structures.push(path.clone()),
+            _ => skipped.push(path.clone()),
+        }
+    }
+
+    let mut structures = structures.into_iter();
+    let primary = match (top, gro) {
+        (Some(top), Some(gro)) => Some((PickKind::TopGroPair, vec![top, gro])),
+        (Some(top), None) => Some((PickKind::Top, vec![top])),
+        (None, Some(gro)) => Some((PickKind::Gro, vec![gro])),
+        (None, None) => structures.next().map(|p| (PickKind::Structure, vec![p])),
+    };
+    plan.queue.extend(primary);
+    plan.queue.extend(ndx.map(|p| (PickKind::Ndx, vec![p])));
+    plan.queue.extend(xtc.map(|p| (PickKind::Xtc, vec![p])));
+    plan.queue
+        .extend(structures.map(|p| (PickKind::StructureLayer, vec![p])));
+    plan
 }
 
 /// One axis of the slice: a plane at `at`, and which side of it is kept.
@@ -870,6 +940,12 @@ pub struct KuromameApp {
     /// `update`/`ui` polls it and applies the finished payload on the UI thread.
     /// `None` when nothing is loading; at most one load runs at a time.
     pending_load: Option<PendingLoad>,
+    /// Loads from a multi-file drop still waiting for `pending_load` to free
+    /// up, in order. Cleared when a load fails or is cancelled (the rest
+    /// depend on it) and whenever the user starts a different load.
+    queued_loads: VecDeque<(PickKind, Vec<PathBuf>)>,
+    /// Files the current batch could not use, reported once the batch ends.
+    batch_skipped: Vec<PathBuf>,
     /// The xyz slice planes. Global, not per layer -- see [`SliceState`].
     slice: SliceState,
     /// How many atoms the COMPONENTS filter and the slice currently leave
@@ -1063,6 +1139,8 @@ impl KuromameApp {
             periodic_cells: [1, 1, 1],
             pending_pick: None,
             pending_load: None,
+            queued_loads: VecDeque::new(),
+            batch_skipped: Vec::new(),
             slice: SliceState::default(),
             drawn_atom_count: 0,
             plumed: PlumedState::default(),
@@ -1111,6 +1189,9 @@ impl KuromameApp {
     /// [`Self::poll_pending_load`] receives it.
     fn dispatch_pick(&mut self, picked: PickedFiles) {
         let PickedFiles { kind, paths } = picked;
+        // A file picked by hand supersedes whatever a drop still had queued.
+        self.queued_loads.clear();
+        self.batch_skipped.clear();
         if let PickKind::TopGroPair = kind {
             // Paths arrive as `[top, gro]`; keep that order so the worker pairs
             // them correctly.
@@ -1162,10 +1243,64 @@ impl KuromameApp {
         match pending.rx.try_recv() {
             Ok(finished) => {
                 self.pending_load = None;
-                self.apply_finished_load(finished);
+                if self.apply_finished_load(finished) {
+                    self.start_next_queued_load();
+                } else {
+                    self.abandon_queued_loads();
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.pending_load = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_load = None;
+                self.abandon_queued_loads();
+            }
+        }
+    }
+
+    /// Start the next load of a multi-file batch, or report what the batch
+    /// skipped once it is done.
+    fn start_next_queued_load(&mut self) {
+        if self.pending_load.is_some() {
+            return;
+        }
+        if let Some((kind, paths)) = self.queued_loads.pop_front() {
+            if kind == PickKind::StructureLayer {
+                // The layer exists before its structure arrives, exactly as
+                // when the user adds one by hand.
+                self.push_empty_layer();
+            }
+            self.spawn_load(kind, paths);
+        } else if !self.batch_skipped.is_empty() {
+            let names: Vec<String> = self
+                .batch_skipped
+                .drain(..)
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect();
+            let msg = format!(
+                "{} \u{2014} not loaded: {} (one file per kind per drop)",
+                self.ui.status_msg,
+                names.join(", ")
+            );
+            self.set_status(msg);
+        }
+    }
+
+    /// Drop the rest of a batch after one of its loads failed or was
+    /// cancelled: the later files (index, trajectory) were meant for it.
+    fn abandon_queued_loads(&mut self) {
+        let left = self.queued_loads.len();
+        self.queued_loads.clear();
+        self.batch_skipped.clear();
+        if left > 0 {
+            let msg = format!(
+                "{} \u{2014} {left} more file(s) from the same drop not loaded",
+                self.ui.status_msg
+            );
+            self.set_status(msg);
         }
     }
 
@@ -1417,17 +1552,19 @@ impl KuromameApp {
     /// Apply a worker's [`FinishedLoad`] on the UI thread: route the parsed
     /// payload into `self`/viewport with the exact same side effects and status
     /// messages the old synchronous loaders produced after their parse step.
-    fn apply_finished_load(&mut self, finished: FinishedLoad) {
+    /// Apply a finished load. Returns whether it succeeded, so a multi-file
+    /// batch knows whether to carry on.
+    fn apply_finished_load(&mut self, finished: FinishedLoad) -> bool {
         let FinishedLoad { paths, result, .. } = finished;
         let payload = match result {
             Ok(payload) => payload,
             Err(msg) if msg == CANCELLED_SENTINEL => {
                 self.set_status("Load cancelled");
-                return;
+                return false;
             }
             Err(msg) => {
                 self.set_status(msg);
-                return;
+                return false;
             }
         };
 
@@ -1488,6 +1625,7 @@ impl KuromameApp {
                 }
             }
         }
+        true
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -3513,6 +3651,12 @@ impl KuromameApp {
     /// Create a new empty layer, make it active, and prompt to load a structure
     /// into it. The normal file loaders then target this layer.
     pub fn add_layer(&mut self) {
+        self.push_empty_layer();
+        self.open_structure_into_active_layer();
+    }
+
+    /// Append an empty layer and make it active, ready for a structure load.
+    fn push_empty_layer(&mut self) {
         self.save_active_layer();
         let name = format!("Layer {}", self.layers.len() + 1);
         let color = LAYER_PALETTE[self.layers.len() % LAYER_PALETTE.len()];
@@ -3520,7 +3664,6 @@ impl KuromameApp {
         let idx = self.layers.len() - 1;
         self.load_active_layer(idx);
         self.refresh_active_view(false);
-        self.open_structure_into_active_layer();
     }
 
     /// Remove a layer, keeping at least one, and re-activate a neighbour.
@@ -5606,81 +5749,31 @@ impl KuromameApp {
         self.load_paths(dropped_paths);
     }
 
-    /// Load a batch of files, routing each by extension exactly as a drag-and-drop
-    /// does: a `.top`+`.gro` pair is cross-loaded for residue-name sync, otherwise
-    /// the single most relevant file is loaded. Shared by drag-and-drop and the
-    /// command-line entry point (files passed as arguments / opened via a file
-    /// association). A no-op on an empty list.
+    /// Load a batch of files: a drag-and-drop, or files passed on the command
+    /// line / through a file association. Every usable file is loaded, in the
+    /// order [`plan_load_batch`] sets (structure first, then what is checked
+    /// against it), one background load after another. A no-op on an empty list.
     pub fn load_paths(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
         }
+        let plan = plan_load_batch(&paths);
 
-        let mut top_path: Option<PathBuf> = None;
-        let mut gro_path: Option<PathBuf> = None;
-        let mut ndx_path: Option<PathBuf> = None;
-        let mut xtc_path: Option<PathBuf> = None;
-        let mut plumed_path: Option<PathBuf> = None;
-        let mut radii_path: Option<PathBuf> = None;
-        let mut other_path: Option<PathBuf> = None;
-
-        for path in &paths {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                match ext.to_ascii_lowercase().as_str() {
-                    "top" | "itp" => top_path = Some(path.clone()),
-                    "gro" => gro_path = Some(path.clone()),
-                    "ndx" => ndx_path = Some(path.clone()),
-                    "xtc" => xtc_path = Some(path.clone()),
-                    "dat" => plumed_path = Some(path.clone()),
-                    "csv" => radii_path = Some(path.clone()),
-                    _ => other_path = Some(path.clone()),
-                }
-            }
-        }
-
-        // A PLUMED script is a few KB of text, so it is read here on the spot
-        // rather than queued: only one async load runs at a time, and dropping
-        // a structure together with its `plumed.dat` should load both.
-        if let Some(path) = plumed_path {
+        // A PLUMED script and a radius table are a few KB each, so they are
+        // read here on the spot rather than queued.
+        if let Some(path) = plan.plumed {
             self.load_plumed_file(path);
         }
-        // Likewise a radius table is tiny; loading it on the spot lets it be
-        // dropped together with the structure it sizes.
-        if let Some(path) = radii_path {
+        if let Some(path) = plan.radii {
             self.load_particle_radii_file(path);
         }
 
-        // Route through the async worker (same as the file-dialog path) so a big
-        // dropped/CLI file reads off the UI thread with a progress bar instead of
-        // freezing — dropping a large `.xtc` is the very case the user hit.
-        if let (Some(top), Some(gro)) = (top_path.clone(), gro_path.clone()) {
-            self.spawn_load(PickKind::TopGroPair, vec![top, gro]);
-            return;
-        }
-
-        if let Some(top) = top_path {
-            self.spawn_load(PickKind::Top, vec![top]);
-            return;
-        }
-
-        if let Some(gro) = gro_path {
-            self.spawn_load(PickKind::Gro, vec![gro]);
-            return;
-        }
-
-        if let Some(path) = xtc_path {
-            self.spawn_load(PickKind::Xtc, vec![path]);
-            return;
-        }
-
-        if let Some(path) = ndx_path {
-            self.spawn_load(PickKind::Ndx, vec![path]);
-            return;
-        }
-
-        if let Some(path) = other_path {
-            self.spawn_load(PickKind::Structure, vec![path]);
-        }
+        // A new batch replaces whatever an earlier one still had queued, and
+        // supersedes an in-flight load, as a single drop always has.
+        self.queued_loads = plan.queue.into();
+        self.batch_skipped = plan.skipped;
+        self.pending_load = None;
+        self.start_next_queued_load();
     }
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
@@ -6062,6 +6155,90 @@ impl eframe::App for KuromameApp {
 mod tests {
     use super::*;
     use moleucle_3dview_rs::molecule::Bond;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn kinds(plan: &LoadPlan) -> Vec<(PickKind, Vec<PathBuf>)> {
+        plan.queue.clone()
+    }
+
+    #[test]
+    fn a_structure_and_its_index_both_load_structure_first() {
+        // The bug: dropping a PDB with its NDX loaded only the NDX.
+        let plan = plan_load_batch(&paths(&["groups.ndx", "protein.pdb"]));
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (PickKind::Structure, paths(&["protein.pdb"])),
+                (PickKind::Ndx, paths(&["groups.ndx"])),
+            ]
+        );
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_full_gromacs_set_loads_in_dependency_order() {
+        let plan = plan_load_batch(&paths(&[
+            "traj.xtc", "index.ndx", "conf.gro", "topol.top", "plumed.dat", "radii.csv",
+        ]));
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (PickKind::TopGroPair, paths(&["topol.top", "conf.gro"])),
+                (PickKind::Ndx, paths(&["index.ndx"])),
+                (PickKind::Xtc, paths(&["traj.xtc"])),
+            ]
+        );
+        assert_eq!(plan.plumed, Some(PathBuf::from("plumed.dat")));
+        assert_eq!(plan.radii, Some(PathBuf::from("radii.csv")));
+    }
+
+    #[test]
+    fn extra_structures_open_as_layers_after_everything_else() {
+        let plan = plan_load_batch(&paths(&["a.pdb", "b.mol2", "i.ndx", "c.PDB"]));
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (PickKind::Structure, paths(&["a.pdb"])),
+                (PickKind::Ndx, paths(&["i.ndx"])),
+                (PickKind::StructureLayer, paths(&["b.mol2"])),
+                (PickKind::StructureLayer, paths(&["c.PDB"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pdb_next_to_a_gro_becomes_a_layer() {
+        let plan = plan_load_batch(&paths(&["x.pdb", "conf.gro"]));
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (PickKind::Gro, paths(&["conf.gro"])),
+                (PickKind::StructureLayer, paths(&["x.pdb"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicates_and_unknown_files_are_reported_not_loaded() {
+        let plan = plan_load_batch(&paths(&["a.ndx", "b.ndx", "notes.txt", "noext", "s.pdb"]));
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (PickKind::Structure, paths(&["s.pdb"])),
+                (PickKind::Ndx, paths(&["a.ndx"])),
+            ]
+        );
+        assert_eq!(plan.skipped, paths(&["b.ndx", "notes.txt", "noext"]));
+    }
+
+    #[test]
+    fn an_index_alone_still_loads_onto_the_current_structure() {
+        let plan = plan_load_batch(&paths(&["i.ndx"]));
+        assert_eq!(kinds(&plan), vec![(PickKind::Ndx, paths(&["i.ndx"]))]);
+    }
 
     /// A slice with `axis` on, cutting at `at`, keeping the side `keep_above`
     /// names. Other axes off.
