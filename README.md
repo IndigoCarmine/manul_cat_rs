@@ -55,9 +55,10 @@ cargo run --release
    toggle them in the left panel, or type commands such as `hide SOL` into the command
    bar at the bottom (**Ctrl+P**).
 
-> Load files one at a time. A drop or command line that holds several files at once
-> loads only one of them. The exceptions are a `.top` + `.gro` pair, and a PLUMED
-> script or radius `.csv` dropped together with a structure.
+> You can also drop (or pass) several files at once, e.g. `topol.top conf.gro index.ndx
+> traj.xtc`. They load in dependency order: the structure first, then the index file,
+> then the trajectory. Extra structure files open as new layers. Only one file of each
+> other kind is used per drop; any left over are named in the status bar.
 
 ---
 
